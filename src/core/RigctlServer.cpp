@@ -74,6 +74,17 @@ quint16 RigctlServer::port() const
     return m_server ? m_server->serverPort() : 0;
 }
 
+bool RigctlServer::canProcessWhileAsyncPending(const QString& line)
+{
+    QString trimmed = line.trimmed();
+    while (trimmed.startsWith('+'))
+        trimmed = trimmed.mid(1).trimmed();
+
+    return trimmed == "q"
+        || trimmed == "\\quit"
+        || trimmed == "\\stop_morse";
+}
+
 void RigctlServer::onNewConnection()
 {
     while (m_server->hasPendingConnections()) {
@@ -131,24 +142,23 @@ void RigctlServer::processClientData(QTcpSocket* socket)
     if (idx < 0) return;
 
     auto& cs = m_clients[idx];
-    if (cs.protocol->hasPendingAsyncResponse())
-        return;
-
     cs.buffer.append(socket->readAll());
 
     // Process complete lines
     while (true) {
-        if (cs.protocol->hasPendingAsyncResponse())
-            return;
-
         int nlPos = cs.buffer.indexOf('\n');
         if (nlPos < 0) break;
 
         QString line = QString::fromUtf8(cs.buffer.left(nlPos));
+        QString trimmed = line.trimmed();
+        if (cs.protocol->hasPendingAsyncResponse()
+            && !canProcessWhileAsyncPending(trimmed)) {
+            return;
+        }
+
         cs.buffer.remove(0, nlPos + 1);
 
         // Check for quit
-        QString trimmed = line.trimmed();
         if (trimmed == "q" || trimmed == "\\quit") {
             socket->disconnectFromHost();
             return;

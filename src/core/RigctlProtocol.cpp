@@ -25,6 +25,7 @@ constexpr quint64 kRigLevelRfPowerMeter      = (1ULL << 32);
 constexpr quint64 kRigLevelRfPowerMeterWatts = (1ULL << 39);
 constexpr qint64  kTxMeterFreshMs            = 1500;
 constexpr int     kHamlibSmartSdrSliceAModel = 23005;
+constexpr int     kMorseCompletionGraceMs    = 350;
 constexpr quint64 kRigGetLevelMask = kRigLevelRfPower
                                    | kRigLevelKeyspd
                                    | kRigLevelSwr
@@ -267,7 +268,7 @@ void RigctlProtocol::scheduleMorseAck(const QString& text)
         return;
 
     auto* cwx = &m_model->cwxModel();
-    const int targetIndex = cwx->sentIndex() + text.size();
+    const int expectedChars = text.size();
     const int timeoutMs = estimateMorseDurationMs(text, cwx->speed());
     const auto responder = m_asyncResponder;
 
@@ -285,16 +286,21 @@ void RigctlProtocol::scheduleMorseAck(const QString& text)
         QObject::disconnect(*cancelConn);
         responder(QStringLiteral("RPRT 0\n"));
     };
+    m_completeAsyncResponse = finish;
 
+    auto sentCount = std::make_shared<int>(0);
     *sentConn = QObject::connect(cwx, &CwxModel::charSent, cwx,
-        [targetIndex, finish](int index) mutable {
-            if (index >= targetIndex)
-                finish();
+        [cwx, expectedChars, sentCount, finish](int) mutable {
+            ++(*sentCount);
+            if (*sentCount >= expectedChars) {
+                QTimer::singleShot(kMorseCompletionGraceMs, cwx, [finish]() mutable {
+                    finish();
+                });
+            }
         });
     *erasedConn = QObject::connect(cwx, &CwxModel::erased, cwx,
-        [targetIndex, finish](int, int stop) mutable {
-            if (stop >= targetIndex)
-                finish();
+        [finish](int, int) mutable {
+            finish();
         });
     *cancelConn = QObject::connect(cwx, &CwxModel::transmissionCancelled, cwx,
         [finish]() mutable {
@@ -304,6 +310,12 @@ void RigctlProtocol::scheduleMorseAck(const QString& text)
     QTimer::singleShot(timeoutMs, cwx, [finish]() mutable {
         finish();
     });
+}
+
+void RigctlProtocol::completePendingAsyncResponse()
+{
+    if (hasPendingAsyncResponse() && m_completeAsyncResponse)
+        m_completeAsyncResponse();
 }
 
 // ── Main entry point ────────────────────────────────────────────────────────
@@ -1048,6 +1060,7 @@ QString RigctlProtocol::cmdSendMorse(const QString& text)
 QString RigctlProtocol::cmdStopMorse()
 {
     if (!m_model) return rprt(-1);
+    completePendingAsyncResponse();
     auto* model = m_model;
     QMetaObject::invokeMethod(model, [model]() {
         model->cwxModel().clearBuffer();

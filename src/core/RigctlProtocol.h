@@ -81,6 +81,7 @@ private:
     SliceModel* findTxSlice() const;
     QString rprt(int code) const;
     void scheduleMorseAck(const QString& text);
+    void completePendingAsyncResponse();
 
     // Mode conversion tables
     static QString smartsdrToHamlib(const QString& mode);
@@ -96,6 +97,7 @@ private:
     bool m_pendingMorseLine{false};
     AsyncResponder m_asyncResponder;
     std::shared_ptr<bool> m_asyncResponsePending;
+    std::function<void()> m_completeAsyncResponse;
 };
 
 } // namespace AetherSDR
