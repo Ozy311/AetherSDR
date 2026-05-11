@@ -380,11 +380,19 @@ QString TciProtocol::cmdTrx(const QStringList& args, bool isSet)
     if (args.size() < 2) return {};
     bool tx = (args[1].toLower() == "true");
     QMetaObject::invokeMethod(m_model, [this, tx, trx]() {
-        // Assign TX to this TRX's slice before keying
+        // Only auto-assign TX if no slice currently owns it. External
+        // tools (e.g. CSN S.A.T. for satellite ops) pin TX to a specific
+        // slice via the radio API; overriding that on every PTT breaks
+        // full-duplex configurations. (#1807)
         if (tx) {
-            auto* s = sliceForTrx(trx);
-            if (s && !s->isTxSlice())
-                s->setTxSlice(true);
+            bool hasTxSlice = false;
+            for (auto* sl : m_model->slices()) {
+                if (sl->isTxSlice()) { hasTxSlice = true; break; }
+            }
+            if (!hasTxSlice) {
+                auto* s = sliceForTrx(trx);
+                if (s) s->setTxSlice(true);
+            }
         }
         m_model->setTransmit(tx);
     }, Qt::QueuedConnection);
@@ -405,11 +413,20 @@ QString TciProtocol::cmdTxEnable(const QStringList& args)
     bool enable = (args[1].toLower() == "true");
 
     if (enable) {
-        auto* s = sliceForTrx(trx);
-        if (s) {
-            QMetaObject::invokeMethod(s, [s]() {
-                s->setTxSlice(true);
-            }, Qt::QueuedConnection);
+        // Only auto-assign TX if no slice currently owns it — external
+        // tools (e.g. CSN S.A.T. for satellite ops) own the TX slice
+        // assignment in multi-slice setups. (#1807)
+        bool hasTxSlice = false;
+        for (auto* sl : m_model->slices()) {
+            if (sl->isTxSlice()) { hasTxSlice = true; break; }
+        }
+        if (!hasTxSlice) {
+            auto* s = sliceForTrx(trx);
+            if (s) {
+                QMetaObject::invokeMethod(s, [s]() {
+                    s->setTxSlice(true);
+                }, Qt::QueuedConnection);
+            }
         }
     }
 
