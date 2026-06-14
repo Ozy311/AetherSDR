@@ -1606,8 +1606,9 @@ MainWindow::MainWindow(QWidget* parent)
     // Unified CAT ports → wireCatPorts() (MainWindow_Session.cpp, #3351 Phase 2d).
     wireCatPorts();
 
-    // DAX IQ wiring (no-audio-bridge platforms) → wireDaxIq()
-    // (MainWindow_Session.cpp, #3351 Phase 2d).
+    // DAX IQ routing wiring — established once at construction for all platforms
+    // (independent of the audio bridge) → wireDaxIq() (MainWindow_Session.cpp;
+    // extracted #3351 Phase 2d, de-gated #3522).
     wireDaxIq();
 
     // ── Status bar telemetry ──────────────────────────────────────────────────
