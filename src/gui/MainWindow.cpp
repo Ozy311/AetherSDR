@@ -5244,6 +5244,32 @@ void MainWindow::onConnectionStateChanged(bool connected)
             }
         }
         m_wfLineDurationReconcile.clear();
+        for (auto it = m_panAverageReconcileConnections.begin();
+             it != m_panAverageReconcileConnections.end(); ++it) {
+            QObject::disconnect(it.value());
+        }
+        m_panAverageReconcileConnections.clear();
+        for (auto it = m_panWeightedAvgReconcileConnections.begin();
+             it != m_panWeightedAvgReconcileConnections.end(); ++it) {
+            QObject::disconnect(it.value());
+        }
+        m_panWeightedAvgReconcileConnections.clear();
+        for (auto it = m_panAverageReconcile.begin();
+             it != m_panAverageReconcile.end(); ++it) {
+            if (it->timer) {
+                it->timer->stop();
+                it->timer->deleteLater();
+            }
+        }
+        m_panAverageReconcile.clear();
+        for (auto it = m_panWeightedAvgReconcile.begin();
+             it != m_panWeightedAvgReconcile.end(); ++it) {
+            if (it->timer) {
+                it->timer->stop();
+                it->timer->deleteLater();
+            }
+        }
+        m_panWeightedAvgReconcile.clear();
         m_adaptiveThrottleActive = false;
         m_adaptiveFpsCap = 0;  // clear cap alongside throttle flag — see #2829 review
 
@@ -6625,6 +6651,193 @@ void MainWindow::schedulePanFpsReconcile(const QString& panId, int reportedFps)
     state.timer->start();
 }
 
+void MainWindow::schedulePanAverageReconcile(const QString& panId, int reportedAverage)
+{
+    // FFT averaging is radio-authoritative (#4001): the firmware runs the
+    // averaging and echoes the level in pan status. After a global-profile /
+    // band switch the firmware adopts the profile's stored average, but the
+    // client never re-asserts the user's displayed level. Mirror the fps
+    // reconcile — reuse the profile-load write-hold + cooldown guards. Unlike
+    // fps, averaging is NOT adaptively throttled, so there is deliberately NO
+    // adaptive-throttle guard here. average=0 (off) is a VALID desired value, so
+    // guard on < 0 (the unknown sentinel), never <= 0.
+    if (panId.isEmpty() || reportedAverage < 0)
+        return;
+    if (profileLoadRadioStateWritesHeld()) {
+        qCDebug(lcProtocol).noquote().nospace()
+            << "MainWindow: average reconcile suppressed for profile load pan=" << panId
+            << " reported=" << reportedAverage;
+        return;
+    }
+
+    auto* pan = m_radioModel.panadapter(panId);
+    if (!pan)
+        return;
+
+    auto& state = m_panAverageReconcile[panId];
+    if (!state.spectrum) {
+        if (auto* applet = m_panStack->panadapter(panId))
+            state.spectrum = applet->spectrumWidget();
+    }
+
+    auto* sw = state.spectrum.data();
+    if (!sw)
+        return;
+
+    const int desiredAverage = sw->fftAverage();
+    if (desiredAverage < 0)
+        return;
+    if (desiredAverage == reportedAverage) {
+        if (state.timer)
+            state.timer->stop();
+        state.lastSentMs = 0;
+        state.lastSentDesired = -1;
+        return;
+    }
+
+    if (!state.timer) {
+        state.timer = new QTimer(this);
+        state.timer->setSingleShot(true);
+        state.timer->setInterval(300);
+        connect(state.timer, &QTimer::timeout, this, [this, panId]() {
+            auto it = m_panAverageReconcile.find(panId);
+            if (it == m_panAverageReconcile.end())
+                return;
+
+            auto* pan = m_radioModel.panadapter(panId);
+            auto* sw = it->spectrum.data();
+            if (!sw) {
+                if (auto* applet = m_panStack->panadapter(panId)) {
+                    sw = applet->spectrumWidget();
+                    it->spectrum = sw;
+                }
+            }
+            if (!pan || !sw)
+                return;
+            if (profileLoadRadioStateWritesHeld()) {
+                qCDebug(lcProtocol).noquote().nospace()
+                    << "MainWindow: average timer suppressed for profile load pan=" << panId;
+                return;
+            }
+
+            const int reported = pan->average();
+            const int desired = sw->fftAverage();
+            if (reported < 0 || desired < 0 || reported == desired)
+                return;
+
+            constexpr qint64 kCooldownMs = 5000;
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            if (it->lastSentDesired == desired
+                && it->lastSentMs > 0
+                && now - it->lastSentMs < kCooldownMs) {
+                return;
+            }
+
+            qCDebug(lcProtocol).noquote().nospace()
+                << "MainWindow: reasserting panadapter average pan=" << panId
+                << " reported=" << reported
+                << " desired=" << desired;
+            m_radioModel.sendCommand(
+                QString("display pan set %1 average=%2").arg(panId).arg(desired));
+            it->lastSentMs = now;
+            it->lastSentDesired = desired;
+        });
+    }
+
+    state.timer->start();
+}
+
+void MainWindow::schedulePanWeightedAvgReconcile(const QString& panId, bool reportedWeighted)
+{
+    // weighted_average has the identical latent gap (#4001): a band switch via
+    // global profile adopts the profile's stored flag and the client never
+    // re-asserts the user's checkbox. Mirror the average reconcile; the wire
+    // field is a bool flag (weighted_average=0/1). No adaptive-throttle guard.
+    if (panId.isEmpty())
+        return;
+    if (profileLoadRadioStateWritesHeld()) {
+        qCDebug(lcProtocol).noquote().nospace()
+            << "MainWindow: weighted_average reconcile suppressed for profile load pan=" << panId
+            << " reported=" << reportedWeighted;
+        return;
+    }
+
+    auto* pan = m_radioModel.panadapter(panId);
+    if (!pan)
+        return;
+
+    auto& state = m_panWeightedAvgReconcile[panId];
+    if (!state.spectrum) {
+        if (auto* applet = m_panStack->panadapter(panId))
+            state.spectrum = applet->spectrumWidget();
+    }
+
+    auto* sw = state.spectrum.data();
+    if (!sw)
+        return;
+
+    const bool desiredWeighted = sw->fftWeightedAvg();
+    if (desiredWeighted == reportedWeighted) {
+        if (state.timer)
+            state.timer->stop();
+        state.lastSentMs = 0;
+        state.lastSentDesired = -1;
+        return;
+    }
+
+    if (!state.timer) {
+        state.timer = new QTimer(this);
+        state.timer->setSingleShot(true);
+        state.timer->setInterval(300);
+        connect(state.timer, &QTimer::timeout, this, [this, panId]() {
+            auto it = m_panWeightedAvgReconcile.find(panId);
+            if (it == m_panWeightedAvgReconcile.end())
+                return;
+
+            auto* pan = m_radioModel.panadapter(panId);
+            auto* sw = it->spectrum.data();
+            if (!sw) {
+                if (auto* applet = m_panStack->panadapter(panId)) {
+                    sw = applet->spectrumWidget();
+                    it->spectrum = sw;
+                }
+            }
+            if (!pan || !sw)
+                return;
+            if (profileLoadRadioStateWritesHeld()) {
+                qCDebug(lcProtocol).noquote().nospace()
+                    << "MainWindow: weighted_average timer suppressed for profile load pan=" << panId;
+                return;
+            }
+
+            const bool reported = pan->weightedAverage();
+            const bool desired = sw->fftWeightedAvg();
+            if (reported == desired)
+                return;
+
+            constexpr qint64 kCooldownMs = 5000;
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            const int desiredInt = desired ? 1 : 0;
+            if (it->lastSentDesired == desiredInt
+                && it->lastSentMs > 0
+                && now - it->lastSentMs < kCooldownMs) {
+                return;
+            }
+
+            qCDebug(lcProtocol).noquote().nospace()
+                << "MainWindow: reasserting panadapter weighted_average pan=" << panId
+                << " reported=" << reported
+                << " desired=" << desired;
+            m_radioModel.sendCommand(
+                QString("display pan set %1 weighted_average=%2").arg(panId).arg(desiredInt));
+            it->lastSentMs = now;
+            it->lastSentDesired = desiredInt;
+        });
+    }
+
+    state.timer->start();
+}
+
 void MainWindow::scheduleWaterfallLineDurationReconcile(const QString& panId, int reportedMs)
 {
     if (panId.isEmpty() || reportedMs <= 0)
@@ -6761,6 +6974,36 @@ void MainWindow::wirePanReconcilers(PanadapterApplet* applet, PanadapterModel* p
         }));
     scheduleWaterfallLineDurationReconcile(applet->panId(),
                                            pan->waterfallLineDuration());
+
+    auto oldAverageConnection =
+        m_panAverageReconcileConnections.take(applet->panId());
+    if (oldAverageConnection)
+        QObject::disconnect(oldAverageConnection);
+
+    auto& averageState = m_panAverageReconcile[applet->panId()];
+    averageState.spectrum = sw;
+    m_panAverageReconcileConnections.insert(
+        applet->panId(),
+        connect(pan, &PanadapterModel::averageReported,
+                this, [this, panId = applet->panId()](int average) {
+            schedulePanAverageReconcile(panId, average);
+        }));
+    schedulePanAverageReconcile(applet->panId(), pan->average());
+
+    auto oldWeightedAvgConnection =
+        m_panWeightedAvgReconcileConnections.take(applet->panId());
+    if (oldWeightedAvgConnection)
+        QObject::disconnect(oldWeightedAvgConnection);
+
+    auto& weightedAvgState = m_panWeightedAvgReconcile[applet->panId()];
+    weightedAvgState.spectrum = sw;
+    m_panWeightedAvgReconcileConnections.insert(
+        applet->panId(),
+        connect(pan, &PanadapterModel::weightedAverageReported,
+                this, [this, panId = applet->panId()](bool weighted) {
+            schedulePanWeightedAvgReconcile(panId, weighted);
+        }));
+    schedulePanWeightedAvgReconcile(applet->panId(), pan->weightedAverage());
 }
 
 // wirePanadapter() / revealFrequencyIfNeeded() / panFollowVfo() / wireVfoWidget() lives in MainWindow_Wiring.cpp (#3351 Phase 1d).

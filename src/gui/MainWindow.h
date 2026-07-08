@@ -438,6 +438,8 @@ private:
     void wirePanadapter(PanadapterApplet* applet);
     void wirePanReconcilers(PanadapterApplet* applet, PanadapterModel* pan);
     void schedulePanFpsReconcile(const QString& panId, int reportedFps);
+    void schedulePanAverageReconcile(const QString& panId, int reportedAverage);
+    void schedulePanWeightedAvgReconcile(const QString& panId, bool reportedWeighted);
     void scheduleWaterfallLineDurationReconcile(const QString& panId, int reportedMs);
     void reassertUnmutedSliceAudioForPan(const QString& panId);
     void onMuteAllSlicesToggle();
@@ -1132,6 +1134,26 @@ private:
     };
     QHash<QString, PanFpsReconcileState> m_panFpsReconcile;
     QHash<QString, QMetaObject::Connection> m_panFpsReconcileConnections;
+    // FFT averaging reconcile (#4001) — mirrors the fps reconcile so a global
+    // profile / band switch that adopts the profile's stored average/weighted
+    // value gets the user's desired value re-asserted once the write-hold
+    // releases. Averaging is NOT adaptively throttled, so no throttle guard.
+    struct PanAverageReconcileState {
+        QTimer* timer{nullptr};
+        QPointer<SpectrumWidget> spectrum;
+        qint64 lastSentMs{0};
+        int lastSentDesired{-1};
+    };
+    QHash<QString, PanAverageReconcileState> m_panAverageReconcile;
+    QHash<QString, QMetaObject::Connection> m_panAverageReconcileConnections;
+    struct PanWeightedAvgReconcileState {
+        QTimer* timer{nullptr};
+        QPointer<SpectrumWidget> spectrum;
+        qint64 lastSentMs{0};
+        int lastSentDesired{-1};   // 0/1 last-sent weighted_average flag
+    };
+    QHash<QString, PanWeightedAvgReconcileState> m_panWeightedAvgReconcile;
+    QHash<QString, QMetaObject::Connection> m_panWeightedAvgReconcileConnections;
     bool m_adaptiveThrottleActive{false}; // fps/wf reconcile suppressed while true
     int  m_adaptiveFpsCap{0};             // current cap (> 0 when throttle active); shown in network label
     struct WaterfallLineDurationReconcileState {

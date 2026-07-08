@@ -1366,6 +1366,32 @@ void MainWindow::wirePanLifecycle()
             }
             m_wfLineDurationReconcile.erase(it);
         }
+        if (auto it = m_panAverageReconcileConnections.find(panId);
+            it != m_panAverageReconcileConnections.end()) {
+            QObject::disconnect(it.value());
+            m_panAverageReconcileConnections.erase(it);
+        }
+        if (auto it = m_panWeightedAvgReconcileConnections.find(panId);
+            it != m_panWeightedAvgReconcileConnections.end()) {
+            QObject::disconnect(it.value());
+            m_panWeightedAvgReconcileConnections.erase(it);
+        }
+        if (auto it = m_panAverageReconcile.find(panId);
+            it != m_panAverageReconcile.end()) {
+            if (it->timer) {
+                it->timer->stop();
+                it->timer->deleteLater();
+            }
+            m_panAverageReconcile.erase(it);
+        }
+        if (auto it = m_panWeightedAvgReconcile.find(panId);
+            it != m_panWeightedAvgReconcile.end()) {
+            if (it->timer) {
+                it->timer->stop();
+                it->timer->deleteLater();
+            }
+            m_panWeightedAvgReconcile.erase(it);
+        }
 
         // Disconnect all signals from the dying applet's widgets to prevent
         // dangling pointer crashes in wirePanadapter lambdas (#242)

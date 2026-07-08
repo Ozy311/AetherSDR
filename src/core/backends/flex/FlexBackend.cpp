@@ -303,6 +303,8 @@ void FlexBackend::decodePanState(const QString& panId,
     carry(kvs, "loopa", st);
     carry(kvs, "loopb", st);
     carry(kvs, "fps", st);
+    carry(kvs, "average", st);
+    carry(kvs, "weighted_average", st);
     carry(kvs, "pre", st);
     carry(kvs, "daxiq_channel", st);
     carry(kvs, "client_handle", st);

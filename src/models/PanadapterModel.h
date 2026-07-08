@@ -77,6 +77,8 @@ public:
     bool loopA() const { return m_loopA; }
     bool loopB() const { return m_loopB; }
     int fps() const { return m_fps; }
+    int average() const { return m_average; }
+    bool weightedAverage() const { return m_weightedAverage; }
     int waterfallLineDuration() const { return m_waterfallLineDuration; }
     // Normalized waterfall-line-duration setter driven by the backend (universal
     // display timing). Feeds PerfTelemetry and always emits
@@ -128,6 +130,14 @@ signals:
     void loopChanged(bool loopA, bool loopB);
     void fpsChanged(int fps);
     void fpsReported(int fps);
+    // Averaging is radio-authoritative (firmware runs it, echoes the level in
+    // pan status). Reported fires every status cycle; Changed only on an actual
+    // change — mirrors the fps pair so MainWindow can reconcile after a
+    // global-profile / band switch adopts the profile's stored value (#4001).
+    void averageChanged(int average);
+    void averageReported(int average);
+    void weightedAverageChanged(bool weighted);
+    void weightedAverageReported(bool weighted);
     void waterfallLineDurationChanged(int ms);
     void waterfallLineDurationReported(int ms);
     void waterfallIdChanged(const QString& wfId);
@@ -155,6 +165,8 @@ private:
     bool        m_loopB{false};
     int         m_wnbLevel{50};
     int         m_fps{-1};
+    int         m_average{-1};        // -1 = unknown; 0 = off, 1-N = level (#4001)
+    bool        m_weightedAverage{false};
     int         m_waterfallLineDuration{-1};
     int         m_fftYPixels{-1};
     QString     m_preamp;
