@@ -1194,18 +1194,18 @@ void MainWindow::activateWFM(int sliceId)
     m_wfmSliceId = sliceId;
 
     // Centre the pan (and with it the DAX IQ stream) on the slice — once.
-    // applyPanStatus updates the local model immediately so offsets computed
-    // before the radio echoes the new centre are already correct.
+    // requestPanCenter() updates the local model as it puts the command on the
+    // wire, so offsets computed before the radio echoes the new centre are
+    // already correct — and during a profile load it defers the write instead of
+    // letting it be dropped, which would have left the DAX IQ stream centred
+    // somewhere the client no longer believed it was (#4142).
     auto centerPanAtSlice = [this, s]() {
         const QString panId = s->panId();
         if (panId.isEmpty()) return;
         const double freq = s->frequency();
         auto* pan = m_radioModel.panadapter(panId);
         if (pan && qFuzzyCompare(pan->centerMhz(), freq)) return;
-        const QString freqStr = QString::number(freq, 'f', 6);
-        if (pan) pan->setCenterBandwidth(freq, -1.0);  // aetherd RFC 2.3
-        m_radioModel.sendCommand(
-            QString("display pan set %1 center=%2").arg(panId, freqStr));
+        m_radioModel.requestPanCenter(panId, freq);
     };
     centerPanAtSlice();
 

@@ -444,6 +444,39 @@ public:
     void setPanBandwidth(double bandwidthMhz);
     void setPanCenter(double centerMhz);
     void setPanDbmRange(float minDbm, float maxDbm);
+
+    // #4142 — the ONLY supported way to write a pan center (and, optionally, a
+    // coupled bandwidth) to the radio.
+    //
+    // `display pan set <id> center=…` is classified as a profile-owned radio
+    // state write, so sendCmd() DROPS it while the profile-load hold is armed:
+    // it returns before a sequence number is allocated and the command never
+    // reaches the wire. A user action that lands in that window (typed
+    // frequency, zoom, drag, ATU sweep, automation) was silently lost, and the
+    // client kept its optimistic center — leaving the pan permanently claiming
+    // a center the radio never took.
+    //
+    // requestPanCenter() defers instead of dropping: while the hold is armed it
+    // coalesces the request per pan (last-write-wins) and returns false WITHOUT
+    // advancing local model state, so the client never claims a center the radio
+    // does not have. flushPendingProfileLoadPanCenters() replays it once the
+    // hold lifts.
+    //
+    // Pass bandwidthMhz > 0 to set center and bandwidth coherently in one
+    // command (zoom paths must never split the pair); pass <= 0 to leave the
+    // radio's bandwidth untouched.
+    //
+    // Returns true if the command reached the wire, false if it was deferred.
+    // Callers that also advance view state optimistically must gate that on the
+    // return value, or they will re-create the black-waterfall divergence.
+    bool requestPanCenter(const QString& panId,
+                          double centerMhz,
+                          double bandwidthMhz = -1.0);
+
+    // Replays deferred pan-center writes. Hard invariant: this early-returns
+    // while the hold is armed, so no deferred center can reach the wire inside
+    // the hold window.
+    void flushPendingProfileLoadPanCenters();
     void setPanWnb(bool on);
     void setPanWnbLevel(int level);
     void setPanRfGain(int gain);
@@ -683,6 +716,12 @@ private:
     bool m_wfAutoBlackOn{true};         // mirrors the client auto-black on/off
     bool m_wfAutoBlackRadioSide{false}; // false = client-side, true = radio-side
     bool profileLoadRadioStateWritesHeld() const;
+    // Raw sender for a pan center (+ optional coupled bandwidth). Applies the
+    // local model update and puts the command on the wire together, so the two
+    // can never diverge. Everything else must go through requestPanCenter().
+    void sendPanCenterToRadio(const QString& panId,
+                              double centerMhz,
+                              double bandwidthMhz);
     void registerAsGuiClient(const QString& clientId);
     void disconnectPendingClientsThen(std::function<void()> continuation);
     // LAN-only: subscribe to radio+client topics early, wait 400 ms for
@@ -1054,6 +1093,19 @@ private:
     int                m_rttyMarkDefault{2125};
     quint32            m_txClientHandle{0};  // handle of the client that owns TX
     qint64             m_profileLoadRadioStateWriteHoldUntilMs{0};
+
+    // #4142 — pan-center writes deferred while the profile-load hold is armed.
+    // bandwidthMhz <= 0 means "center only; leave the radio's bandwidth alone".
+    struct PendingPanCenter {
+        double centerMhz{0.0};
+        double bandwidthMhz{-1.0};
+    };
+    // panId → last requested center. Coalesced last-write-wins, but field-wise:
+    // a later center-only request must NOT erase a bandwidth an earlier zoom
+    // asked for, or that zoom's bandwidth would be the very thing we set out to
+    // stop dropping.
+    QHash<QString, PendingPanCenter> m_pendingProfileLoadPanCenters;
+
     QMap<quint32, ClientInfo> m_clientInfoMap; // handle → full client info
     std::function<void()> m_multiFlexContinuation; // saved continuation during conflict pause
     QMap<quint32, QString> m_clientStations;   // handle → station name (legacy, kept in sync)
