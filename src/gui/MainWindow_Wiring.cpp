@@ -468,23 +468,31 @@ bool MainWindow::snapCenterLockForSlice(SliceModel* slice, double mhz, bool send
         bandwidthMhz > 0.0 ? std::max(mhz, bandwidthMhz / 2.0) : mhz;
     bool changed = false;
 
-    if (sw && bandwidthMhz > 0.0
+    const bool modelNeedsCenter = !qFuzzyCompare(pan->centerMhz(), targetCenterMhz);
+    bool centerDeferred = false;
+
+    if (!kiwiDisplayActive && modelNeedsCenter) {
+        if (sendCommand) {
+            // #4142 — defer, never drop. requestPanCenter() advances the local
+            // model only when the command actually reaches the wire, and queues
+            // it for replay when a profile load is holding radio-state writes.
+            centerDeferred = !m_radioModel.requestPanCenter(panId, targetCenterMhz);
+        } else {
+            // Local-only snap: the caller explicitly wants no radio write, so
+            // there is no wire command for the model to diverge from.
+            pan->setCenterBandwidth(targetCenterMhz, -1.0);  // aetherd RFC 2.3
+        }
+        changed = !centerDeferred;
+    }
+
+    // Never move the visible span while the radio stays put. A view that claims
+    // a center the radio never took is precisely what projects honest tiles into
+    // a lying frame and bakes black rows into waterfall history (#4142).
+    if (!centerDeferred && sw && bandwidthMhz > 0.0
         && (!qFuzzyCompare(sw->centerMhz(), targetCenterMhz)
             || !qFuzzyCompare(sw->bandwidthMhz(), bandwidthMhz))) {
         sw->setFrequencyRangeImmediate(targetCenterMhz, bandwidthMhz);
         changed = true;
-    }
-
-    const bool modelNeedsCenter = !qFuzzyCompare(pan->centerMhz(), targetCenterMhz);
-    if (!kiwiDisplayActive && modelNeedsCenter) {
-        pan->setCenterBandwidth(targetCenterMhz, -1.0);  // aetherd RFC 2.3
-        changed = true;
-    }
-
-    if (sendCommand && !kiwiDisplayActive && modelNeedsCenter) {
-        m_radioModel.sendCommand(
-            QStringLiteral("display pan set %1 center=%2")
-                .arg(panId, QString::number(targetCenterMhz, 'f', 6)));
     }
 
     return changed;
@@ -1990,6 +1998,15 @@ void MainWindow::scheduleProfileLoadRecovery(const QString& profileType,
     });
     QTimer::singleShot(kProfileLoadDeferredPanFlushDelayMs, this, [this]() {
         flushPendingProfileLoadPanDimensions();
+        // Ordered after dimensions on the SAME timer — no fourth scheduler.
+        // Bin size is bandwidth/xpixels, so the pan must know its pixel geometry
+        // before it is recentered. This timer is the first flush point past hold
+        // expiry; the two earlier dimension flushes (1500/3500 ms) run INSIDE the
+        // hold, where xpixels/ypixels are exempt but a center write is not.
+        // flushPendingProfileLoadPanCenters() re-checks the hold itself and
+        // early-returns while it is armed, so no center can escape early even if
+        // this call site were moved. (#4142)
+        m_radioModel.flushPendingProfileLoadPanCenters();
     });
     QTimer::singleShot(kProfileLoadPostHoldRecoveryDelayMs, this, [this]() {
         m_profileLoadPendingFftYpixels.clear();
@@ -2529,13 +2546,13 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         }
         if (auto* pan = m_radioModel.panadapter(applet->panId())) {
             center = std::max(center, pan->bandwidthMhz() / 2.0);
-            // The radio may acknowledge this command without echoing a display
-            // status to the setting client. Keep the canonical model aligned
-            // with the visible pan so TCI dds: follows the IQ center.
-            pan->setCenterBandwidth(center, -1.0);
         }
-        m_radioModel.sendCommand(
-            QString("display pan set %1 center=%2").arg(applet->panId()).arg(center, 0, 'f', 6));
+        // The radio may acknowledge this command without echoing a display status
+        // to the setting client, so requestPanCenter() keeps the canonical model
+        // aligned with the wire command (TCI dds: follows this center) — and
+        // during a profile load it defers rather than letting sendCmd drop it
+        // silently (#4142).
+        m_radioModel.requestPanCenter(applet->panId(), center);
     });
     // Band/Segment Zoom toggle off the pan's radio-authoritative model state
     // (togglePanZoomModeForPan) — shared with the keyboard/MIDI shortcuts
@@ -3328,9 +3345,11 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
             // In-window drag moves pass the unchanged center purely to tune
             // without reveal — only emit the pan command when it actually moves.
             if (!qFuzzyCompare(centerMhz, pan->centerMhz())) {
-                m_radioModel.sendCommand(
-                    QString("display pan set %1 center=%2")
-                        .arg(pan->panId()).arg(centerMhz, 0, 'f', 6));
+                // Deferred rather than dropped during a profile load (#4142).
+                // The SpectrumWidget owns its own view during an edge-pan drag,
+                // so the gesture still tracks the cursor; the radio catches up
+                // when the deferred center flushes.
+                m_radioModel.requestPanCenter(pan->panId(), centerMhz);
             }
         }
         queueActiveSliceForSpectrumTarget(target->sliceId());
@@ -3804,10 +3823,12 @@ MainWindow::TuneCenteringResult MainWindow::revealFrequencyIfNeeded(
             ? kPanFollowAnimationDurationMs
             : 0;
 
-        pan->setCenterBandwidth(result.newCenterMhz, -1.0);  // aetherd RFC 2.3
-        m_radioModel.sendCommand(
-            QString("display pan set %1 center=%2")
-                .arg(pan->panId()).arg(result.newCenterMhz, 0, 'f', 6));
+        // #4142 — defer, never drop. During a profile load the pan center write
+        // is suppressed at the wire; advancing the local center anyway is what
+        // made the waterfall go black (the view claimed a center the radio never
+        // took). requestPanCenter() applies the model update only when the
+        // command actually goes out, and replays it once the hold lifts.
+        m_radioModel.requestPanCenter(pan->panId(), result.newCenterMhz);
         return result;
     }
 
@@ -3891,13 +3912,13 @@ MainWindow::TuneCenteringResult MainWindow::revealFrequencyIfNeeded(
         ? kPanFollowAnimationDurationMs
         : 0;
 
-    // Apply the center optimistically so the owning spectrum repaints
-    // immediately; SpectrumWidget decides whether that becomes a short
-    // retargetable animation or an immediate snap based on shift size.
-    pan->setCenterBandwidth(result.newCenterMhz, -1.0);  // aetherd RFC 2.3
-    m_radioModel.sendCommand(
-        QString("display pan set %1 center=%2")
-            .arg(pan->panId()).arg(result.newCenterMhz, 0, 'f', 6));
+    // Apply the center so the owning spectrum repaints immediately;
+    // SpectrumWidget decides whether that becomes a short retargetable animation
+    // or an immediate snap based on shift size. During a profile load this
+    // defers instead (#4142) — the model does not advance ahead of the radio, so
+    // the pan keeps showing truthful spectrum for its real span until the
+    // deferred center flushes.
+    m_radioModel.requestPanCenter(pan->panId(), result.newCenterMhz);
     return result;
 }
 

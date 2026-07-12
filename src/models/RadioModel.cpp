@@ -103,35 +103,9 @@ bool statusFlagSet(const QMap<QString, QString>& kvs, const QString& key)
         || value.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
 }
 
-bool isProfileOwnedRadioStateWrite(const QString& command)
-{
-    const QString trimmed = command.trimmed();
-    const QStringList tokens = trimmed.simplified().split(QLatin1Char(' '), Qt::SkipEmptyParts);
-    if (tokens.size() >= 5
-        && tokens[0] == QStringLiteral("display")
-        && tokens[1] == QStringLiteral("pan")
-        && tokens[2] == QStringLiteral("set")) {
-        bool hasPixelDimension = false;
-        for (int i = 4; i < tokens.size(); ++i) {
-            const QString key = tokens[i].section(QLatin1Char('='), 0, 0);
-            if (key != QStringLiteral("xpixels") && key != QStringLiteral("ypixels")) {
-                return true;
-            }
-            hasPixelDimension = true;
-        }
-        // xpixels/ypixels are allowed past this low-level guard because
-        // MainWindow queues them during a profile load and flushes them after
-        // the radio accepts the profile. Do not bypass
-        // MainWindow::requestPanDimensionsForRadio(); early dimension writes
-        // can cause the radio to save a partial GUIClient slice layout.
-        return !hasPixelDimension;
-    }
-
-    return trimmed.startsWith(QStringLiteral("slice set "))
-        || trimmed.startsWith(QStringLiteral("display pan set "))
-        || trimmed.startsWith(QStringLiteral("display panafall set "))
-        || trimmed.startsWith(QStringLiteral("display waterfall set "));
-}
+// isProfileOwnedRadioStateWrite() moved to ProfileLoadCommand.h so the
+// classification contract has a light, dependency-free test target
+// (profile_load_command_test). Behaviour unchanged. (#4142)
 
 void appendUniqueAntennaToken(QStringList& tokens, const QString& token)
 {
@@ -2761,11 +2735,115 @@ void RadioModel::setPanCenter(double centerMhz)
         // out-of-range center would be optimistically stored and advertised via
         // TCI dds: even though the radio rejects it.
         centerMhz = std::max(centerMhz, pan->bandwidthMhz() / 2.0);
-        pan->setCenterBandwidth(centerMhz, -1.0);
     }
-    sendCmd(
-        QString("display pan set %1 center=%2")
-            .arg(m_activePanId).arg(centerMhz, 0, 'f', 6));
+    requestPanCenter(m_activePanId, centerMhz);
+}
+
+bool RadioModel::requestPanCenter(const QString& panId,
+                                  double centerMhz,
+                                  double bandwidthMhz)
+{
+    if (panId.isEmpty()) {
+        return false;
+    }
+
+    // A pan center is profile-owned radio state, so sendCmd() would DROP this
+    // while a profile load is rebuilding the radio's topology. Defer it instead:
+    // queue the REQUESTED value and replay it once the hold lifts.
+    //
+    // Gate on exactly the predicate sendCmd() guards on, so "if sendCmd would
+    // drop it, we queue it" is an identity rather than an approximation — two
+    // separate clocks could skew and re-open the same silent drop.
+    if (profileLoadRadioStateWritesHeld()) {
+        PendingPanCenter& pending = m_pendingProfileLoadPanCenters[panId];
+        pending.centerMhz = centerMhz;
+        if (bandwidthMhz > 0.0) {
+            pending.bandwidthMhz = bandwidthMhz;
+        }
+
+        // Deliberately do NOT touch PanadapterModel here. The optimistic local
+        // update is the second half of #4142: with the command dropped, a client
+        // that advanced its own center claimed a center the radio never took.
+        // Honest VITA-49 tiles (each carrying its own FrameLowFreq/BinBandwidth)
+        // were then projected into a view that lied about its span, and the
+        // non-overlapping region rendered black — permanently, into history.
+        // Local state may only advance when a command actually reaches the wire.
+        qCDebug(lcProtocol).noquote()
+            << "RadioModel: deferring pan center during profile load"
+            << QStringLiteral("pan=%1").arg(panId)
+            << QStringLiteral("center=%1").arg(centerMhz, 0, 'f', 6);
+        return false;
+    }
+
+    sendPanCenterToRadio(panId, centerMhz, bandwidthMhz);
+    return true;
+}
+
+void RadioModel::sendPanCenterToRadio(const QString& panId,
+                                      double centerMhz,
+                                      double bandwidthMhz)
+{
+    if (PanadapterModel* pan = panadapter(panId)) {
+        // Keep the canonical model aligned with the command we are about to put
+        // on the wire: the radio may ACK without echoing a display status back
+        // to the setting client, and TCI dds: follows this center.
+        pan->setCenterBandwidth(centerMhz, bandwidthMhz > 0.0 ? bandwidthMhz : -1.0);
+    }
+
+    // Center and bandwidth must travel together when both are requested;
+    // splitting them produced the P1/P2 waterfall-loss and zoom-drift bugs.
+    const QString command = bandwidthMhz > 0.0
+        ? QString("display pan set %1 center=%2 bandwidth=%3")
+              .arg(panId)
+              .arg(centerMhz, 0, 'f', 6)
+              .arg(bandwidthMhz, 0, 'f', 6)
+        : QString("display pan set %1 center=%2")
+              .arg(panId)
+              .arg(centerMhz, 0, 'f', 6);
+
+    sendCommand(command);
+}
+
+void RadioModel::flushPendingProfileLoadPanCenters()
+{
+    if (m_pendingProfileLoadPanCenters.isEmpty() || !isConnected()) {
+        return;
+    }
+
+    // THE NON-REGRESSION PROOF, in one branch: while the hold is armed this
+    // returns without sending, so a deferred pan center can never put a byte on
+    // the wire inside the hold window. Nothing here can reintroduce the
+    // missing-slices corruption the hold exists to prevent.
+    //
+    // Returning WITHOUT clearing is deliberate. The hold can only still be armed
+    // because a further topology-rebuilding profile load re-armed it — and that
+    // load scheduled its own post-hold flush, which will replay these. Dropping
+    // them here would be the exact bug this method exists to fix.
+    if (profileLoadRadioStateWritesHeld()) {
+        return;
+    }
+
+    const QHash<QString, PendingPanCenter> pending =
+        std::exchange(m_pendingProfileLoadPanCenters, {});
+
+    int sent = 0;
+    for (auto it = pending.cbegin(); it != pending.cend(); ++it) {
+        // Re-resolve against the LIVE pan topology. A pan that the profile load
+        // removed — or replaced under a new id — simply never matches, so a
+        // stale center can never be applied to a pan that no longer exists.
+        if (!panadapter(it.key())) {
+            continue;
+        }
+
+        sendPanCenterToRadio(it.key(), it.value().centerMhz, it.value().bandwidthMhz);
+        ++sent;
+    }
+
+    if (sent > 0) {
+        qCDebug(lcProtocol).noquote()
+            << "RadioModel: flushed deferred profile-load pan centers"
+            << QStringLiteral("count=%1").arg(sent);
+    }
 }
 
 void RadioModel::setPanDbmRange(float minDbm, float maxDbm)
@@ -4857,7 +4935,12 @@ quint32 RadioModel::sendCmd(const QString& command, ResponseCallback cb)
     if (!profileLoad.valid
         && profileLoadRadioStateWritesHeld()
         && isProfileOwnedRadioStateWrite(command)) {
-        qCDebug(lcProtocol).noquote()
+        // Defense-in-depth backstop only. A command that reaches here is
+        // DROPPED — it never gets a sequence number and never reaches the wire.
+        // Callers that carry user intent must defer instead (see
+        // requestPanCenter()), so anything still landing here is a bug we want
+        // to see rather than silently swallow. (#4142)
+        qCWarning(lcProtocol).noquote()
             << "RadioModel: suppressing profile-load radio-state write"
             << command;
         if (cb) {
