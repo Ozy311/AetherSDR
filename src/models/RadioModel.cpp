@@ -4639,7 +4639,7 @@ void RadioModel::onMessageReceived(const ParsedMessage& msg)
 //   "meter 1"         → meter reading (handled by onMessageReceived)
 //   "removed=True"    → object was removed
 
-void RadioModel::sendCommand(const QString& cmd)
+bool RadioModel::sendCommand(const QString& cmd)
 {
     // #3977: last-line ownership gate for pan writes. Every UI path that
     // adjusts a pan (auto-floor, band restore, center/bandwidth/zoom/fps)
@@ -4654,12 +4654,16 @@ void RadioModel::sendCommand(const QString& cmd)
             qCWarning(lcProtocol).noquote()
                 << "RadioModel: dropping pan-set for foreign-owned pan"
                 << panId << "(owner 0x" + pan->clientHandle() + ") —" << cmd;
-            return;
+            return false;
         }
     }
     qCDebug(lcProtocol) << "RadioModel::sendCommand:" << cmd
              << "connected:" << isConnected() << "wan:" << (m_wanConn != nullptr);
-    this->sendCmd(cmd);
+    // sendCmd() reports a drop as sequence 0, before any wire write: the
+    // profile-load hold backstop returns 0 directly, and a disconnected WAN
+    // session returns 0 from WanConnection::sendCommand(). Both live seq
+    // counters start at 1, so seq != 0 is exactly "the command was dispatched".
+    return this->sendCmd(cmd) != 0;
 }
 
 void RadioModel::sendCmdPublic(const QString& cmd, ResponseCallback cb)

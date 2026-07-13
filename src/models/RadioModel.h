@@ -648,8 +648,14 @@ signals:
     void radioMessageReceived(const QString& text, MessageSeverity severity);
 
 public:
-    // Send a raw command to the radio (for dialogs that need direct protocol access).
-    void sendCommand(const QString& cmd);
+    // Send a raw command to the radio (for dialogs that need direct protocol
+    // access). Returns whether the command was actually dispatched: false when
+    // the foreign-owner gate (#3977) drops a pan write, when the profile-load
+    // hold backstop suppresses a profile-owned write (#4142), or when a WAN
+    // session is not connected. Callers that advance local state to match a
+    // command MUST gate that on this return, or the client will claim state
+    // the radio never took.
+    bool sendCommand(const QString& cmd);
 
     // Request local PTT for our station. Sends "client set local_ptt=1" and applies
     // an optimistic update in case the radio doesn't echo the state change.
