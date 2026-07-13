@@ -1998,15 +1998,16 @@ void MainWindow::scheduleProfileLoadRecovery(const QString& profileType,
     });
     QTimer::singleShot(kProfileLoadDeferredPanFlushDelayMs, this, [this]() {
         flushPendingProfileLoadPanDimensions();
-        // Ordered after dimensions on the SAME timer — no fourth scheduler.
-        // Bin size is bandwidth/xpixels, so the pan must know its pixel geometry
-        // before it is recentered. This timer is the first flush point past hold
-        // expiry; the two earlier dimension flushes (1500/3500 ms) run INSIDE the
-        // hold, where xpixels/ypixels are exempt but a center write is not.
-        // flushPendingProfileLoadPanCenters() re-checks the hold itself and
-        // early-returns while it is armed, so no center can escape early even if
-        // this call site were moved. (#4142)
-        m_radioModel.flushPendingProfileLoadPanCenters();
+        // Deferred pan WRITES (center/bandwidth/band) are NOT flushed from
+        // here. RadioModel owns that replay — hold-relative, armed by the act
+        // of deferring — because this entire recovery pass is gated on the
+        // profile-load ACK, and a large topology (8 pans / 8 slices, measured
+        // 5/5 on a 6700) can stall the radio into a force-disconnect before
+        // the ACK ever arrives; a flush scheduled here would never run. A
+        // dimensions-then-centers ordering is NOT required for correctness:
+        // every VITA-49 tile carries its own FrameLowFreq/BinBandwidth, so a
+        // recenter that lands before the pixel geometry settles is a
+        // self-correcting transient, not a scar. (#4142)
     });
     QTimer::singleShot(kProfileLoadPostHoldRecoveryDelayMs, this, [this]() {
         m_profileLoadPendingFftYpixels.clear();

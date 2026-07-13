@@ -15,6 +15,7 @@
 #include "SliceModel.h"
 #include "MeterModel.h"
 #include "PanadapterModel.h"
+#include "ProfileLoadPanWriteQueue.h"
 #include "TunerModel.h"
 #include "AmpModel.h"
 #include "TransmitModel.h"
@@ -445,38 +446,61 @@ public:
     void setPanCenter(double centerMhz);
     void setPanDbmRange(float minDbm, float maxDbm);
 
-    // #4142 — the ONLY supported way to write a pan center (and, optionally, a
-    // coupled bandwidth) to the radio.
+    // #4142 — the ONLY supported way for a USER-INTENT path to write a pan's
+    // center/bandwidth/band to the radio.
     //
-    // `display pan set <id> center=…` is classified as a profile-owned radio
-    // state write, so sendCmd() DROPS it while the profile-load hold is armed:
-    // it returns before a sequence number is allocated and the command never
-    // reaches the wire. A user action that lands in that window (typed
-    // frequency, zoom, drag, ATU sweep, automation) was silently lost, and the
-    // client kept its optimistic center — leaving the pan permanently claiming
-    // a center the radio never took.
+    // `display pan set <id> center=…` (and bandwidth=/band=) is classified as
+    // a profile-owned radio state write, so sendCmd() DROPS it while the
+    // profile-load hold is armed: it returns before a sequence number is
+    // allocated and the command never reaches the wire. A user action that
+    // lands in that window (typed frequency, zoom, drag, band change, ATU
+    // sweep, automation) was silently lost, and the client kept its optimistic
+    // state — leaving the pan permanently claiming state the radio never took.
     //
-    // requestPanCenter() defers instead of dropping: while the hold is armed it
-    // coalesces the request per pan (last-write-wins) and returns false WITHOUT
-    // advancing local model state, so the client never claims a center the radio
-    // does not have. flushPendingProfileLoadPanCenters() replays it once the
-    // hold lifts.
+    // requestPan*() defers instead of dropping: while the hold is armed it
+    // coalesces the request per pan (field-wise, last write wins per field)
+    // and returns false WITHOUT advancing local model state, so the client
+    // never claims state the radio does not have. The replay is scheduled by
+    // the act of deferring and re-checks the hold before sending.
+    //
+    // Deduping is centralized here against EFFECTIVE state — the pending value
+    // if one is queued, else the model (which keeps tracking radio status
+    // during the hold). A request equal to the model that supersedes a
+    // different pending value is a user CORRECTION: the pending entry is
+    // cancelled instead of replayed.
+    //
+    // Routing discipline is the user-intent boundary: model-echo/reconcile
+    // writers (active-slice reasserts, dBm auto-floor, fps/average reconciles)
+    // must keep their explicit guards and the sendCmd() backstop — #3563
+    // suppresses them during a profile load BY DESIGN. Do not route those.
     //
     // Pass bandwidthMhz > 0 to set center and bandwidth coherently in one
     // command (zoom paths must never split the pair); pass <= 0 to leave the
     // radio's bandwidth untouched.
     //
-    // Returns true if the command reached the wire, false if it was deferred.
-    // Callers that also advance view state optimistically must gate that on the
-    // return value, or they will re-create the black-waterfall divergence.
+    // Returns true if the radio's state matches the request (dispatched, or a
+    // corrective cancel — the radio is already there); false if the request is
+    // deferred or could not be dispatched. Callers that also advance view
+    // state optimistically must gate that on the return value, or they will
+    // re-create the black-waterfall divergence.
     bool requestPanCenter(const QString& panId,
                           double centerMhz,
                           double bandwidthMhz = -1.0);
+    bool requestPanBandwidth(const QString& panId, double bandwidthMhz);
+    bool requestPanBand(const QString& panId, const QString& bandKey);
 
-    // Replays deferred pan-center writes. Hard invariant: this early-returns
-    // while the hold is armed, so no deferred center can reach the wire inside
-    // the hold window.
-    void flushPendingProfileLoadPanCenters();
+    // Effective pan geometry: the deferred pending value if one is queued,
+    // else the live model value, else NaN when the pan is unknown. Caller-side
+    // no-op guards must compare against THIS, not the raw model — during the
+    // hold the model deliberately lags the user's deferred request.
+    double effectivePanCenterMhz(const QString& panId) const;
+    double effectivePanBandwidthMhz(const QString& panId) const;
+
+    // Replays deferred pan writes. Hard invariant: this early-returns while
+    // the hold is armed, so no deferred write can reach the wire inside the
+    // hold window. Scheduling is owned by the defer path (hold-relative,
+    // self-re-arming) — never by the profile-load ACK, which may never arrive.
+    void flushPendingProfileLoadPanWrites();
     void setPanWnb(bool on);
     void setPanWnbLevel(int level);
     void setPanRfGain(int gain);
@@ -723,16 +747,27 @@ private:
     bool m_wfAutoBlackOn{true};         // mirrors the client auto-black on/off
     bool m_wfAutoBlackRadioSide{false}; // false = client-side, true = radio-side
     bool profileLoadRadioStateWritesHeld() const;
-    // Raw sender for a pan center (+ optional coupled bandwidth). Applies the
-    // local model update and puts the command on the wire together, so the two
-    // can never diverge. Everything else must go through requestPanCenter().
-    void sendPanCenterToRadio(const QString& panId,
-                              double centerMhz,
-                              double bandwidthMhz);
-    // Schedules the deferred-pan-center replay for when the hold lifts. Armed by
+    // Raw senders (#4142). Both keep ALL wire-string building for the pan
+    // touchpoint in one place (AGENTS.md seam step 2.4: command encode migrates
+    // to FlexBackend per-touchpoint — these two functions are that touchpoint).
+    //
+    // dispatchPanCenterBandwidth re-clamps the center against the pan's
+    // CURRENT geometry, puts the command on the wire FIRST, and advances the
+    // model only when the send actually happened — wire-before-model is what
+    // makes a re-entrant request converge (last wire write == last model
+    // write) instead of diverging. bandwidthMhz <= 0 means center-only;
+    // centerMhz as NaN means bandwidth-only.
+    bool dispatchPanCenterBandwidth(const QString& panId,
+                                    double centerMhz,
+                                    double bandwidthMhz);
+    // No model write: band-stack state arrives via radio status.
+    bool dispatchPanBand(const QString& panId, const QString& bandKey);
+    // Schedules the deferred-pan-write replay for when the hold lifts. Armed by
     // the act of deferring, NOT by the profile-load ACK — a large topology can
     // stall the radio into a disconnect before it ever ACKs. (#4142)
-    void armProfileLoadPanCenterFlush();
+    void armProfileLoadPanWriteFlush();
+    // Voids one pan's deferred writes, loudly naming what was destroyed.
+    void voidPendingPanWrites(const QString& panId, const QString& reason);
     void registerAsGuiClient(const QString& clientId);
     void disconnectPendingClientsThen(std::function<void()> continuation);
     // LAN-only: subscribe to radio+client topics early, wait 400 ms for
@@ -1105,17 +1140,14 @@ private:
     quint32            m_txClientHandle{0};  // handle of the client that owns TX
     qint64             m_profileLoadRadioStateWriteHoldUntilMs{0};
 
-    // #4142 — pan-center writes deferred while the profile-load hold is armed.
-    // bandwidthMhz <= 0 means "center only; leave the radio's bandwidth alone".
-    struct PendingPanCenter {
-        double centerMhz{0.0};
-        double bandwidthMhz{-1.0};
-    };
-    // panId → last requested center. Coalesced last-write-wins, but field-wise:
-    // a later center-only request must NOT erase a bandwidth an earlier zoom
-    // asked for, or that zoom's bandwidth would be the very thing we set out to
-    // stop dropping.
-    QHash<QString, PendingPanCenter> m_pendingProfileLoadPanCenters;
+    // #4142 — user pan writes (band/center/bandwidth) deferred while the
+    // profile-load hold is armed. Field-wise coalescing lives in the queue
+    // type; see ProfileLoadPanWriteQueue.h for the semantics and
+    // profile_load_command_test for the contract.
+    ProfileLoadPanWriteQueue m_pendingProfileLoadPanWrites;
+    // Single owner of the replay schedule (stop/start re-arm — never a fan of
+    // one-shot timers, which would fire a stale flush for every extension).
+    QTimer m_profileLoadPanWriteFlushTimer;
 
     QMap<quint32, ClientInfo> m_clientInfoMap; // handle → full client info
     std::function<void()> m_multiFlexContinuation; // saved continuation during conflict pause
