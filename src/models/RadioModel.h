@@ -676,9 +676,13 @@ public:
     // access). Returns whether the command was actually dispatched: false when
     // the foreign-owner gate (#3977) drops a pan write, when the profile-load
     // hold backstop suppresses a profile-owned write (#4142), or when a WAN
-    // session is not connected. Callers that advance local state to match a
-    // command MUST gate that on this return, or the client will claim state
-    // the radio never took.
+    // session is not connected. The WAN case is the only transport failure
+    // this contract can see: the LAN path allocates a sequence number
+    // unconditionally, so a write queued onto a dead LAN socket still reports
+    // as dispatched (pre-existing optimistic behavior; a disconnect instead
+    // voids any deferred pan writes via onDisconnected()). Callers that
+    // advance local state to match a command MUST gate that on this return,
+    // or the client will claim state the radio never took.
     bool sendCommand(const QString& cmd);
 
     // Request local PTT for our station. Sends "client set local_ptt=1" and applies

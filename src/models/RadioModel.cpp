@@ -2729,9 +2729,10 @@ double RadioModel::panBandwidthMhz() const
 void RadioModel::setPanBandwidth(double bandwidthMhz)
 {
     if (m_activePanId.isEmpty()) return;
-    sendCmd(
-        QString("display pan set %1 bandwidth=%2")
-            .arg(m_activePanId).arg(bandwidthMhz, 0, 'f', 6));
+    // User-intent pan write: must go through the defer queue like its sibling
+    // setPanCenter() (#4142). A raw sendCmd() here would be silently dropped
+    // during the profile-load hold and trip the routed-pan-field backstop.
+    requestPanBandwidth(m_activePanId, bandwidthMhz);
 }
 
 void RadioModel::setPanCenter(double centerMhz)
