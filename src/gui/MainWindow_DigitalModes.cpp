@@ -1199,16 +1199,20 @@ void MainWindow::activateWFM(int sliceId)
     // already correct — and during a profile load it defers the write instead of
     // letting it be dropped, which would have left the DAX IQ stream centred
     // somewhere the client no longer believed it was (#4142).
-    auto centerPanAtSlice = [this, s]() {
+    // Returns whether the pan is centred on the slice NOW — a deferred
+    // recenter (profile-load hold) is a promise, not a fact, and the NCO
+    // must not be programmed as if it already happened.
+    auto centerPanAtSlice = [this, s]() -> bool {
         const QString panId = s->panId();
-        if (panId.isEmpty()) return;
+        if (panId.isEmpty()) return false;
         const double freq = s->frequency();
         auto* pan = m_radioModel.panadapter(panId);
-        // Effective (pending-else-model) center, so a recenter already
-        // deferred in flight is not re-requested on every call (#4142).
+        // Effective (pending-else-model) compare suppresses re-requesting a
+        // recenter already deferred in flight; "centred now" is only true
+        // when the MODEL (radio truth) agrees (#4142).
         if (pan && qFuzzyCompare(m_radioModel.effectivePanCenterMhz(panId), freq))
-            return;
-        m_radioModel.requestPanCenter(panId, freq);
+            return qFuzzyCompare(pan->centerMhz(), freq);
+        return m_radioModel.requestPanCenter(panId, freq);
     };
     centerPanAtSlice();
 
@@ -1246,9 +1250,18 @@ void MainWindow::activateWFM(int sliceId)
             (sliceFreqMhz - pan->centerMhz()) * 1e6);
         if (qAbs(offsetHz) <= m_wfmDemod->maxFreqOffsetHz()) {
             m_wfmDemod->setFreqOffsetHz(offsetHz);
-        } else {
-            centerPanAtSlice();
+        } else if (centerPanAtSlice()) {
             m_wfmDemod->setFreqOffsetHz(0.0f);
+        } else {
+            // The recenter is deferred (profile-load hold) or could not be
+            // dispatched — the DAX IQ stream is still centred where the radio
+            // is. A zero offset here would tune the demod to the WRONG
+            // frequency; keep best-effort audio at the clamped edge of the IQ
+            // window instead. The deferred recenter self-heals at flush, and
+            // the next frequencyChanged converges the offset. (#4142)
+            const float maxOffsetHz = m_wfmDemod->maxFreqOffsetHz();
+            m_wfmDemod->setFreqOffsetHz(
+                std::clamp(offsetHz, -maxOffsetHz, maxOffsetHz));
         }
     });
 }
