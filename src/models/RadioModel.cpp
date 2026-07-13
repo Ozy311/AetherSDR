@@ -6156,6 +6156,15 @@ void RadioModel::onStatusReceived(const QString& object,
             // Handle pan removal — "display pan 0x40000001 removed" arrives
             // with no '=' so the parser puts the whole string in 'object'
             if (kvs.contains("removed") || object.endsWith("removed")) {
+                // #4142: this pan's deferred writes die with it. Void them
+                // loudly NOW — the radio re-uses pan ids across a profile
+                // load (observed live on a 6700), so a write left queued here
+                // would replay onto a same-id NEWCOMER and override the state
+                // the profile just restored. The user's typed-tune-during-
+                // rebuild loses both halves consistently: the slice half died
+                // in the rebuild too.
+                voidPendingPanWrites(
+                    panId, QStringLiteral("pan removed during profile load"));
                 m_radioDisplayPans.remove(normalizePanadapterId(panId));   // #3856 Layer B inventory
                 m_pendingPanStatuses.remove(panId);
                 m_panTransmitInhibitReasons.remove(panId);
@@ -6250,6 +6259,10 @@ void RadioModel::onStatusReceived(const QString& object,
                     m_stalePanadapters.erase(it);
                 }
                 if (rejectedPan) {
+                    // #4142: any deferred writes targeted the pan the user
+                    // saw, not this id's rightful owner — void, loudly.
+                    voidPendingPanWrites(panId,
+                                         QStringLiteral("pan ownership lost"));
                     m_panTransmitInhibitReasons.remove(panId);
                     m_panTransmitInhibitedTxSlices.remove(panId);
                     m_panStream->unregisterPanStream(rejectedPan->panStreamId());
@@ -6281,6 +6294,11 @@ void RadioModel::onStatusReceived(const QString& object,
                             << "reassigned to client" << newOwner
                             << "— going quiet on it (#3977)";
                     }
+                    // #4142: going quiet includes the deferred writes — the
+                    // foreign-owner gate would drop them at flush anyway;
+                    // void them at the moment ownership actually flips.
+                    voidPendingPanWrites(panId,
+                                         QStringLiteral("pan ownership lost"));
                     m_panTransmitInhibitReasons.remove(panId);
                     m_panTransmitInhibitedTxSlices.remove(panId);
                     heldPan->setClientHandle(newOwner);
