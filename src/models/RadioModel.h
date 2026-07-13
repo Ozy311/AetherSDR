@@ -723,6 +723,10 @@ private:
     void sendPanCenterToRadio(const QString& panId,
                               double centerMhz,
                               double bandwidthMhz);
+    // Schedules the deferred-pan-center replay for when the hold lifts. Armed by
+    // the act of deferring, NOT by the profile-load ACK — a large topology can
+    // stall the radio into a disconnect before it ever ACKs. (#4142)
+    void armProfileLoadPanCenterFlush();
     void registerAsGuiClient(const QString& clientId);
     void disconnectPendingClientsThen(std::function<void()> continuation);
     // LAN-only: subscribe to radio+client topics early, wait 400 ms for

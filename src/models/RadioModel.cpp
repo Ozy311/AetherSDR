@@ -2772,6 +2772,16 @@ bool RadioModel::requestPanCenter(const QString& panId,
             << "RadioModel: deferring pan center during profile load"
             << QStringLiteral("pan=%1").arg(panId)
             << QStringLiteral("center=%1").arg(centerMhz, 0, 'f', 6);
+
+        // Whoever defers a write owns scheduling its replay. Do NOT rely on the
+        // profile-load ACK to schedule the flush: the hold is armed when the
+        // profile-load command is SENT, but MainWindow's recovery pass (and its
+        // flush timers) only runs on profileLoadCompleted, which is emitted on
+        // ACK. A large topology (8 pans / 8 slices, verified on a 6700) can stall
+        // the radio long enough that it misses pings and the client force-
+        // disconnects BEFORE the ACK ever arrives — in which case no flush would
+        // ever have been scheduled and this request would be stranded forever.
+        armProfileLoadPanCenterFlush();
         return false;
     }
 
@@ -2804,9 +2814,38 @@ void RadioModel::sendPanCenterToRadio(const QString& panId,
     sendCommand(command);
 }
 
+void RadioModel::armProfileLoadPanCenterFlush()
+{
+    // Re-arm for exactly when the hold lifts. The hold can be EXTENDED after we
+    // arm (the ACK pushes it out again, and a second profile load pushes it out
+    // further), so the flush re-checks and re-arms itself rather than trusting a
+    // single deadline computed up front.
+    const qint64 remainingMs =
+        m_profileLoadRadioStateWriteHoldUntilMs - QDateTime::currentMSecsSinceEpoch();
+    const int delayMs = static_cast<int>(std::max<qint64>(remainingMs, 0)) + 100;
+
+    QTimer::singleShot(delayMs, this, [this]() {
+        flushPendingProfileLoadPanCenters();
+    });
+}
+
 void RadioModel::flushPendingProfileLoadPanCenters()
 {
-    if (m_pendingProfileLoadPanCenters.isEmpty() || !isConnected()) {
+    if (m_pendingProfileLoadPanCenters.isEmpty()) {
+        return;
+    }
+
+    if (!isConnected()) {
+        // The session these requests belonged to is gone. Their pan ids and the
+        // user's intent both died with it, and the radio will rebuild its own
+        // topology on reconnect — replaying a pre-disconnect center could land a
+        // stale frequency on a pan that is no longer the same pan. Void them
+        // loudly rather than stranding or misapplying them. (onDisconnected()
+        // normally clears these first; this is the backstop.)
+        qCWarning(lcProtocol).noquote()
+            << "RadioModel: discarding" << m_pendingProfileLoadPanCenters.size()
+            << "deferred pan center(s) — disconnected before the profile load settled";
+        m_pendingProfileLoadPanCenters.clear();
         return;
     }
 
@@ -2815,11 +2854,12 @@ void RadioModel::flushPendingProfileLoadPanCenters()
     // the wire inside the hold window. Nothing here can reintroduce the
     // missing-slices corruption the hold exists to prevent.
     //
-    // Returning WITHOUT clearing is deliberate. The hold can only still be armed
-    // because a further topology-rebuilding profile load re-armed it — and that
-    // load scheduled its own post-hold flush, which will replay these. Dropping
-    // them here would be the exact bug this method exists to fix.
+    // Returning WITHOUT clearing is deliberate — we re-arm instead. The hold is
+    // still armed only because a further topology-rebuilding profile load pushed
+    // it out; dropping the request here would be the exact bug this method exists
+    // to fix.
     if (profileLoadRadioStateWritesHeld()) {
+        armProfileLoadPanCenterFlush();
         return;
     }
 
@@ -3817,6 +3857,19 @@ void RadioModel::restoreTuneInhibit()
 void RadioModel::onDisconnected()
 {
     qCDebug(lcProtocol) << "RadioModel: disconnected";
+
+    // #4142 — void any pan centers deferred during a profile load. The session
+    // they belonged to is gone: the radio rebuilds its topology on reconnect, so
+    // a queued center could land a stale frequency on a pan that is no longer the
+    // same pan. This is a real path, not a theoretical one — a large profile
+    // (8 pans / 8 slices on a 6700) can stall the radio past the ping timeout and
+    // force a disconnect BEFORE the profile load is ever ACKed.
+    if (!m_pendingProfileLoadPanCenters.isEmpty()) {
+        qCWarning(lcProtocol).noquote()
+            << "RadioModel: discarding" << m_pendingProfileLoadPanCenters.size()
+            << "deferred pan center(s) — disconnected before the profile load settled";
+        m_pendingProfileLoadPanCenters.clear();
+    }
 
     // Release sleep inhibition on disconnect (#1420)
     m_sleepInhibitor.release();
@@ -4937,12 +4990,31 @@ quint32 RadioModel::sendCmd(const QString& command, ResponseCallback cb)
         && isProfileOwnedRadioStateWrite(command)) {
         // Defense-in-depth backstop only. A command that reaches here is
         // DROPPED — it never gets a sequence number and never reaches the wire.
-        // Callers that carry user intent must defer instead (see
-        // requestPanCenter()), so anything still landing here is a bug we want
-        // to see rather than silently swallow. (#4142)
-        qCWarning(lcProtocol).noquote()
-            << "RadioModel: suppressing profile-load radio-state write"
-            << command;
+        //
+        // Warn only for pan geometry, which is the class routed through
+        // requestPanCenter(): one of those arriving here means a caller bypassed
+        // the defer path and a user command is being lost — a real bug (#4142).
+        //
+        // The other suppressions on this path are model-echo/reconcile writers
+        // that #3563 drops BY DESIGN (active-slice and TX-slice reasserts,
+        // panafall/waterfall auto-black defaults). Several fire on every profile
+        // load, so warning on them would cry wolf and bury the one line that
+        // actually means something.
+        const bool panGeometryWrite =
+            command.startsWith(QStringLiteral("display pan set "))
+            && (command.contains(QStringLiteral("center="))
+                || command.contains(QStringLiteral("bandwidth=")));
+
+        if (panGeometryWrite) {
+            qCWarning(lcProtocol).noquote()
+                << "RadioModel: DROPPED a pan geometry write during profile load —"
+                << "this should have been deferred via requestPanCenter()"
+                << command;
+        } else {
+            qCDebug(lcProtocol).noquote()
+                << "RadioModel: suppressing profile-load radio-state write"
+                << command;
+        }
         if (cb) {
             cb(kProfileLoadSuppressedCommandCode,
                QStringLiteral("suppressed during profile load"));
