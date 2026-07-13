@@ -459,16 +459,21 @@ bool MainWindow::snapCenterLockForSlice(SliceModel* slice, double mhz, bool send
     if (sw && sw->panDragActive()) {
         return false;
     }
+    // Effective (pending-else-model) geometry: during the profile-load hold
+    // the model deliberately lags a deferred request, and comparing against it
+    // would re-issue the same write on every echo (#4142).
+    const double effPanBandwidthMhz = m_radioModel.effectivePanBandwidthMhz(panId);
     const double bandwidthMhz = kiwiDisplayActive && sw && sw->bandwidthMhz() > 0.0
         ? sw->bandwidthMhz()
-        : (pan->bandwidthMhz() > 0.0
-            ? pan->bandwidthMhz()
+        : (effPanBandwidthMhz > 0.0
+            ? effPanBandwidthMhz
             : (sw ? sw->bandwidthMhz() : 0.0));
     const double targetCenterMhz =
         bandwidthMhz > 0.0 ? std::max(mhz, bandwidthMhz / 2.0) : mhz;
     bool changed = false;
 
-    const bool modelNeedsCenter = !qFuzzyCompare(pan->centerMhz(), targetCenterMhz);
+    const bool modelNeedsCenter =
+        !qFuzzyCompare(m_radioModel.effectivePanCenterMhz(panId), targetCenterMhz);
     bool centerDeferred = false;
 
     if (!kiwiDisplayActive && modelNeedsCenter) {
@@ -2537,16 +2542,23 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         if (kiwiSdrPanDisplaysKiwi(applet->panId())) {
             return;
         }
-        m_radioModel.sendCommand(
-            QString("display pan set %1 bandwidth=%2").arg(applet->panId()).arg(bw, 0, 'f', 6));
+        // #4142: a bandwidth drag is user intent — during the profile-load
+        // hold a bare sendCommand() is silently destroyed; defer it instead.
+        m_radioModel.requestPanBandwidth(applet->panId(), bw);
     });
     connect(sw, &SpectrumWidget::centerChangeRequested,
             this, [this, applet](double center) {
         if (kiwiSdrPanDisplaysKiwi(applet->panId())) {
             return;
         }
-        if (auto* pan = m_radioModel.panadapter(applet->panId())) {
-            center = std::max(center, pan->bandwidthMhz() / 2.0);
+        // Clamp against EFFECTIVE bandwidth (a deferred zoom's pending value,
+        // else the model): during the hold the model deliberately lags the
+        // user's deferred request. Dispatch re-clamps against live geometry
+        // regardless — this caller clamp is UX-only.
+        const double effBw =
+            m_radioModel.effectivePanBandwidthMhz(applet->panId());
+        if (effBw > 0.0) {
+            center = std::max(center, effBw / 2.0);
         }
         // The radio may acknowledge this command without echoing a display status
         // to the setting client, so requestPanCenter() keeps the canonical model
@@ -3342,10 +3354,15 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
             return;
         }
         if (auto* pan = m_radioModel.panadapter(target->panId())) {
-            centerMhz = std::max(centerMhz, pan->bandwidthMhz() / 2.0);
+            // Effective (pending-else-model) geometry, so a deferred write in
+            // flight dedupes instead of re-issuing per drag tick (#4142).
+            centerMhz = std::max(
+                centerMhz,
+                m_radioModel.effectivePanBandwidthMhz(pan->panId()) / 2.0);
             // In-window drag moves pass the unchanged center purely to tune
             // without reveal — only emit the pan command when it actually moves.
-            if (!qFuzzyCompare(centerMhz, pan->centerMhz())) {
+            if (!qFuzzyCompare(centerMhz,
+                               m_radioModel.effectivePanCenterMhz(pan->panId()))) {
                 // Deferred rather than dropped during a profile load (#4142).
                 // The SpectrumWidget owns its own view during an edge-pan drag,
                 // so the gesture still tracks the cursor; the radio catches up
@@ -3710,8 +3727,11 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
                                [this, panId = applet->panId()]() {
                 m_kiwiRebind.clearBandRecall(panId);
             });
-            m_radioModel.sendCommand(
-                QString("display pan set %1 band=%2").arg(applet->panId()).arg(stackKey));
+            // #4142: during the profile-load hold a bare sendCommand() band=
+            // write is silently destroyed. requestPanBand defers it instead.
+            // Outside a hold it dispatches inline, so the #4158 grace window
+            // above is unchanged on the normal user-initiated band-recall path.
+            m_radioModel.requestPanBand(applet->panId(), stackKey);
             QTimer::singleShot(300, this, [this, panId = applet->panId()]() {
                 reassertUnmutedSliceAudioForPan(panId);
             });

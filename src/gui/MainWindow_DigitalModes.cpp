@@ -1204,7 +1204,10 @@ void MainWindow::activateWFM(int sliceId)
         if (panId.isEmpty()) return;
         const double freq = s->frequency();
         auto* pan = m_radioModel.panadapter(panId);
-        if (pan && qFuzzyCompare(pan->centerMhz(), freq)) return;
+        // Effective (pending-else-model) center, so a recenter already
+        // deferred in flight is not re-requested on every call (#4142).
+        if (pan && qFuzzyCompare(m_radioModel.effectivePanCenterMhz(panId), freq))
+            return;
         m_radioModel.requestPanCenter(panId, freq);
     };
     centerPanAtSlice();

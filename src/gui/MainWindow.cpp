@@ -5669,8 +5669,10 @@ bool MainWindow::activateMemorySpot(int memoryIndex, const QString& preferredPan
                     << " key=" << stackKeyResult.key;
                 clearSwrSweepForBandChange(-1, slicePanId, memoryBand);
                 m_bandSettings.setCurrentBand(memoryBand);
-                m_radioModel.sendCommand(
-                    QString("display pan set %1 band=%2").arg(slicePanId, stackKeyResult.key));
+                // #4142: during the profile-load hold a bare sendCommand()
+                // band= write is silently destroyed and the recall lands on
+                // the wrong band stack. requestPanBand defers it instead.
+                m_radioModel.requestPanBand(slicePanId, stackKeyResult.key);
                 QTimer::singleShot(300, this, [this, slicePanId]() {
                     reassertUnmutedSliceAudioForPan(slicePanId);
                 });
@@ -5908,8 +5910,11 @@ MainWindow::BandStackPreselectResult MainWindow::preselectBandStackForTune(
         << " key=" << stackKeyResult.key;
     clearSwrSweepForBandChange(-1, slice->panId(), targetBand);
     m_bandSettings.setCurrentBand(targetBand);
-    m_radioModel.sendCommand(
-        QString("display pan set %1 band=%2").arg(slice->panId(), stackKeyResult.key));
+    // #4142: the cross-band typed tune is the reported bug's worst variant —
+    // the `slice tune` half survives the hold while a bare sendCommand()
+    // band= write is silently destroyed, so the slice lands outside the pan.
+    // requestPanBand defers the band-stack swap and replays it band-first.
+    m_radioModel.requestPanBand(slice->panId(), stackKeyResult.key);
     QTimer::singleShot(300, this, [this, panId = slice->panId()]() {
         reassertUnmutedSliceAudioForPan(panId);
     });
@@ -6062,8 +6067,13 @@ void MainWindow::applyPanRangeRequest(const QString& panId, double centerMhz,
     auto* pan = m_radioModel.panadapter(panId);
 
     if (pan) {
-        if (qFuzzyCompare(pan->centerMhz(), centerMhz)
-            && qFuzzyCompare(pan->bandwidthMhz(), bandwidthMhz)) {
+        // Effective (pending-else-model) geometry: during the profile-load
+        // hold the model deliberately lags a deferred request; comparing
+        // against it would treat the user's pending zoom as "already there"
+        // — or re-issue it forever (#4142).
+        if (qFuzzyCompare(m_radioModel.effectivePanCenterMhz(panId), centerMhz)
+            && qFuzzyCompare(m_radioModel.effectivePanBandwidthMhz(panId),
+                             bandwidthMhz)) {
             return;
         }
     }
