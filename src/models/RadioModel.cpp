@@ -5269,8 +5269,9 @@ quint32 RadioModel::sendCmd(const QString& command, ResponseCallback cb)
         // Defense-in-depth backstop only. A command that reaches here is
         // DROPPED — it never gets a sequence number and never reaches the wire.
         //
-        // Warn only for pan geometry, which is the class routed through
-        // requestPanCenter(): one of those arriving here means a caller bypassed
+        // Warn only for the routed fields (center/bandwidth/band), which is
+        // the class carried by requestPanCenter()/requestPanBandwidth()/
+        // requestPanBand(): one of those arriving here means a caller bypassed
         // the defer path and a user command is being lost — a real bug (#4142).
         //
         // The other suppressions on this path are model-echo/reconcile writers
@@ -5278,15 +5279,19 @@ quint32 RadioModel::sendCmd(const QString& command, ResponseCallback cb)
         // panafall/waterfall auto-black defaults). Several fire on every profile
         // load, so warning on them would cry wolf and bury the one line that
         // actually means something.
-        const bool panGeometryWrite =
+        //
+        // " band=" keeps its leading space so it cannot match inside
+        // "bandwidth=" — the two are distinct fields with distinct routes.
+        const bool routedPanFieldWrite =
             command.startsWith(QStringLiteral("display pan set "))
             && (command.contains(QStringLiteral("center="))
-                || command.contains(QStringLiteral("bandwidth=")));
+                || command.contains(QStringLiteral("bandwidth="))
+                || command.contains(QStringLiteral(" band=")));
 
-        if (panGeometryWrite) {
+        if (routedPanFieldWrite) {
             qCWarning(lcProtocol).noquote()
-                << "RadioModel: DROPPED a pan geometry write during profile load —"
-                << "this should have been deferred via requestPanCenter()"
+                << "RadioModel: DROPPED a routed pan field write during profile load —"
+                << "this should have been deferred via requestPan*()"
                 << command;
         } else {
             qCDebug(lcProtocol).noquote()
