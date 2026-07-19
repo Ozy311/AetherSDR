@@ -245,7 +245,7 @@ TOOLS = [
             "Live JSON snapshot of app/radio state — assert on state "
             "without screenshots. model = audio | dsp | radio | "
             "transmit | slice <selector: id|active|tx> | slices | pan "
-            "<selector: id|active> | pans | flags | kiwi | sync. "
+            "<selector: id|active> | pans | flags | kiwi | sync | clock. "
             "Optional `property` returns just that field."),
         "inputSchema": {"type": "object", "properties": {
             "model": {"type": "string"},

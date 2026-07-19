@@ -553,6 +553,8 @@ set(CORE_SOURCES
     src/core/TimeFrameVoter.cpp
     src/core/WwvDecoder.cpp
     src/core/WwvbDecoder.cpp
+    src/core/AetherClockEngine.cpp
+    src/core/AetherClockSettings.cpp
     src/core/PacketLossConcealment.cpp
     src/core/PerfTelemetry.cpp
     src/core/RigctlProtocol.cpp
@@ -704,6 +706,7 @@ set(MODEL_SOURCES
     src/models/BandPlanManager.cpp
     src/models/XvtrPolicy.cpp
     src/models/AntennaGeniusModel.cpp
+    src/models/AetherClockModel.cpp
 )
 
 # Vendored QGeoView (LGPL-3.0) — slippy-map widget for the common
@@ -3863,6 +3866,18 @@ target_include_directories(wwvb_decoder_test PRIVATE src)
 target_link_libraries(wwvb_decoder_test PRIVATE aethercore Qt6::Core Qt6::Test)
 set_target_properties(wwvb_decoder_test PROPERTIES AUTOMOC ON)
 add_test(NAME wwvb_decoder_test COMMAND wwvb_decoder_test)
+
+add_executable(aetherclock_engine_test tests/aetherclock_engine_test.cpp)
+target_include_directories(aetherclock_engine_test PRIVATE src)
+target_link_libraries(aetherclock_engine_test PRIVATE aethercore Qt6::Core Qt6::Test)
+set_target_properties(aetherclock_engine_test PROPERTIES AUTOMOC ON)
+add_test(NAME aetherclock_engine_test COMMAND aetherclock_engine_test)
+
+add_executable(aetherclock_model_test tests/aetherclock_model_test.cpp)
+target_include_directories(aetherclock_model_test PRIVATE src)
+target_link_libraries(aetherclock_model_test PRIVATE aethercore Qt6::Core Qt6::Test)
+set_target_properties(aetherclock_model_test PROPERTIES AUTOMOC ON)
+add_test(NAME aetherclock_model_test COMMAND aetherclock_model_test)
 
 add_executable(aetherd_amp_decode_test tests/aetherd_amp_decode_test.cpp)
 target_include_directories(aetherd_amp_decode_test PRIVATE src)

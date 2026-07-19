@@ -1,0 +1,379 @@
+#include "core/AetherClockEngine.h"
+
+#include "core/WwvDecoder.h"
+#include "core/WwvbDecoder.h"
+#include "models/SliceModel.h"
+
+#include <QByteArray>
+#include <QDateTime>
+#include <QDebug>
+#include <QMetaObject>
+#include <QPointer>
+#include <QString>
+#include <QTimeZone>
+#include <QVector>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <vector>
+
+namespace AetherSDR {
+
+namespace {
+
+// Type-erasing holder so the engine can own EITHER time-signal decoder behind
+// one pointer: WwvDecoder and WwvbDecoder expose an identical surface
+// (WwvDecoder.h / WwvbDecoder.h) but share no base class. This is purely an
+// implementation detail of Task A's "owned WwvDecoder/WwvbDecoder (create the
+// one selected at start())".
+struct IDecoder {
+    virtual ~IDecoder() = default;
+    virtual void process(const float* mono, std::size_t n) = 0;
+    virtual void reset() = 0;
+    virtual ClockStation station() const = 0;
+    virtual std::int64_t samplesConsumed() const = 0;
+
+    // Engine-side callbacks, forwarded from the concrete decoder's callbacks.
+    std::function<void(const ClockSecondInfo&)> onSecond;
+    std::function<void(const ClockFrameInfo&)> onFrame;
+    std::function<void(const ClockTimeInfo&)> onTime;
+    std::function<void(ClockLockState)> onStateChanged;
+};
+
+template <class D>
+struct DecoderHolder final : IDecoder {
+    D d;
+    explicit DecoderHolder(int sampleRateHz) : d(sampleRateHz) {
+        d.onSecond = [this](const ClockSecondInfo& i) { if (onSecond) onSecond(i); };
+        d.onFrame = [this](const ClockFrameInfo& fr) { if (onFrame) onFrame(fr); };
+        d.onTime = [this](const ClockTimeInfo& t) { if (onTime) onTime(t); };
+        d.onStateChanged = [this](ClockLockState s) { if (onStateChanged) onStateChanged(s); };
+    }
+    void process(const float* mono, std::size_t n) override { d.process(mono, n); }
+    void reset() override { d.reset(); }
+    ClockStation station() const override { return d.station(); }
+    std::int64_t samplesConsumed() const override { return d.samplesConsumed(); }
+};
+
+} // namespace
+
+struct AetherClockEngine::Impl {
+    explicit Impl(AetherClockEngine* owner) : q(owner) {}
+
+    AetherClockEngine* q = nullptr;
+
+    // DAX-hold provider (EB3: the engine never touches the vendor stream). The
+    // wiring layer wraps the central PanadapterStream::acquire/releaseDaxChannel
+    // with DaxConsumer::Clock; the engine drives these with the bound channel.
+    std::function<void(int)> acquireCh;
+    std::function<void(int)> releaseCh;
+
+    QPointer<SliceModel> slice;
+    std::unique_ptr<IDecoder> decoder;
+
+    int heldChannel = 0;                              // 0 = none
+    ClockStation configured = ClockStation::Unknown;  // station chosen at start()
+    ClockStation lastStation = ClockStation::Unknown; // for stationDetected edges
+    ClockLockState lastState = ClockLockState::NoSignal;
+    bool running = false;
+
+    std::function<qint64()> nowUtcMs =
+        [] { return QDateTime::currentMSecsSinceEpoch(); };
+
+    // Sample <-> host anchor: host time `anchorHostMs` corresponds to total
+    // consumed sample `anchorSamples` (the END of the last fed buffer).
+    std::int64_t anchorSamples = 0;
+    qint64 anchorHostMs = 0;
+
+    // Second-0 sample index of the most recent completed frame (from onFrame,
+    // which always fires immediately before the vote refresh). votedField
+    // (FieldMinutes) is normalized to this newest frame, so hh:mm from the vote
+    // is the time AT this frame's second 0 — the anchor for onTime composition.
+    std::int64_t lastFrameStartSample = 0;
+    bool haveFrame = false;
+
+    std::vector<float> monoScratch;
+
+    QMetaObject::Connection connDax;
+    QMetaObject::Connection connDestroyed;
+
+    double hostMsAtSample(std::int64_t s) const {
+        return static_cast<double>(anchorHostMs)
+             - static_cast<double>(anchorSamples - s) * 1000.0
+                   / static_cast<double>(AetherClockEngine::kSampleRateHz);
+    }
+
+    void setState(ClockLockState s) {
+        if (s == lastState) return;
+        lastState = s;
+        emit q->lockStateChanged(s);
+        emit q->lockedChanged(s == ClockLockState::Locked);
+    }
+
+    void disconnectAll() {
+        QObject::disconnect(connDax);
+        QObject::disconnect(connDestroyed);
+        connDax = {};
+        connDestroyed = {};
+    }
+
+    void releaseHold() {
+        if (releaseCh && heldChannel >= 1 && heldChannel <= 4)
+            releaseCh(heldChannel);
+        heldChannel = 0;
+    }
+
+    // ---- Decoder callbacks: fire inline on the feed thread during process() ----
+
+    void handleState(ClockLockState st) { setState(st); }
+
+    void handleSecond(const ClockSecondInfo& info) {
+        ClockAlignmentFrame f;
+        f.hostUtcMs = static_cast<qint64>(std::llround(hostMsAtSample(info.edgeSample)));
+        f.secondOfFrame = info.secondOfFrame;
+        f.envelope = QVector<float>(info.envelope.begin(), info.envelope.end());
+        f.expected = QVector<float>(info.expected.begin(), info.expected.end());
+        // The decoders' 1 s alignment window is edge-anchored: the window start
+        // IS the detected AM-drop second edge (WwvDecoder.cpp: the window is cut
+        // at the tick-phase boundary and edgeSample = startJ * decim), so there
+        // is no window->edge lead to report.
+        f.edgeOffsetMs = 0;
+        f.symbol = static_cast<int>(info.symbol);
+        f.confidence = info.confidence;
+        f.station = static_cast<quint8>(static_cast<int>(decoder->station()));
+        emit q->alignmentFrame(f);
+
+        // Surface the station once the decoder classifies it (WWV/WWVH by tick
+        // band per NIST SP 432; WWVB by construction).
+        const ClockStation st = decoder->station();
+        if (st != lastStation) {
+            lastStation = st;
+            emit q->stationDetected(st);
+        }
+    }
+
+    void handleFrame(const ClockFrameInfo& frame) {
+        // Fires immediately BEFORE any vote refresh; frameStartSample is the
+        // decoder input-sample index of this frame's second 0 (same clock as
+        // lastEdgeSample and the host anchor).
+        lastFrameStartSample = frame.frameStartSample;
+        haveFrame = true;
+    }
+
+    void handleTime(const ClockTimeInfo& t) {
+        // Compose from the voted frame's second 0 plus the elapsed-sample count
+        // to the last edge. This is exact across WWVB per-second re-emission
+        // (cached vote), WWV chunk-straddle, and multi-frame backlog, because
+        // lastEdgeSecondOfFrame can point into a frame LATER than the vote —
+        // using it directly would be up to minutes off. No host-clock snapping.
+        if (!haveFrame) return;  // onFrame always precedes the vote; guard anyway
+
+        const int year = 2000 + t.year2;
+        // doy is 1-based day-of-year (NIST SP 432 BCD day field).
+        const QDate date = QDate::fromJulianDay(
+            QDate(year, 1, 1).toJulianDay() + static_cast<qint64>(t.doy) - 1);
+        // hh:mm AT the voted frame's second 0 (votedField(Minutes) is normalized
+        // to the newest frame = the most recent onFrame).
+        const QDateTime baseUtc(date, QTime(t.hour, t.minute, 0), QTimeZone::utc());
+        const int elapsedSec = static_cast<int>(std::lround(
+            static_cast<double>(t.lastEdgeSample - lastFrameStartSample)
+            / static_cast<double>(AetherClockEngine::kSampleRateHz)));
+        const QDateTime decodedUtc = baseUtc.addSecs(elapsedSec);
+
+        const double offsetMs =
+            static_cast<double>(decodedUtc.toMSecsSinceEpoch())
+            - hostMsAtSample(t.lastEdgeSample);
+        int quality = static_cast<int>(std::lround(t.quality * 100.0));
+        quality = std::clamp(quality, 0, 100);
+        emit q->timeDecoded(decodedUtc, offsetMs, quality);
+    }
+};
+
+AetherClockEngine::AetherClockEngine(QObject* parent)
+    : QObject(parent), m_impl(std::make_unique<Impl>(this)) {
+    // Register everything that crosses queued connections (GpsDelta precedent).
+    qRegisterMetaType<AetherSDR::ClockAlignmentFrame>();
+    qRegisterMetaType<AetherSDR::ClockLockState>("AetherSDR::ClockLockState");
+    qRegisterMetaType<AetherSDR::ClockStation>("AetherSDR::ClockStation");
+}
+
+AetherClockEngine::~AetherClockEngine() {
+    // Silent teardown: never leak a DAX hold (INV-3). No signals from a dying
+    // object.
+    m_impl->disconnectAll();
+    m_impl->releaseHold();
+    m_impl->decoder.reset();
+}
+
+void AetherClockEngine::setDaxChannelProvider(std::function<void(int)> acquire,
+                                              std::function<void(int)> release) {
+    m_impl->acquireCh = std::move(acquire);
+    m_impl->releaseCh = std::move(release);
+}
+
+void AetherClockEngine::setHostClock(std::function<qint64()> nowUtcMs) {
+    if (nowUtcMs)
+        m_impl->nowUtcMs = std::move(nowUtcMs);
+    else
+        m_impl->nowUtcMs = [] { return QDateTime::currentMSecsSinceEpoch(); };
+}
+
+bool AetherClockEngine::isRunning() const { return m_impl->running; }
+
+int AetherClockEngine::boundSliceId() const {
+    return m_impl->slice ? m_impl->slice->sliceId() : -1;
+}
+
+ClockStation AetherClockEngine::configuredStation() const {
+    return m_impl->configured;
+}
+
+ClockLockState AetherClockEngine::lockState() const { return m_impl->lastState; }
+
+void AetherClockEngine::start(SliceModel* slice, ClockStation station) {
+    auto& d = *m_impl;
+    if (d.running) stop();
+
+    // Require a slice to bind; stay stopped otherwise.
+    if (!slice) {
+        qWarning() << "AetherClockEngine::start: no slice - staying stopped";
+        return;
+    }
+
+    d.slice = slice;
+    d.configured = station;
+    d.lastStation = ClockStation::Unknown;
+
+    // Create the selected decoder and wire its inline callbacks.
+    if (station == ClockStation::Wwvb)
+        d.decoder = std::make_unique<DecoderHolder<WwvbDecoder>>(kSampleRateHz);
+    else
+        d.decoder = std::make_unique<DecoderHolder<WwvDecoder>>(kSampleRateHz);
+    d.decoder->onSecond = [this](const ClockSecondInfo& i) { m_impl->handleSecond(i); };
+    d.decoder->onFrame = [this](const ClockFrameInfo& fr) { m_impl->handleFrame(fr); };
+    d.decoder->onTime = [this](const ClockTimeInfo& t) { m_impl->handleTime(t); };
+    d.decoder->onStateChanged = [this](ClockLockState s) { m_impl->handleState(s); };
+
+    // Fresh sample<->host and frame anchors for the fresh decoder.
+    d.anchorSamples = 0;
+    d.anchorHostMs = d.nowUtcMs();
+    d.lastFrameStartSample = 0;
+    d.haveFrame = false;
+
+    // Hold the slice's LIVE DAX channel through the injected provider (the
+    // wiring layer routes this to the central #3305 ownership registry).
+    const int ch = slice->daxChannel();
+    d.heldChannel = 0;
+    if (!d.acquireCh || !d.releaseCh) {
+        qWarning() << "AetherClockEngine::start: no DAX channel provider set -"
+                   << "hold not acquired; audio will not flow";
+    } else if (ch >= 1 && ch <= 4) {
+        d.heldChannel = ch;
+        d.acquireCh(ch);
+    } else {
+        qWarning() << "AetherClockEngine::start: slice" << slice->sliceId()
+                   << "has no DAX channel assigned - audio will not flow";
+    }
+
+    // Follow mid-session DAX reassignment THROUGH THE PROVIDER: acquire NEW
+    // before releasing OLD so the channel's holder set never transiently hits
+    // zero (RADE precedent).
+    d.connDax = connect(slice, &SliceModel::daxChannelChanged, this,
+                        [this](int newCh) {
+        auto& e = *m_impl;
+        if (!e.acquireCh || !e.releaseCh) return;
+        const int oldCh = e.heldChannel;
+        const int nc = (newCh >= 1 && newCh <= 4) ? newCh : 0;
+        if (nc) e.acquireCh(nc);
+        if (oldCh >= 1 && oldCh <= 4 && oldCh != nc) e.releaseCh(oldCh);
+        e.heldChannel = nc;
+    });
+
+    // Graceful loss if the bound slice is destroyed under us.
+    d.connDestroyed = connect(slice, &QObject::destroyed, this, [this] {
+        auto& e = *m_impl;
+        e.releaseHold();
+        e.disconnectAll();
+        if (e.decoder) e.decoder->reset();
+        e.running = false;
+        e.setState(ClockLockState::NoSignal);
+        emit runningChanged(false);
+    });
+
+    d.running = true;
+    d.lastState = ClockLockState::NoSignal;  // state starts NoSignal
+    emit runningChanged(true);
+}
+
+void AetherClockEngine::stop() {
+    auto& d = *m_impl;
+    const bool was = d.running;
+    d.releaseHold();
+    d.disconnectAll();
+    if (d.decoder) d.decoder->reset();
+    d.decoder.reset();
+    d.slice = nullptr;
+    d.lastStation = ClockStation::Unknown;
+    d.haveFrame = false;
+    d.running = false;
+    d.setState(ClockLockState::NoSignal);  // emits only on actual change
+    if (was) emit runningChanged(false);
+}
+
+void AetherClockEngine::applyStationPreset(ClockStation station, double carrierMHz) {
+    auto& d = *m_impl;
+    if (!d.slice) return;  // no-op unless bound
+    // All-or-nothing: on a locked slice only setFrequency honors the lock
+    // (SliceModel.cpp), so applying the preset would strand the slice on its
+    // old frequency while still forcing USB (and AGC off for WWVB). Refuse the
+    // whole preset instead of leaving an inconsistent state.
+    if (d.slice->isLocked()) {
+        qWarning() << "AetherClockEngine: bound slice is locked -"
+                   << "station preset not applied";
+        return;
+    }
+    // Radio-authoritative live-slice state only; nothing persisted.
+    d.slice->setFrequency(listeningDialMHz(carrierMHz));
+    d.slice->setMode(QStringLiteral("USB"));
+    if (station == ClockStation::Wwvb)
+        d.slice->setAgcMode(QStringLiteral("off"));
+}
+
+void AetherClockEngine::feedRxAudio(int channel, const QByteArray& pcm) {
+    auto& d = *m_impl;
+    if (!d.running || !d.decoder || !d.slice) return;
+    if (channel != d.slice->daxChannel()) return;  // live channel filter
+
+    // Payload: float32 interleaved stereo, native-endian, 24 kHz (8 bytes/frame).
+    const std::size_t n = static_cast<std::size_t>(pcm.size()) / 8;
+    if (n == 0) return;
+    const float* in = reinterpret_cast<const float*>(pcm.constData());
+
+    d.monoScratch.resize(n);
+    for (std::size_t i = 0; i < n; ++i)
+        d.monoScratch[i] = 0.5f * (in[2 * i] + in[2 * i + 1]);  // downmix L+R
+
+    // Anchor BEFORE process(): host time corresponds to the END of this buffer
+    // (samplesConsumedBefore + n), so callbacks fired inline during process()
+    // already read a current sample<->host mapping.
+    d.anchorSamples = d.decoder->samplesConsumed() + static_cast<std::int64_t>(n);
+    d.anchorHostMs = d.nowUtcMs();
+    d.decoder->process(d.monoScratch.data(), n);
+}
+
+// ---- Station preset statics ----
+
+QVector<double> AetherClockEngine::wwvCarrierFrequenciesMHz() {
+    return QVector<double>{2.5, 5.0, 10.0, 15.0, 20.0};
+}
+
+double AetherClockEngine::wwvbCarrierFrequencyMHz() { return 0.060; }
+
+double AetherClockEngine::listeningDialMHz(double carrierMHz) {
+    return carrierMHz - 0.001;
+}
+
+} // namespace AetherSDR

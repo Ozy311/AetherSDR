@@ -11,6 +11,7 @@
 #include "CallsignLookupService.h" // qrz() verb — QRZ lookup cache/service
 #include "CallsignUtils.h"
 #include "models/RadioModel.h"   // RadioModel, SliceModel, PanadapterModel (get())
+#include "models/AetherClockModel.h"  // AetherClockModel (get clock)
 #include "IConnectionAutomation.h" // gui-free connect/disconnect/dialog hook
 
 #include <QAction>
@@ -2278,7 +2279,7 @@ const QStringList& getModelNames()
         QStringLiteral("meters"),     QStringLiteral("slice"),
         QStringLiteral("slices"),     QStringLiteral("pan"),
         QStringLiteral("pans"),       QStringLiteral("panstats"),
-        QStringLiteral("gps"),
+        QStringLiteral("gps"),        QStringLiteral("clock"),
         QStringLiteral("renderstats"),
         QStringLiteral("tracedebug"), QStringLiteral("waveforms"),
         QStringLiteral("kiwi"),
@@ -3685,6 +3686,32 @@ QJsonObject AutomationServer::doInvoke(const QString& target, const QString& act
     return r;
 }
 
+void AutomationServer::setClockModel(AetherClockModel* model)
+{
+    m_clockModel = model;
+}
+
+namespace {
+// AetherClock model snapshot for "get clock" (PRD-A: bridge exposure).
+QJsonObject clockSnapshot(const AetherClockModel* m)
+{
+    return QJsonObject{
+        {QStringLiteral("state"), m->state()},
+        {QStringLiteral("stateName"), m->stateName()},
+        {QStringLiteral("station"), m->station()},
+        {QStringLiteral("stationName"), m->stationName()},
+        {QStringLiteral("decodedUtc"),
+         m->decodedUtc().isValid()
+             ? m->decodedUtc().toUTC().toString(Qt::ISODateWithMs)
+             : QString{}},
+        {QStringLiteral("offsetMs"), m->offsetMs()},
+        {QStringLiteral("lockQuality"), m->lockQuality()},
+        {QStringLiteral("sliceId"), m->sliceId()},
+        {QStringLiteral("gpsTimeAvailable"), m->gpsTimeAvailable()},
+    };
+}
+} // namespace
+
 QJsonObject AutomationServer::doGet(const QString& model, const QString& selector,
                                     const QString& property) const
 {
@@ -4566,6 +4593,27 @@ QJsonObject AutomationServer::doGet(const QString& model, const QString& selecto
         return data;
     }
 
+    if (model == QLatin1String("clock")) {
+        // AetherClock time-signal decode state — model exists independently
+        // of a radio connection, so it is served before the radio guard.
+        AetherClockModel* clock = m_clockModel;
+        if (!clock)
+            return err(QStringLiteral("no clock model available"));
+        QJsonObject data = clockSnapshot(clock);
+        if (!property.isEmpty()) {
+            if (!data.contains(property))
+                return err(QStringLiteral("unknown property '") + property
+                           + QStringLiteral("' for clock"));
+            return QJsonObject{{QStringLiteral("ok"), true},
+                               {QStringLiteral("model"), model},
+                               {QStringLiteral("property"), property},
+                               {QStringLiteral("value"), data.value(property)}};
+        }
+        data[QStringLiteral("ok")] = true;
+        data[QStringLiteral("model")] = model;
+        return data;
+    }
+
     RadioModel* radio = m_radioModel;
     if (!radio)
         return err(QStringLiteral("no radio model available"));
@@ -4679,7 +4727,7 @@ QJsonObject AutomationServer::doGet(const QString& model, const QString& selecto
         data = panSnapshot(p, radio);
     } else {
         return err(QStringLiteral("unknown model: ") + model
-                   + QStringLiteral(" (use audio|dsp|sync|radio|transmit|cwx|equalizer|meters|slice|slices|pan|pans|flags|panstats|renderstats|tracedebug|clients|kiwi|wavestats)"));
+                   + QStringLiteral(" (use audio|dsp|sync|radio|transmit|cwx|equalizer|meters|slice|slices|pan|pans|flags|panstats|renderstats|tracedebug|clients|kiwi|wavestats|clock)"));
     }
 
     if (!property.isEmpty()) {

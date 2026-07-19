@@ -30,6 +30,7 @@ namespace AetherSDR {
 class RadioModel;
 class AudioEngine;
 class QsoRecorder;
+class AetherClockModel;
 
 // In-app, agent-first automation bridge (issue #3646, Phases 0-1).
 //
@@ -240,6 +241,9 @@ public:
     // "no radio model" rather than crashing).
     void setRadioModel(RadioModel* model) { m_radioModel = model; }
     void setAudioEngine(AudioEngine* audio) { m_audioEngine = audio; }
+    // AetherClock model handle for "get clock"; may be null (reports
+    // "no clock model available" until the applet wires it).
+    void setClockModel(AetherClockModel* model);  // out-of-line: QPointer needs the complete type
     // QSO recorder handle for the record() verb (start/stop/status/path).
     void setQsoRecorder(QsoRecorder* rec) { m_qsoRecorder = rec; }
     // Real connection hook for the connect/disconnect/dialog verbs. The bridge
@@ -580,6 +584,7 @@ private:
     QPointer<RadioModel> m_radioModel;           // for get(); may be null
     QPointer<AudioEngine> m_audioEngine;          // for get audio; may be null
     QPointer<QsoRecorder> m_qsoRecorder;          // for record(); may be null
+    QPointer<AetherClockModel> m_clockModel;      // for get clock; may be null
     IConnectionAutomation* m_connection = nullptr;  // connect/disconnect verbs
     QPointer<QObject> m_connectionGuard;            // auto-nulls when the impl is destroyed
     // Returns the connection hook only while its implementor is alive, so every
