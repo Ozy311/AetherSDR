@@ -94,6 +94,9 @@ class QSystemTrayIcon;
 
 namespace AetherSDR {
 
+class AetherClockApplet;
+class AetherClockEngine;
+class AetherClockModel;
 class AutomationServer;
 class ConnectionPanel;
 class TitleBar;
@@ -1286,6 +1289,12 @@ private:
     QString m_panadapterConnectionAnimationLabel;
     ShortcutManager m_shortcutManager;
     UpdateChecker* m_updateChecker{nullptr};
+
+// AetherClock (MainWindow_AetherClock.cpp)
+    AetherClockEngine* m_clockEngine{nullptr};
+    AetherClockModel* m_clockModel{nullptr};
+    QMetaObject::Connection m_clockDaxConn;  // daxAudioReady feed — live only while the engine runs
+    void setupAetherClock();
 
 #ifdef HAVE_RADE
     RADEEngine* m_radeEngine{nullptr};

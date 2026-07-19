@@ -1,0 +1,518 @@
+#include "AetherClockApplet.h"
+
+#include "ClockAlignmentWidget.h"
+#include "ComboStyle.h"
+#include "GuardedSlider.h"  // GuardedComboBox
+#include "core/AetherClockEngine.h"
+#include "core/AetherClockSettings.h"
+#include "core/ThemeManager.h"
+#include "core/TimeFrameVoter.h"  // ClockStation / ClockLockState
+#include "models/AetherClockModel.h"
+#include "models/SliceModel.h"  // complete type required by QPointer<SliceModel> assignment
+
+#include <QComboBox>
+#include <QDateTime>
+#include <QFont>
+#include <QFrame>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QPushButton>
+#include <QSignalBlocker>
+#include <QSizePolicy>
+#include <QString>
+#include <QVariant>
+#include <QVBoxLayout>
+#include <QVector>
+
+#include <algorithm>
+#include <cmath>
+
+namespace AetherSDR {
+
+namespace {
+
+// Per-item combo roles: the WWV/WWVB carrier (MHz) and the station enum
+// value, so the Tune + Start actions can recover the full preset from the
+// current selection without a parallel table.
+constexpr int kCarrierRole = Qt::UserRole;
+constexpr int kStationRole = Qt::UserRole + 1;
+
+// Status-signal colours (NIST time-signal acquisition states). These are
+// semantic indicator colours like the style guide's gauge zones, so they
+// stay literal rather than routing through the structural token map.
+constexpr const char* kLedNoSignal = "#405060";
+constexpr const char* kLedAcquiring = "#ffb800";
+constexpr const char* kLedLocked = "#00ff88";
+
+// Shared themed button chrome (matches the applet style guide standard
+// button: compact, bold, token-driven so it live-re-themes).
+const QString& kButtonBase()
+{
+    static const QString s = ThemeManager::instance().resolve(
+        "QPushButton { background: {{color.background.1}};"
+        " border: 1px solid {{color.background.2}};"
+        " border-radius: 3px; color: {{color.text.primary}};"
+        " font-size: 10px; font-weight: bold; padding: 2px 4px; }"
+        "QPushButton:hover { background: {{color.background.2}}; }");
+    return s;
+}
+
+// Green "active" checked state — style guide's activate/running family
+// (background #006040, text #00ff88, border #00a060).
+const QString kStartActive =
+    "QPushButton:checked { background-color: #006040; color: #00ff88;"
+    " border: 1px solid #00a060; }";
+
+const QString kDisabledBtn =
+    "QPushButton:disabled { background-color: #1a1a2a; color: #556070;"
+    " border: 1px solid #2a3040; }";
+
+QLabel* makeSettingLabel(const QString& text, QWidget* parent)
+{
+    auto* label = new QLabel(text, parent);
+    label->setFixedWidth(52);
+    label->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    ThemeManager::instance().applyStyleSheet(
+        label, "QLabel { color: {{color.text.secondary}}; font-size: 11px; }");
+    return label;
+}
+
+// Inset value readout (style guide inset pattern: dark well, subtle border,
+// centred primary text).
+QLabel* makeInsetReadout(QWidget* parent, int minWidth)
+{
+    auto* label = new QLabel(parent);
+    label->setAlignment(Qt::AlignCenter);
+    label->setMinimumWidth(minWidth);
+    label->setStyleSheet(QStringLiteral(
+        "QLabel { font-size: 11px; background: #0a0a18;"
+        " border: 1px solid #1e2e3e; border-radius: 3px;"
+        " padding: 1px 4px; color: #c8d8e8; }"));
+    return label;
+}
+
+struct PresetChoice {
+    ClockStation station = ClockStation::Wwv;
+    double carrierMHz = 0.0;
+};
+
+PresetChoice currentChoice(const QComboBox* combo)
+{
+    PresetChoice c;
+    if (!combo)
+        return c;
+    const int i = combo->currentIndex();
+    if (i < 0)
+        return c;
+    c.carrierMHz = combo->itemData(i, kCarrierRole).toDouble();
+    c.station = ClockStation(combo->itemData(i, kStationRole).toInt());
+    return c;
+}
+
+void applyLockLed(QLabel* led, ClockLockState state)
+{
+    if (!led)
+        return;
+    const char* colour = kLedNoSignal;
+    switch (state) {
+    case ClockLockState::Acquiring:
+        colour = kLedAcquiring;
+        break;
+    case ClockLockState::Locked:
+        colour = kLedLocked;
+        break;
+    case ClockLockState::NoSignal:
+    default:
+        colour = kLedNoSignal;
+        break;
+    }
+    led->setStyleSheet(
+        QStringLiteral("QLabel { background-color: %1; border-radius: 5px; }")
+            .arg(QLatin1String(colour)));
+}
+
+void applyStationTag(QLabel* tag, const QString& stationName)
+{
+    if (!tag)
+        return;
+    tag->setText(stationName == QStringLiteral("Unknown") ? QStringLiteral("--")
+                                                          : stationName);
+}
+
+void applyUtcReadout(QLabel* label, const QDateTime& utc)
+{
+    if (!label)
+        return;
+    label->setText(utc.isValid()
+                       ? utc.toUTC().toString(QStringLiteral("HH:mm:ss"))
+                       : QStringLiteral("--:--:--"));
+}
+
+void applyOffsetReadout(QLabel* label, const QDateTime& utc, double offsetMs)
+{
+    if (!label)
+        return;
+    if (!utc.isValid()) {
+        label->setText(QStringLiteral("--"));
+        return;
+    }
+    // + = host clock BEHIND the broadcast (engine offset convention).
+    label->setText(QString::asprintf("%+.2f s", offsetMs / 1000.0));
+}
+
+// Listening dial (MHz) formatted for the preset note — "9.999 MHz",
+// "2.499 MHz", "0.059 MHz" — trailing zeros trimmed sensibly.
+QString fmtDialMHz(double mhz)
+{
+    QString s = QString::number(mhz, 'f', 3);
+    if (s.contains(QLatin1Char('.'))) {
+        while (s.endsWith(QLatin1Char('0')))
+            s.chop(1);
+        if (s.endsWith(QLatin1Char('.')))
+            s.chop(1);
+    }
+    return s + QStringLiteral(" MHz");
+}
+
+// Tune-button label + the always-visible per-preset dial note follow the
+// current preset selection.
+void refreshPresetUi(QComboBox* combo, QPushButton* tuneBtn, QLabel* note)
+{
+    if (!combo)
+        return;
+    if (tuneBtn) {
+        // U+2192 rightwards arrow — a text glyph, not an icon.
+        tuneBtn->setText(
+            QStringLiteral("Tune slice → %1").arg(combo->currentText()));
+    }
+    if (note) {
+        const PresetChoice c = currentChoice(combo);
+        const QString dial =
+            fmtDialMHz(AetherClockEngine::listeningDialMHz(c.carrierMHz));
+        // The deliberate carrier−1 kHz USB dial (post-demod high-pass
+        // workaround) must read as intent, not error.
+        QString text =
+            QStringLiteral("dial %1 USB — 1 kHz below carrier").arg(dial);
+        if (c.station == ClockStation::Wwvb)
+            text += QStringLiteral(" · AGC off on tune");
+        note->setText(text);
+    }
+}
+
+} // namespace
+
+AetherClockApplet::AetherClockApplet(QWidget* parent)
+    : QWidget(parent)
+{
+    buildUi();
+}
+
+QSize AetherClockApplet::sizeHint() const
+{
+    const int scopeH = m_scope ? m_scope->sizeHint().height() : 150;
+    const int drawerH = (m_settingsDrawer && !m_settingsDrawer->isHidden())
+                            ? m_settingsDrawer->sizeHint().height() + 3
+                            : 0;
+    return {260, std::max(240, scopeH + drawerH + 62)};
+}
+
+QSize AetherClockApplet::minimumSizeHint() const
+{
+    const int scopeH = m_scope ? m_scope->minimumSizeHint().height() : 110;
+    const int drawerH = (m_settingsDrawer && !m_settingsDrawer->isHidden())
+                            ? m_settingsDrawer->minimumSizeHint().height() + 3
+                            : 0;
+    return {220, std::max(180, scopeH + drawerH + 50)};
+}
+
+void AetherClockApplet::buildUi()
+{
+    theme::setContainer(this, QStringLiteral("applet/clock"));
+
+    auto* layout = new QVBoxLayout(this);
+    layout->setContentsMargins(2, 2, 2, 2);
+    layout->setSpacing(3);
+
+    // Alignment scope — the dominant differentiator, takes all stretch.
+    m_scope = new ClockAlignmentWidget(this);
+    layout->addWidget(m_scope, 1);
+
+    // Status row: lock LED · station tag · decoded UTC · offset.
+    {
+        auto* row = new QHBoxLayout;
+        row->setSpacing(5);
+
+        m_lockLed = new QLabel(this);
+        m_lockLed->setFixedSize(10, 10);
+        applyLockLed(m_lockLed, ClockLockState::NoSignal);
+        row->addWidget(m_lockLed);
+
+        m_stationTag = new QLabel(QStringLiteral("--"), this);
+        ThemeManager::instance().applyStyleSheet(
+            m_stationTag,
+            "QLabel { color: {{color.text.secondary}}; font-size: 11px;"
+            " font-weight: bold; }");
+        row->addWidget(m_stationTag);
+
+        row->addStretch(1);
+
+        m_utcValue = makeInsetReadout(this, 64);
+        QFont mono = m_utcValue->font();
+        mono.setStyleHint(QFont::Monospace);
+        mono.setFamily(QStringLiteral("monospace"));
+        m_utcValue->setFont(mono);
+        row->addWidget(m_utcValue);
+
+        m_offsetValue = makeInsetReadout(this, 52);
+        row->addWidget(m_offsetValue);
+
+        layout->addLayout(row);
+    }
+
+    // Drawer toggle (collapsed by default).
+    m_drawerToggle = new QPushButton(this);
+    m_drawerToggle->setStyleSheet(kButtonBase());
+    m_drawerToggle->setFixedHeight(20);
+    m_drawerToggle->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    connect(m_drawerToggle, &QPushButton::clicked, this, [this]() {
+        setSettingsExpanded(m_settingsDrawer && m_settingsDrawer->isHidden());
+    });
+    layout->addWidget(m_drawerToggle);
+
+    buildSettingsDrawer();
+    layout->addWidget(m_settingsDrawer);
+
+    setSettingsExpanded(false);
+
+    // Prime the status row + action enables to the detached/no-signal state.
+    applyStationTag(m_stationTag, QStringLiteral("Unknown"));
+    applyUtcReadout(m_utcValue, QDateTime());
+    applyOffsetReadout(m_offsetValue, QDateTime(), 0.0);
+    updateStartStopUi();
+}
+
+void AetherClockApplet::buildSettingsDrawer()
+{
+    m_settingsDrawer = new QFrame(this);
+
+    auto* drawer = new QVBoxLayout(m_settingsDrawer);
+    drawer->setContentsMargins(5, 4, 5, 5);
+    drawer->setSpacing(4);
+
+    // Station preset combo.
+    {
+        auto* row = new QHBoxLayout;
+        row->setSpacing(5);
+        row->addWidget(makeSettingLabel(QStringLiteral("Station:"), m_settingsDrawer));
+
+        m_presetCombo = new GuardedComboBox(m_settingsDrawer);
+        m_presetCombo->setObjectName(QStringLiteral("clockPresetCombo"));
+        m_presetCombo->setAccessibleName(QStringLiteral("AetherClock station preset"));
+        applyComboStyle(m_presetCombo);
+        m_presetCombo->setFixedHeight(20);
+        m_presetCombo->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+        row->addWidget(m_presetCombo, 1);
+
+        drawer->addLayout(row);
+    }
+
+    // Tune slice → <preset>.
+    m_tuneButton = new QPushButton(m_settingsDrawer);
+    m_tuneButton->setStyleSheet(kButtonBase() + kDisabledBtn);
+    m_tuneButton->setFixedHeight(20);
+    m_tuneButton->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    connect(m_tuneButton, &QPushButton::clicked, this,
+            &AetherClockApplet::applyPresetSelection);
+    drawer->addWidget(m_tuneButton);
+
+    // Always-visible per-preset dial note (text set by refreshPresetUi).
+    m_presetNote = new QLabel(m_settingsDrawer);
+    m_presetNote->setWordWrap(true);
+    ThemeManager::instance().applyStyleSheet(
+        m_presetNote,
+        "QLabel { color: {{color.text.secondary}}; font-size: 10px; }");
+    drawer->addWidget(m_presetNote);
+
+    // Start / Stop.
+    m_startStopButton = new QPushButton(QStringLiteral("Start"), m_settingsDrawer);
+    m_startStopButton->setCheckable(true);
+    m_startStopButton->setStyleSheet(kButtonBase() + kStartActive + kDisabledBtn);
+    m_startStopButton->setFixedHeight(22);
+    m_startStopButton->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    connect(m_startStopButton, &QPushButton::clicked, this, [this]() {
+        // A checkable button toggles before this fires, so isChecked() is the
+        // user's intended next state; updateStartStopUi reconciles it with the
+        // engine's actual running state afterward.
+        const bool wantRun = m_startStopButton && m_startStopButton->isChecked();
+        if (!m_engine.isNull()) {
+            if (wantRun) {
+                if (!m_slice.isNull())
+                    m_engine->start(m_slice.data(), currentChoice(m_presetCombo).station);
+            } else {
+                m_engine->stop();
+            }
+        }
+        updateStartStopUi();
+    });
+    drawer->addWidget(m_startStopButton);
+
+    // Populate carriers from the engine preset list, then restore the saved
+    // selection under a signal block so restore never persists or applies.
+    const QVector<double> wwvCarriers = AetherClockEngine::wwvCarrierFrequenciesMHz();
+    {
+        QSignalBlocker block(m_presetCombo);
+        for (double mhz : wwvCarriers) {
+            m_presetCombo->addItem(QStringLiteral("WWV %1 MHz").arg(QString::number(mhz)));
+            const int idx = m_presetCombo->count() - 1;
+            m_presetCombo->setItemData(idx, mhz, kCarrierRole);
+            m_presetCombo->setItemData(idx, int(ClockStation::Wwv), kStationRole);
+        }
+        m_presetCombo->addItem(QStringLiteral("WWVB 60 kHz"));
+        {
+            const int idx = m_presetCombo->count() - 1;
+            m_presetCombo->setItemData(idx, AetherClockEngine::wwvbCarrierFrequencyMHz(),
+                                       kCarrierRole);
+            m_presetCombo->setItemData(idx, int(ClockStation::Wwvb), kStationRole);
+        }
+
+        int sel = 0;
+        if (AetherClockSettings::stationPreset() == QStringLiteral("WWVB")) {
+            sel = m_presetCombo->count() - 1;
+        } else {
+            const double carrier = AetherClockSettings::wwvCarrierMHz();
+            for (int i = 0; i < m_presetCombo->count(); ++i) {
+                if (ClockStation(m_presetCombo->itemData(i, kStationRole).toInt())
+                        == ClockStation::Wwv
+                    && std::abs(m_presetCombo->itemData(i, kCarrierRole).toDouble()
+                                - carrier)
+                           < 1e-6) {
+                    sel = i;
+                    break;
+                }
+            }
+        }
+        m_presetCombo->setCurrentIndex(sel);
+    }
+
+    connect(m_presetCombo, qOverload<int>(&QComboBox::currentIndexChanged), this,
+            [this](int) {
+        if (!m_presetCombo)
+            return;
+        const PresetChoice c = currentChoice(m_presetCombo);
+        // Persist the chosen preset only (radio-authoritative tuning is never
+        // saved). WWVB keeps the last WWV carrier untouched.
+        if (c.station == ClockStation::Wwvb) {
+            AetherClockSettings::setStationPreset(QStringLiteral("WWVB"));
+        } else {
+            AetherClockSettings::setStationPreset(QStringLiteral("WWV"));
+            AetherClockSettings::setWwvCarrierMHz(c.carrierMHz);
+        }
+        refreshPresetUi(m_presetCombo, m_tuneButton, m_presetNote);
+    });
+
+    refreshPresetUi(m_presetCombo, m_tuneButton, m_presetNote);
+}
+
+void AetherClockApplet::setSettingsExpanded(bool expanded)
+{
+    if (!m_settingsDrawer)
+        return;
+
+    m_settingsDrawer->setVisible(expanded);
+    if (m_drawerToggle) {
+        // U+25BE / U+25B8 triangles — text glyphs, not emoji icons.
+        m_drawerToggle->setText(expanded ? QStringLiteral("▾ Settings")
+                                         : QStringLiteral("▸ Settings"));
+    }
+    setMinimumHeight(minimumSizeHint().height());
+    updateGeometry();
+    adjustSize();
+    if (auto* p = parentWidget())
+        p->updateGeometry();
+}
+
+void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* model)
+{
+    if (!m_engine.isNull())
+        disconnect(m_engine, nullptr, this, nullptr);
+    if (!m_model.isNull())
+        disconnect(m_model, nullptr, this, nullptr);
+
+    m_engine = engine;
+    m_model = model;
+
+    // Whole status row refreshed on any model change — 1 Hz-class traffic, so
+    // a full re-read is trivially cheap and keeps the four fields consistent.
+    auto syncStatus = [this]() {
+        AetherClockModel* m = m_model.data();
+        applyLockLed(m_lockLed, m ? m->lockState() : ClockLockState::NoSignal);
+        applyStationTag(m_stationTag, m ? m->stationName() : QStringLiteral("Unknown"));
+        const QDateTime utc = m ? m->decodedUtc() : QDateTime();
+        applyUtcReadout(m_utcValue, utc);
+        applyOffsetReadout(m_offsetValue, utc, m ? m->offsetMs() : 0.0);
+    };
+
+    if (!m_model.isNull()) {
+        connect(m_model, &AetherClockModel::stateChanged, this, syncStatus);
+        connect(m_model, &AetherClockModel::stationChanged, this, syncStatus);
+        connect(m_model, &AetherClockModel::decodedUtcChanged, this, syncStatus);
+        connect(m_model, &AetherClockModel::offsetMsChanged, this, syncStatus);
+    }
+
+    if (!m_engine.isNull()) {
+        connect(m_engine, &AetherClockEngine::alignmentFrame, this,
+                [this](const ClockAlignmentFrame& frame) {
+            if (m_scope)
+                m_scope->appendFrame(frame);
+        });
+        connect(m_engine, &AetherClockEngine::runningChanged, this,
+                [this](bool running) {
+            updateStartStopUi();
+            // History is useful across a NoSignal dropout; only a real stop
+            // clears the scope.
+            if (!running && m_scope)
+                m_scope->clear();
+        });
+    }
+
+    syncStatus();
+    updateStartStopUi();
+}
+
+void AetherClockApplet::setSlice(SliceModel* slice)
+{
+    // Store only; never auto-start on bind, and never double-stop — if the
+    // engine is running and the slice is lost, the engine stops itself and
+    // its runningChanged(false) drives the UI. Here we just refresh enables.
+    m_slice = slice;
+    updateStartStopUi();
+}
+
+void AetherClockApplet::updateStartStopUi()
+{
+    const bool haveEngine = !m_engine.isNull();
+    const bool haveSlice = !m_slice.isNull();
+    const bool running = haveEngine && m_engine->isRunning();
+
+    if (m_startStopButton) {
+        QSignalBlocker block(m_startStopButton);
+        m_startStopButton->setChecked(running);
+        m_startStopButton->setText(running ? QStringLiteral("Stop")
+                                           : QStringLiteral("Start"));
+        // Always able to stop while running; only startable when attached to
+        // both an engine and a slice.
+        m_startStopButton->setEnabled(running || (haveEngine && haveSlice));
+    }
+    if (m_tuneButton)
+        m_tuneButton->setEnabled(haveEngine && haveSlice);
+}
+
+void AetherClockApplet::applyPresetSelection()
+{
+    if (m_engine.isNull() || m_slice.isNull() || !m_presetCombo)
+        return;
+    const PresetChoice c = currentChoice(m_presetCombo);
+    m_engine->applyStationPreset(c.station, c.carrierMHz);
+}
+
+} // namespace AetherSDR

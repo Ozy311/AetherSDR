@@ -725,6 +725,7 @@ set(GUI_SOURCES
     src/gui/MainWindow_DigitalModes.cpp
     src/gui/MainWindow_Spots.cpp
     src/gui/MainWindow_SwrSweep.cpp
+    src/gui/MainWindow_AetherClock.cpp
     src/gui/MainWindow_Wiring.cpp
     src/gui/MainWindow_Nets.cpp
     src/gui/MainWindow_Callsign.cpp
@@ -827,6 +828,8 @@ set(GUI_SOURCES
     src/gui/WaveApplet.cpp
     src/gui/WaveformScopeModel.cpp
     src/gui/WaveformWidget.cpp
+    src/gui/AetherClockApplet.cpp
+    src/gui/ClockAlignmentWidget.cpp
     src/gui/ClientEqApplet.cpp
     src/gui/ClientEqCurveWidget.cpp
     src/gui/ClientEqEditor.cpp

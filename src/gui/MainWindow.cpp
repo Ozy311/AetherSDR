@@ -4861,6 +4861,8 @@ void MainWindow::buildUI()
             this, &MainWindow::expireSHistoryMarkers);
     m_sHistoryExpireTimer->start();
 
+    setupAetherClock();
+
     // CNN signal classifier — load model from next to the executable or ~/.config/AetherSDR/
     {
         const QString exeDir  = QCoreApplication::applicationDirPath();
