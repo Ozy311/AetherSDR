@@ -1,8 +1,9 @@
 // AetherClock WS-2 — AetherClockEngine integration test (plain main() + CHECK,
 // NOT QtTest; harness idiom per tests/amp_model_test.cpp + SPEC "Repo
 // conventions"). Drives the ENGINE through its public header contract only:
-// setPanadapterStream / setHostClock / start / stop / applyStationPreset /
-// feedRxAudio, observing the six engine signals via QSignalSpy. The decoder
+// setPanadapterStream / setHostClock / setLockDecayTimeoutMs / start / stop /
+// applyStationPreset / feedRxAudio, observing the six engine signals via
+// QSignalSpy. The decoder
 // .cpp is authored in parallel; this file asserts engine contracts, never
 // decoder internals.
 //
@@ -482,6 +483,109 @@ void sectionStatics() {
     CHECK(std::abs(AetherClockEngine::listeningDialMHz(0.060) - 0.059) < 1e-9);
 }
 
+// [8] applyStationPreset(SliceModel*, ...) overload: tunes ANY given slice
+// without binding it or starting the engine; a locked slice refuses the whole
+// preset (all-or-nothing). This is the applet's Tune-while-stopped path.
+void sectionStationPresetOverload() {
+    AetherClockEngine engine;   // never started; nothing bound, no provider
+
+    // Unlocked WWV: dial = carrier - 1 kHz, USB. The engine stays stopped and
+    // unbound (the overload touches only the slice it is handed).
+    SliceModel wwv(0);
+    engine.applyStationPreset(&wwv, ClockStation::Wwv, 10.0);
+    CHECK(std::abs(wwv.frequency() - 9.999) < 1e-9);
+    CHECK(wwv.mode() == QStringLiteral("USB"));
+    CHECK(!engine.isRunning());
+    CHECK(engine.boundSliceId() == -1);
+
+    // Unlocked WWVB additionally forces AGC off on that slice.
+    SliceModel wwvb(1);
+    engine.applyStationPreset(&wwvb, ClockStation::Wwvb, 0.060);
+    CHECK(std::abs(wwvb.frequency() - 0.059) < 1e-9);
+    CHECK(wwvb.mode() == QStringLiteral("USB"));
+    CHECK(wwvb.agcMode() == QStringLiteral("off"));
+
+    // Locked slice: the lock check refuses the preset, so nothing changes.
+    SliceModel locked(2);
+    locked.setFrequency(14.0);
+    locked.setMode(QStringLiteral("LSB"));
+    locked.setLocked(true);
+    engine.applyStationPreset(&locked, ClockStation::Wwv, 10.0);
+    CHECK(std::abs(locked.frequency() - 14.0) < 1e-9);
+    CHECK(locked.mode() == QStringLiteral("LSB"));
+}
+
+// [9] Lock-decay watchdog at the NoSignal floor: after start() the state is
+// NoSignal and the watchdog fires repeatedly (60 ms) but must NEVER emit —
+// there is nothing below NoSignal to demote to.
+void sectionLockDecayNoSignalStable() {
+    PanadapterStream stream;
+    SliceModel slice(0);
+    slice.setDaxChannel(2);
+
+    AetherClockEngine engine;
+    wireProvider(engine, stream);
+    engine.setLockDecayTimeoutMs(60);   // well under the 200 ms spin below
+
+    QSignalSpy spyLock(&engine, &AetherClockEngine::lockStateChanged);
+    engine.start(&slice, ClockStation::Wwv);
+    CHECK(engine.lockState() == ClockLockState::NoSignal);
+
+    // wait() spins an event loop so the QTimer can fire; it returns false when
+    // no lockStateChanged arrives within the window — exactly what we want at
+    // the floor. No audio is fed, so no second re-arms toward a real state.
+    CHECK(!spyLock.wait(200));
+    CHECK(spyLock.isEmpty());
+    CHECK(engine.lockState() == ClockLockState::NoSignal);
+
+    engine.stop();
+}
+
+// [10] Lock-decay watchdog demotes a stalled lock one step at a time. Reach
+// Locked on clean synth audio, then stop feeding: with a 60 ms timeout the
+// engine-side watchdog walks Locked -> Acquiring -> NoSignal and then stops
+// re-arming at the floor. (The handleSecond resync — which re-pulls the
+// decoder's live state after a decay — is exercised implicitly by the happy
+// path, where fast feeding re-arms every classified second and any transient
+// decay self-heals back to the decoder's Locked; live QA covers the on-air
+// re-emit-after-decay recovery directly.)
+void sectionLockDecayDemotes() {
+    SynthOpts opts;
+    const std::vector<float> mono = synthWwv(kGold, opts);
+    const qint64 epochMs = synthEpochMs(kGold, opts);
+
+    PanadapterStream stream;
+    SliceModel slice(0);
+    slice.setDaxChannel(2);
+
+    AetherClockEngine engine;
+    wireProvider(engine, stream);
+    engine.setLockDecayTimeoutMs(60);
+    qint64 fakeNow = epochMs + kSkewMs;
+    engine.setHostClock([&fakeNow] { return fakeNow; });
+
+    QSignalSpy spyLock(&engine, &AetherClockEngine::lockStateChanged);
+    engine.start(&slice, ClockStation::Wwv);
+
+    qint64 samplesFed = 0;
+    feedStereo(engine, 2, mono, epochMs, kSkewMs, samplesFed, fakeNow, /*advance*/ true);
+    CHECK(sawLocked(spyLock, engine));
+    CHECK(engine.lockState() == ClockLockState::Locked);   // no more audio flows
+
+    // With feeding stopped the 60 ms watchdog decays the stale lock stepwise.
+    // Each wait() spins the loop until the next demotion edge.
+    CHECK(spyLock.wait(2000));                              // Locked -> Acquiring
+    CHECK(engine.lockState() == ClockLockState::Acquiring);
+    CHECK(spyLock.wait(2000));                              // Acquiring -> NoSignal
+    CHECK(engine.lockState() == ClockLockState::NoSignal);
+
+    // At the floor the watchdog stops re-arming: no further edges.
+    CHECK(!spyLock.wait(300));
+    CHECK(engine.lockState() == ClockLockState::NoSignal);
+
+    engine.stop();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -500,6 +604,9 @@ int main(int argc, char** argv) {
     sectionSliceRemoval();
     sectionStationPreset();
     sectionStatics();
+    sectionStationPresetOverload();
+    sectionLockDecayNoSignalStable();
+    sectionLockDecayDemotes();
 
     if (g_failures == 0) {
         std::printf("aetherclock_engine_test: all checks passed\n");

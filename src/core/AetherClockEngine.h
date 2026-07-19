@@ -66,6 +66,14 @@ public:
     // engine never writes the OS clock.
     void setHostClock(std::function<qint64()> nowUtcMs);
 
+    // Lock-decay watchdog timeout (ms). Decoder state only advances inside
+    // process(); if audio stops arriving (or no second classifies) a
+    // Locked/Acquiring state would stick forever. When this window elapses with
+    // no classified second while running, the engine demotes the state one step
+    // (Locked -> Acquiring -> NoSignal). Test seam; default 10000 ms, values
+    // < 50 clamped to 50.
+    void setLockDecayTimeoutMs(int ms);
+
     bool isRunning() const;
     int boundSliceId() const;               // -1 when not bound
     ClockStation configuredStation() const; // station selected at start()
@@ -81,11 +89,16 @@ public slots:
     void start(SliceModel* slice, ClockStation station);
     void stop();
 
-    // Convenience tune: tunes the BOUND slice to listeningDialMHz(carrierMHz)
-    // USB; for Wwvb also sets AGC off on that slice. Radio-authoritative
-    // state — applied to the live slice only, never persisted. No-op when
-    // not bound.
+    // Convenience tune to listeningDialMHz(carrierMHz) USB; for Wwvb also sets
+    // AGC off on that slice. Radio-authoritative state — applied to the live
+    // slice only, never persisted; neither binds the slice nor starts the
+    // engine. A locked slice refuses the whole preset (all-or-nothing).
+    // The two-arg form acts on the BOUND slice (no-op when not bound); the
+    // three-arg form acts on any given slice — the applet's Tune-while-stopped
+    // path, acting on the strip's selected slice.
     void applyStationPreset(ClockStation station, double carrierMHz);
+    void applyStationPreset(SliceModel* slice, ClockStation station,
+                            double carrierMHz);
 
     // PCM ingest — the daxAudioReady payload (float32 interleaved stereo,
     // native-endian, 24 kHz). The wiring layer connects the audio source

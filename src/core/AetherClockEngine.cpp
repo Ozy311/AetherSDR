@@ -11,6 +11,7 @@
 #include <QPointer>
 #include <QString>
 #include <QTimeZone>
+#include <QTimer>
 #include <QVector>
 
 #include <algorithm>
@@ -35,6 +36,9 @@ struct IDecoder {
     virtual void reset() = 0;
     virtual ClockStation station() const = 0;
     virtual std::int64_t samplesConsumed() const = 0;
+    // Live decoder lock state — the decoder suppresses no-change state edges, so
+    // after an engine-side lock decay handleSecond resyncs from this accessor.
+    virtual ClockLockState lockState() const = 0;
 
     // Engine-side callbacks, forwarded from the concrete decoder's callbacks.
     std::function<void(const ClockSecondInfo&)> onSecond;
@@ -56,12 +60,21 @@ struct DecoderHolder final : IDecoder {
     void reset() override { d.reset(); }
     ClockStation station() const override { return d.station(); }
     std::int64_t samplesConsumed() const override { return d.samplesConsumed(); }
+    ClockLockState lockState() const override { return d.state(); }
 };
 
 } // namespace
 
 struct AetherClockEngine::Impl {
-    explicit Impl(AetherClockEngine* owner) : q(owner) {}
+    explicit Impl(AetherClockEngine* owner) : q(owner) {
+        // Parented to q so it dies with the engine. Single-shot; the engine is a
+        // thread-agnostic QObject whose slots and queued feedRxAudio all run on
+        // its own thread, so every start/stop/re-arm of this timer happens there
+        // — no cross-thread QTimer use.
+        decayTimer = new QTimer(q);
+        decayTimer->setSingleShot(true);
+        QObject::connect(decayTimer, &QTimer::timeout, q, [this] { onDecayTimeout(); });
+    }
 
     AetherClockEngine* q = nullptr;
 
@@ -79,6 +92,12 @@ struct AetherClockEngine::Impl {
     ClockStation lastStation = ClockStation::Unknown; // for stationDetected edges
     ClockLockState lastState = ClockLockState::NoSignal;
     bool running = false;
+
+    // Lock-decay watchdog (see setLockDecayTimeoutMs). Armed on start() and
+    // re-armed on every classified second; on timeout it demotes the state one
+    // step so a stalled feed cannot pin a stale Locked/Acquiring.
+    QTimer* decayTimer = nullptr;
+    int decayTimeoutMs = 10000;
 
     std::function<qint64()> nowUtcMs =
         [] { return QDateTime::currentMSecsSinceEpoch(); };
@@ -126,6 +145,20 @@ struct AetherClockEngine::Impl {
         heldChannel = 0;
     }
 
+    void armDecayTimer() { decayTimer->start(decayTimeoutMs); }
+
+    void onDecayTimeout() {
+        if (!running) return;
+        // Demote ONE step and re-arm; at the NoSignal floor stop re-arming until
+        // the next classified second re-arms the watchdog (handleSecond).
+        if (lastState == ClockLockState::Locked) {
+            setState(ClockLockState::Acquiring);
+            armDecayTimer();
+        } else if (lastState == ClockLockState::Acquiring) {
+            setState(ClockLockState::NoSignal);
+        }
+    }
+
     // ---- Decoder callbacks: fire inline on the feed thread during process() ----
 
     void handleState(ClockLockState st) { setState(st); }
@@ -153,6 +186,15 @@ struct AetherClockEngine::Impl {
             lastStation = st;
             emit q->stationDetected(st);
         }
+
+        // A classified second means audio is live: re-arm the lock-decay
+        // watchdog, then resync engine state from the decoder's live accessor.
+        // The decoder suppresses no-change state edges, so after an engine-side
+        // decay it may still believe Locked and never re-emit it; the resync
+        // recovers the engine to the decoder's truth.
+        armDecayTimer();
+        const ClockLockState ds = decoder->lockState();
+        if (ds != lastState) setState(ds);
     }
 
     void handleFrame(const ClockFrameInfo& frame) {
@@ -219,6 +261,10 @@ void AetherClockEngine::setHostClock(std::function<qint64()> nowUtcMs) {
         m_impl->nowUtcMs = std::move(nowUtcMs);
     else
         m_impl->nowUtcMs = [] { return QDateTime::currentMSecsSinceEpoch(); };
+}
+
+void AetherClockEngine::setLockDecayTimeoutMs(int ms) {
+    m_impl->decayTimeoutMs = ms < 50 ? 50 : ms;
 }
 
 bool AetherClockEngine::isRunning() const { return m_impl->running; }
@@ -295,6 +341,7 @@ void AetherClockEngine::start(SliceModel* slice, ClockStation station) {
     // Graceful loss if the bound slice is destroyed under us.
     d.connDestroyed = connect(slice, &QObject::destroyed, this, [this] {
         auto& e = *m_impl;
+        e.decayTimer->stop();
         e.releaseHold();
         e.disconnectAll();
         if (e.decoder) e.decoder->reset();
@@ -305,12 +352,14 @@ void AetherClockEngine::start(SliceModel* slice, ClockStation station) {
 
     d.running = true;
     d.lastState = ClockLockState::NoSignal;  // state starts NoSignal
+    d.armDecayTimer();                       // watchdog runs while running
     emit runningChanged(true);
 }
 
 void AetherClockEngine::stop() {
     auto& d = *m_impl;
     const bool was = d.running;
+    d.decayTimer->stop();
     d.releaseHold();
     d.disconnectAll();
     if (d.decoder) d.decoder->reset();
@@ -324,22 +373,32 @@ void AetherClockEngine::stop() {
 }
 
 void AetherClockEngine::applyStationPreset(ClockStation station, double carrierMHz) {
-    auto& d = *m_impl;
-    if (!d.slice) return;  // no-op unless bound
+    // The bound slice is null when unbound, so this keeps the no-op-unless-bound
+    // semantics (the overload warns + returns on a null slice).
+    applyStationPreset(m_impl->slice.data(), station, carrierMHz);
+}
+
+void AetherClockEngine::applyStationPreset(SliceModel* slice, ClockStation station,
+                                           double carrierMHz) {
+    if (!slice) {
+        qWarning() << "AetherClockEngine: no slice - station preset not applied";
+        return;
+    }
     // All-or-nothing: on a locked slice only setFrequency honors the lock
     // (SliceModel.cpp), so applying the preset would strand the slice on its
     // old frequency while still forcing USB (and AGC off for WWVB). Refuse the
     // whole preset instead of leaving an inconsistent state.
-    if (d.slice->isLocked()) {
-        qWarning() << "AetherClockEngine: bound slice is locked -"
+    if (slice->isLocked()) {
+        qWarning() << "AetherClockEngine: slice is locked -"
                    << "station preset not applied";
         return;
     }
-    // Radio-authoritative live-slice state only; nothing persisted.
-    d.slice->setFrequency(listeningDialMHz(carrierMHz));
-    d.slice->setMode(QStringLiteral("USB"));
+    // Radio-authoritative live-slice state only; nothing persisted. Neither
+    // binds the slice nor starts the engine.
+    slice->setFrequency(listeningDialMHz(carrierMHz));
+    slice->setMode(QStringLiteral("USB"));
     if (station == ClockStation::Wwvb)
-        d.slice->setAgcMode(QStringLiteral("off"));
+        slice->setAgcMode(QStringLiteral("off"));
 }
 
 void AetherClockEngine::feedRxAudio(int channel, const QByteArray& pcm) {
