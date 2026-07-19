@@ -56,7 +56,10 @@ inline QColor cEmptyText() { return AetherSDR::ThemeManager::instance().color("c
 
 constexpr int kInnerPad = 3;       // gap between the inset border and content
 constexpr int kSymbolLaneH = 14;   // decoded-symbol glyph lane
-constexpr int kConfLaneH = 8;      // confidence bar lane
+// Confidence lane height adapts to the widget height (height()/10) clamped to
+// this band — a flat 8 px was too subtle to read at strip size.
+constexpr int kConfLaneMinH = 14;
+constexpr int kConfLaneMaxH = 28;
 constexpr int kLaneGap = 2;        // vertical gap between lanes
 
 } // namespace
@@ -142,11 +145,14 @@ void ClockAlignmentWidget::paintEvent(QPaintEvent* /*event*/)
 
     const QRect plot = full.adjusted(kInnerPad, kInnerPad, -kInnerPad, -kInnerPad);
 
+    // Confidence lane grows with the widget so it stays legible at strip size.
+    const int confLaneH = std::clamp(height() / 10, kConfLaneMinH, kConfLaneMaxH);
+
     // Vertical bands, measured up from the bottom: symbol lane, confidence
     // lane, then the scope lane takes the remaining height.
     const int symbolTop = plot.bottom() - kSymbolLaneH + 1;
     const int confBottom = symbolTop - kLaneGap;
-    const int confTop = confBottom - kConfLaneH;
+    const int confTop = confBottom - confLaneH;
     const int scopeTop = plot.top();
     const int scopeBottom = std::max(scopeTop + 1, confTop - kLaneGap);
     const float scopeH = float(scopeBottom - scopeTop);
@@ -250,7 +256,7 @@ void ClockAlignmentWidget::paintEvent(QPaintEvent* /*event*/)
             const float c = std::clamp(f.confidence, 0.0f, 1.0f);
             const QColor barCol = c >= 0.5f ? confSuccessCol
                                             : (c >= 0.25f ? confWarningCol : confInactiveCol);
-            const float h = c * float(kConfLaneH);
+            const float h = c * float(confLaneH);
             const QRectF bar(x0 + 1.0f, float(confBottom) - h,
                              std::max(colW - 2.0f, 1.0f), h);
             p.fillRect(bar, barCol);

@@ -77,6 +77,27 @@ QLabel* makeSettingLabel(const QString& text, QWidget* parent)
     return label;
 }
 
+// Inset readout stylesheets (style guide inset pattern: dark well, subtle
+// border, centred text). The warn variant swaps only the text colour to amber
+// #ffb800 — the same semantic warning literal as the acquiring LED — so the DAX
+// inset can flag a running-but-no-channel bound slice without losing its chrome.
+const QString& kInsetStyle()
+{
+    static const QString s = QStringLiteral(
+        "QLabel { font-size: 11px; background: #0a0a18;"
+        " border: 1px solid #1e2e3e; border-radius: 3px;"
+        " padding: 1px 4px; color: #c8d8e8; }");
+    return s;
+}
+const QString& kInsetStyleWarn()
+{
+    static const QString s = QStringLiteral(
+        "QLabel { font-size: 11px; background: #0a0a18;"
+        " border: 1px solid #1e2e3e; border-radius: 3px;"
+        " padding: 1px 4px; color: #ffb800; }");
+    return s;
+}
+
 // Inset value readout (style guide inset pattern: dark well, subtle border,
 // centred primary text).
 QLabel* makeInsetReadout(QWidget* parent, int minWidth)
@@ -84,10 +105,7 @@ QLabel* makeInsetReadout(QWidget* parent, int minWidth)
     auto* label = new QLabel(parent);
     label->setAlignment(Qt::AlignCenter);
     label->setMinimumWidth(minWidth);
-    label->setStyleSheet(QStringLiteral(
-        "QLabel { font-size: 11px; background: #0a0a18;"
-        " border: 1px solid #1e2e3e; border-radius: 3px;"
-        " padding: 1px 4px; color: #c8d8e8; }"));
+    label->setStyleSheet(kInsetStyle());
     return label;
 }
 
@@ -213,7 +231,12 @@ QSize AetherClockApplet::sizeHint() const
     const int drawerH = (m_settingsDrawer && !m_settingsDrawer->isHidden())
                             ? m_settingsDrawer->sizeHint().height() + 3
                             : 0;
-    return {260, std::max(240, scopeH + drawerH + 62)};
+    // The half-width toggle row is still one fixed 20 px row (folded into the
+    // +62 baseline); the warning banner adds height only while it is shown.
+    const int warnH = (m_daxWarning && !m_daxWarning->isHidden())
+                          ? m_daxWarning->sizeHint().height() + 3
+                          : 0;
+    return {260, std::max(240, scopeH + drawerH + warnH + 62)};
 }
 
 QSize AetherClockApplet::minimumSizeHint() const
@@ -222,7 +245,10 @@ QSize AetherClockApplet::minimumSizeHint() const
     const int drawerH = (m_settingsDrawer && !m_settingsDrawer->isHidden())
                             ? m_settingsDrawer->minimumSizeHint().height() + 3
                             : 0;
-    return {220, std::max(180, scopeH + drawerH + 50)};
+    const int warnH = (m_daxWarning && !m_daxWarning->isHidden())
+                          ? m_daxWarning->minimumSizeHint().height() + 3
+                          : 0;
+    return {220, std::max(180, scopeH + drawerH + warnH + 50)};
 }
 
 void AetherClockApplet::buildUi()
@@ -254,6 +280,16 @@ void AetherClockApplet::buildUi()
             " font-weight: bold; }");
         row->addWidget(m_stationTag);
 
+        // Bound-slice indicator ("▸<letter>") — empty unless the engine is
+        // running; secondary-text themed like the station tag.
+        m_boundSliceTag = new QLabel(this);
+        m_boundSliceTag->setToolTip(QStringLiteral("Bound slice"));
+        ThemeManager::instance().applyStyleSheet(
+            m_boundSliceTag,
+            "QLabel { color: {{color.text.secondary}}; font-size: 11px;"
+            " font-weight: bold; }");
+        row->addWidget(m_boundSliceTag);
+
         row->addStretch(1);
 
         m_utcValue = makeInsetReadout(this, 64);
@@ -266,18 +302,67 @@ void AetherClockApplet::buildUi()
         m_offsetValue = makeInsetReadout(this, 52);
         row->addWidget(m_offsetValue);
 
+        // DAX channel of the relevant slice (bound while running, else the
+        // selected slice). Amber when a running bound slice has no channel.
+        m_daxDisplay = makeInsetReadout(this, 40);
+        m_daxDisplay->setToolTip(
+            QStringLiteral("DAX channel — bound slice while running, "
+                           "else the selected slice"));
+        row->addWidget(m_daxDisplay);
+
         layout->addLayout(row);
     }
 
-    // Drawer toggle (collapsed by default).
-    m_drawerToggle = new QPushButton(this);
-    m_drawerToggle->setStyleSheet(kButtonBase());
-    m_drawerToggle->setFixedHeight(20);
-    m_drawerToggle->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    connect(m_drawerToggle, &QPushButton::clicked, this, [this]() {
-        setSettingsExpanded(m_settingsDrawer && m_settingsDrawer->isHidden());
-    });
-    layout->addWidget(m_drawerToggle);
+    // No-DAX warning directly under the status row: amber, word-wrapped, hidden
+    // until a running bound slice is found to have no DAX channel (no audio).
+    m_daxWarning = new QLabel(
+        QStringLiteral("Bound slice has no DAX channel — no audio"), this);
+    m_daxWarning->setObjectName(QStringLiteral("clockDaxWarning"));
+    m_daxWarning->setWordWrap(true);
+    m_daxWarning->setStyleSheet(
+        QStringLiteral("QLabel { color: #ffb800; font-size: 10px; }"));
+    m_daxWarning->setVisible(false);
+    layout->addWidget(m_daxWarning);
+
+    // Half-width button-grid row: the settings drawer toggle (collapsed by
+    // default) beside the DAX chooser for the selected slice, each ~50%.
+    {
+        auto* controlRow = new QHBoxLayout;
+        controlRow->setSpacing(3);
+
+        m_drawerToggle = new QPushButton(this);
+        m_drawerToggle->setStyleSheet(kButtonBase());
+        m_drawerToggle->setFixedHeight(20);
+        m_drawerToggle->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        connect(m_drawerToggle, &QPushButton::clicked, this, [this]() {
+            setSettingsExpanded(m_settingsDrawer && m_settingsDrawer->isHidden());
+        });
+        controlRow->addWidget(m_drawerToggle, 1);
+
+        // DAX chooser acts on the strip's SELECTED slice — a client-scoped DAX
+        // assignment. index == channel (0 = Off, 1-4). Disabled with no slice.
+        m_daxCombo = new GuardedComboBox(this);
+        m_daxCombo->setObjectName(QStringLiteral("clockDaxCombo"));
+        m_daxCombo->setAccessibleName(QStringLiteral("AetherClock DAX channel"));
+        applyComboStyle(m_daxCombo);
+        m_daxCombo->setFixedHeight(20);
+        m_daxCombo->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+        m_daxCombo->addItems({QStringLiteral("DAX Off"), QStringLiteral("DAX 1"),
+                              QStringLiteral("DAX 2"), QStringLiteral("DAX 3"),
+                              QStringLiteral("DAX 4")});
+        connect(m_daxCombo, qOverload<int>(&QComboBox::currentIndexChanged), this,
+                [this](int idx) {
+            // Skip the echo while we sync the combo from the model (VfoWidget
+            // precedent); index == DAX channel.
+            if (m_updatingDaxFromModel)
+                return;
+            if (!m_slice.isNull())
+                m_slice->setDaxChannel(idx);
+        });
+        controlRow->addWidget(m_daxCombo, 1);
+
+        layout->addLayout(controlRow);
+    }
 
     buildSettingsDrawer();
     layout->addWidget(m_settingsDrawer);
@@ -289,6 +374,7 @@ void AetherClockApplet::buildUi()
     applyUtcReadout(m_utcValue, QDateTime());
     applyOffsetReadout(m_offsetValue, QDateTime(), 0.0);
     updateStartStopUi();
+    refreshDaxUi();
 }
 
 void AetherClockApplet::buildSettingsDrawer()
@@ -346,13 +432,25 @@ void AetherClockApplet::buildSettingsDrawer()
         const bool wantRun = m_startStopButton && m_startStopButton->isChecked();
         if (!m_engine.isNull()) {
             if (wantRun) {
-                if (!m_slice.isNull())
+                if (!m_slice.isNull()) {
                     m_engine->start(m_slice.data(), currentChoice(m_presetCombo).station);
+                    // The applet is the sole start caller, so binding here is
+                    // authoritative for the running-slice display. Watch the
+                    // bound slice's DAX channel too, so the no-audio warning
+                    // reacts if the user (re)assigns a channel mid-run.
+                    m_boundSlice = m_slice;
+                    if (m_boundSliceDaxConn)
+                        disconnect(m_boundSliceDaxConn);
+                    m_boundSliceDaxConn =
+                        connect(m_boundSlice.data(), &SliceModel::daxChannelChanged,
+                                this, [this](int) { refreshDaxUi(); });
+                }
             } else {
                 m_engine->stop();
             }
         }
         updateStartStopUi();
+        refreshDaxUi();
     });
     drawer->addWidget(m_startStopButton);
 
@@ -468,6 +566,15 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
         connect(m_engine, &AetherClockEngine::runningChanged, this,
                 [this](bool running) {
             updateStartStopUi();
+            if (!running) {
+                // A real stop unbinds the slice; drop its DAX watch so a later
+                // channel edit can't revive the running-state warning.
+                if (m_boundSliceDaxConn)
+                    disconnect(m_boundSliceDaxConn);
+                m_boundSliceDaxConn = {};
+                m_boundSlice = nullptr;
+            }
+            refreshDaxUi();
             // History is useful across a NoSignal dropout; only a real stop
             // clears the scope.
             if (!running && m_scope)
@@ -477,6 +584,7 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
 
     syncStatus();
     updateStartStopUi();
+    refreshDaxUi();
 }
 
 void AetherClockApplet::setSlice(SliceModel* slice)
@@ -484,8 +592,17 @@ void AetherClockApplet::setSlice(SliceModel* slice)
     // Store only; never auto-start on bind, and never double-stop — if the
     // engine is running and the slice is lost, the engine stops itself and
     // its runningChanged(false) drives the UI. Here we just refresh enables.
+    if (m_sliceDaxConn)
+        disconnect(m_sliceDaxConn);
+    m_sliceDaxConn = {};
     m_slice = slice;
+    if (slice) {
+        // The DAX chooser + display track the selected slice's channel.
+        m_sliceDaxConn = connect(slice, &SliceModel::daxChannelChanged, this,
+                                 [this](int) { refreshDaxUi(); });
+    }
     updateStartStopUi();
+    refreshDaxUi();
 }
 
 void AetherClockApplet::updateStartStopUi()
@@ -509,10 +626,74 @@ void AetherClockApplet::updateStartStopUi()
 
 void AetherClockApplet::applyPresetSelection()
 {
+    // Tune acts on the strip's SELECTED slice via the slice-scoped overload,
+    // which works while the engine is stopped (it refuses locked slices
+    // internally). Tune is enabled whenever an engine + slice are present — it
+    // never requires the engine to be running or a slice to be bound.
     if (m_engine.isNull() || m_slice.isNull() || !m_presetCombo)
         return;
     const PresetChoice c = currentChoice(m_presetCombo);
-    m_engine->applyStationPreset(c.station, c.carrierMHz);
+    m_engine->applyStationPreset(m_slice.data(), c.station, c.carrierMHz);
+}
+
+void AetherClockApplet::refreshDaxUi()
+{
+    const bool running = !m_engine.isNull() && m_engine->isRunning();
+    SliceModel* bound = m_boundSlice.data();
+    SliceModel* sel = m_slice.data();
+
+    // Bound-slice indicator: "▸<letter>" (U+25B8 text glyph), only while running.
+    if (m_boundSliceTag) {
+        m_boundSliceTag->setText((running && bound)
+                                     ? QStringLiteral("▸") + bound->letter()
+                                     : QString());
+    }
+
+    // DAX chooser tracks the SELECTED slice (the pick a user change acts on).
+    // The QSignalBlocker stops the programmatic setCurrentIndex from echoing
+    // back as a user edit; the guard flag is the VfoWidget belt-and-suspenders.
+    if (m_daxCombo) {
+        m_daxCombo->setEnabled(sel != nullptr);
+        const int ch = std::clamp(sel ? sel->daxChannel() : 0, 0, 4);
+        m_updatingDaxFromModel = true;
+        {
+            QSignalBlocker block(m_daxCombo);
+            m_daxCombo->setCurrentIndex(ch);
+        }
+        m_updatingDaxFromModel = false;
+    }
+
+    // A running bound slice with no DAX channel is the no-audio condition — it
+    // drives both the amber DAX inset and the warning banner.
+    const bool noDaxWhileRunning = running && bound && bound->daxChannel() == 0;
+
+    // DAX display inset: the RELEVANT slice — bound while running, else selected.
+    if (m_daxDisplay) {
+        SliceModel* shown = (running && bound) ? bound : sel;
+        QString text;
+        if (!shown) {
+            text = QStringLiteral("--");
+        } else if (shown->daxChannel() == 0) {
+            // U+2013 en dash: slice present, no channel assigned.
+            text = QStringLiteral("DAX –");
+        } else {
+            text = QStringLiteral("DAX %1").arg(shown->daxChannel());
+        }
+        m_daxDisplay->setText(text);
+        m_daxDisplay->setStyleSheet(noDaxWhileRunning ? kInsetStyleWarn()
+                                                      : kInsetStyle());
+    }
+
+    // Warning banner toggles height, so re-run the geometry path (mirroring
+    // setSettingsExpanded) only when its visibility actually flips.
+    if (m_daxWarning && m_daxWarning->isHidden() == noDaxWhileRunning) {
+        m_daxWarning->setVisible(noDaxWhileRunning);
+        setMinimumHeight(minimumSizeHint().height());
+        updateGeometry();
+        adjustSize();
+        if (auto* p = parentWidget())
+            p->updateGeometry();
+    }
 }
 
 } // namespace AetherSDR

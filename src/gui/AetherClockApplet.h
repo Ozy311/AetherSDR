@@ -52,23 +52,36 @@ private:
     void buildSettingsDrawer();
     void setSettingsExpanded(bool expanded);
     void updateStartStopUi();
-    void applyPresetSelection();  // combo → engine applyStationPreset
+    void applyPresetSelection();  // combo → engine applyStationPreset (selected slice)
+    // Recompute the DAX chooser index, DAX display text+style, and the no-DAX
+    // warning visibility from current (engine running, bound slice, selected
+    // slice) state.
+    void refreshDaxUi();
 
     QPointer<AetherClockEngine> m_engine;
     QPointer<AetherClockModel> m_model;
-    QPointer<SliceModel> m_slice;
+    QPointer<SliceModel> m_slice;       // strip-selected listening slice
+    QPointer<SliceModel> m_boundSlice;  // slice the running engine is bound to
 
     ClockAlignmentWidget* m_scope{nullptr};
     QLabel* m_utcValue{nullptr};      // decoded UTC, monospace
     QLabel* m_offsetValue{nullptr};   // signed offset, glanceable
     QLabel* m_lockLed{nullptr};       // state-colored LED dot
     QLabel* m_stationTag{nullptr};    // WWV / WWVH / WWVB / --
+    QLabel* m_boundSliceTag{nullptr}; // "▸<letter>" bound slice, running only
+    QLabel* m_daxDisplay{nullptr};    // "DAX n" inset for the relevant slice
+    QLabel* m_daxWarning{nullptr};    // amber no-DAX-channel warning, under status row
     QFrame* m_settingsDrawer{nullptr};
     QPushButton* m_drawerToggle{nullptr};
     GuardedComboBox* m_presetCombo{nullptr};
+    GuardedComboBox* m_daxCombo{nullptr};  // DAX chooser for the selected slice
     QPushButton* m_tuneButton{nullptr};
     QPushButton* m_startStopButton{nullptr};
     QLabel* m_presetNote{nullptr};  // per-preset dial note (+ WWVB AGC note)
+
+    bool m_updatingDaxFromModel{false};  // guard the DAX combo↔model echo loop
+    QMetaObject::Connection m_sliceDaxConn;       // selected slice daxChannelChanged
+    QMetaObject::Connection m_boundSliceDaxConn;  // bound slice daxChannelChanged (running)
 };
 
 } // namespace AetherSDR
