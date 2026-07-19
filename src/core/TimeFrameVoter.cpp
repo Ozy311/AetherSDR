@@ -22,7 +22,36 @@ inline float agedWeight(float confidence, float agingFactor, int age) {
     return base * std::pow(agingFactor, static_cast<float>(age));
 }
 
+// True when the two-digit year names a Gregorian leap year, under the 20xx
+// century assumption (full year = 2000 + year2). Within 2000..2099 this reduces
+// to year2 % 4 == 0 — 2000 is a 400-divisible leap year and no year in that
+// span is century-divisible — but the full rule is written out so the helper
+// stays correct if the century assumption is ever revisited.
+inline bool isLeapYear2(int year2) {
+    const int y = 2000 + year2;
+    return (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0);
+}
+
 } // namespace
+
+// Forward calendar arithmetic with minute/hour/doy/year carries. `minutes` is
+// small in practice (bounded by the voter window), but the loops are written to
+// carry across any number of day/year boundaries.
+TimeFields advanceMinutes(TimeFields t, int minutes) {
+    t.minute += minutes;
+    t.hour   += t.minute / 60;
+    t.minute %= 60;
+    int carryDays = t.hour / 24;
+    t.hour %= 24;
+    t.doy += carryDays;
+    // doy is 1-based; wrap at the current year's length, carrying year2 (mod 100).
+    for (int len = isLeapYear2(t.year2) ? 366 : 365; t.doy > len;
+         len = isLeapYear2(t.year2) ? 366 : 365) {
+        t.doy -= len;
+        t.year2 = (t.year2 + 1) % 100;
+    }
+    return t;
+}
 
 TimeFrameVoter::TimeFrameVoter(Config cfg) : m_cfg(std::move(cfg)) {}
 
@@ -46,17 +75,21 @@ int TimeFrameVoter::frameCount() const {
     return static_cast<int>(m_frames.size());
 }
 
-// Per-frame BCD minutes decode: sum the minutes-map weights whose second
-// classified as One. Marker/Unknown contribute nothing.
-int TimeFrameVoter::decodeMinutes(const Frame& f) const {
+// Per-frame BCD field decode: sum the field-map weights whose second classified
+// as One. Marker/Unknown contribute nothing.
+int TimeFrameVoter::decodeField(const Frame& f, FieldIndex field) const {
     int value = 0;
-    for (const auto& bw : m_cfg.fields[FieldMinutes]) {
+    for (const auto& bw : m_cfg.fields[field]) {
         if (bw.second >= 0 && bw.second < 60 &&
             f.symbols[bw.second] == ClockSymbol::One) {
             value += bw.weight;
         }
     }
     return value;
+}
+
+int TimeFrameVoter::decodeMinutes(const Frame& f) const {
+    return decodeField(f, FieldMinutes);
 }
 
 bool TimeFrameVoter::locked() const {
@@ -118,71 +151,90 @@ bool TimeFrameVoter::locked() const {
     return true;
 }
 
-int TimeFrameVoter::votedField(FieldIndex field) const {
+TimeFields TimeFrameVoter::votedTimestamp() const {
     const int n = static_cast<int>(m_frames.size());
-    if (n == 0) {
-        return -1;
-    }
 
-    // FieldMinutes is special: bits change frame-to-frame, so vote on the
-    // decoded VALUE normalized to the newest frame (older frames + their age,
-    // mod 60), weighted by each frame's mean minutes-map confidence, aged.
-    if (field == FieldMinutes) {
-        const auto& mmap = m_cfg.fields[FieldMinutes];
-        std::unordered_map<int, double> weightByValue;
-        for (int i = 0; i < n; ++i) {
-            const int age = (n - 1) - i;
-            const Frame& f = m_frames[i];
-            const int normalized = ((decodeMinutes(f) + age) % 60 + 60) % 60;
-
-            double confSum = 0.0;
-            int confCount = 0;
-            for (const auto& bw : mmap) {
+    // Field-map bit indices whose per-frame confidences represent a frame's
+    // timestamp-decode quality (union of the four voted field maps).
+    auto meanTimestampConfidence = [&](const Frame& f) -> double {
+        double sum = 0.0;
+        int count = 0;
+        for (const FieldIndex fld : {FieldMinutes, FieldHours, FieldDoy, FieldYear}) {
+            for (const auto& bw : m_cfg.fields[fld]) {
                 if (bw.second >= 0 && bw.second < 60) {
-                    confSum += f.confidence[bw.second];
-                    ++confCount;
+                    sum += f.confidence[bw.second];
+                    ++count;
                 }
             }
-            const double meanConf = confCount ? confSum / confCount : 0.0;
-            weightByValue[normalized] +=
-                meanConf * std::pow(static_cast<double>(m_cfg.agingFactor),
-                                    static_cast<double>(age));
         }
+        return count ? sum / count : 0.0;
+    };
 
-        int best = -1;
-        double bestWeight = -1.0;
-        for (const auto& [value, weight] : weightByValue) {
-            if (weight > bestWeight) {
-                bestWeight = weight;
-                best = value;
-            }
-        }
-        return best;
+    // Encode a range-valid timestamp tuple to a collision-free key so equal
+    // extrapolated timestamps accumulate their weight together.
+    auto encode = [](const TimeFields& t) -> int64_t {
+        return (static_cast<int64_t>(t.year2) * 100000000) +
+               (static_cast<int64_t>(t.doy) * 100000) +
+               (static_cast<int64_t>(t.hour) * 1000) +
+               static_cast<int64_t>(t.minute);
+    };
+
+    std::unordered_map<int64_t, double> weightByTuple;
+    std::unordered_map<int64_t, TimeFields> tupleByKey;
+
+    for (int i = 0; i < n; ++i) {
+        const int age = (n - 1) - i;  // newest -> age 0
+        const Frame& f = m_frames[i];
+
+        TimeFields tf;
+        tf.minute = decodeField(f, FieldMinutes);
+        tf.hour   = decodeField(f, FieldHours);
+        tf.doy    = decodeField(f, FieldDoy);
+        tf.year2  = decodeField(f, FieldYear);
+
+        // Exclude frames whose fields decode outside valid broadcast ranges —
+        // the same spirit as excluding Marker/Unknown symbols from a bit vote.
+        if (tf.minute < 0 || tf.minute > 59) continue;
+        if (tf.hour   < 0 || tf.hour   > 23) continue;
+        if (tf.doy    < 1 || tf.doy    > 366) continue;
+        if (tf.year2  < 0 || tf.year2  > 99) continue;
+
+        // Extrapolate this frame's timestamp forward to the newest frame, so all
+        // in-window frames vote on the SAME (newest) timestamp.
+        const TimeFields ext = advanceMinutes(tf, age);
+        const double w =
+            agedWeight(static_cast<float>(meanTimestampConfidence(f)),
+                       m_cfg.agingFactor, age);
+        const int64_t key = encode(ext);
+        weightByTuple[key] += w;
+        tupleByKey[key] = ext;
     }
 
-    // Static fields: per-bit confidence-weighted majority; sum the weights of
-    // the bits that voted One.
-    int value = 0;
-    for (const auto& bw : m_cfg.fields[field]) {
-        if (bw.second < 0 || bw.second >= 60) {
-            continue;
-        }
-        float w0 = 0.0f, w1 = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            const int age = (n - 1) - i;
-            const Frame& f = m_frames[i];
-            const ClockSymbol s = f.symbols[bw.second];
-            if (s == ClockSymbol::One || s == ClockSymbol::Zero) {
-                const float w =
-                    agedWeight(f.confidence[bw.second], m_cfg.agingFactor, age);
-                (s == ClockSymbol::One ? w1 : w0) += w;
-            }
-        }
-        if (w1 > w0) {
-            value += bw.weight;
+    int64_t bestKey = 0;
+    double bestWeight = -1.0;
+    bool have = false;
+    for (const auto& [key, weight] : weightByTuple) {
+        if (weight > bestWeight) {
+            bestWeight = weight;
+            bestKey = key;
+            have = true;
         }
     }
-    return value;
+    return have ? tupleByKey[bestKey] : TimeFields{};
+}
+
+int TimeFrameVoter::votedField(FieldIndex field) const {
+    if (m_frames.empty()) {
+        return -1;
+    }
+    const TimeFields t = votedTimestamp();
+    switch (field) {
+        case FieldMinutes: return t.minute;
+        case FieldHours:   return t.hour;
+        case FieldDoy:     return t.doy;
+        case FieldYear:    return t.year2;
+        default:           return -1;
+    }
 }
 
 int TimeFrameVoter::lastFrameMinute() const {
@@ -193,6 +245,13 @@ int TimeFrameVoter::lastFrameMinute() const {
 }
 
 float TimeFrameVoter::lockConfidence() const {
+    // Deliberately retained as the per-bit winning-margin over the static-field
+    // bits of the window, NOT switched to the winning-tuple weight margin. It
+    // measures raw bit stability, which is the honest quantity here: during an
+    // hour/day rollover the window straddles two timestamps, the per-bit margins
+    // dip, and reporting that dip is correct — quality SHOULD soften through a
+    // transition even though the tuple vote (votedTimestamp) now resolves the
+    // reported time unambiguously.
     const int n = static_cast<int>(m_frames.size());
     if (n < m_cfg.minFramesForLock) {
         return 0.0f;

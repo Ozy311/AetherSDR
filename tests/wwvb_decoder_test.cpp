@@ -280,6 +280,111 @@ static void checkAuxFields(const Capture& c, const FrameTruth& truth, int nFrame
     CHECK(matched >= nFrames);
 }
 
+// ---------------------------------------------- direct TimeFrameVoter rollover
+// Drive TimeFrameVoter directly with the NIST WWVB legacy-AM field map so the
+// whole-timestamp value vote is exercised across hour/day/year boundaries — the
+// case the golden audio vectors never reached (all stayed within one hour).
+
+using VMap = std::vector<std::pair<int, int>>;  // (second, weight)
+// WWVB field maps derived from encodeFrame's setBits placement (NIST SP 250-67).
+static const VMap kVbMin{{1,40},{2,20},{3,10},{5,8},{6,4},{7,2},{8,1}};
+static const VMap kVbHr {{12,20},{13,10},{15,8},{16,4},{17,2},{18,1}};
+static const VMap kVbDoy{{22,200},{23,100},{25,80},{26,40},{27,20},{28,10},
+                         {30,8},{31,4},{32,2},{33,1}};
+static const VMap kVbYr {{45,80},{46,40},{47,20},{48,10},{50,8},{51,4},{52,2},{53,1}};
+
+static TimeFrameVoter::Config wwvbVoterConfig() {
+    auto toFieldMap = [](const VMap& m) {
+        ClockFieldMap fm;
+        for (const auto& pr : m) fm.push_back(ClockBitWeight{pr.first, pr.second});
+        return fm;
+    };
+    TimeFrameVoter::Config cfg;
+    cfg.fields[TimeFrameVoter::FieldMinutes] = toFieldMap(kVbMin);
+    cfg.fields[TimeFrameVoter::FieldHours]   = toFieldMap(kVbHr);
+    cfg.fields[TimeFrameVoter::FieldDoy]     = toFieldMap(kVbDoy);
+    cfg.fields[TimeFrameVoter::FieldYear]    = toFieldMap(kVbYr);
+    cfg.markerSeconds = {0, 9, 19, 29, 39, 49, 59};
+    cfg.window = 8;
+    cfg.minFramesForLock = 2;
+    cfg.agingFactor = 0.9f;
+    return cfg;
+}
+
+static std::array<ClockSymbol, 60> wwvbVoterFrame(int mn, int hr, int doy, int yr) {
+    const FrameTruth t{mn, hr, doy, yr, /*dut1*/0, /*lyi*/false, /*lsw*/false, /*dst*/0};
+    const std::array<int, 60> s = encodeFrame(t);
+    std::array<ClockSymbol, 60> out{};
+    for (int i = 0; i < 60; ++i) {
+        out[i] = (s[i] == kSymOne)    ? ClockSymbol::One
+               : (s[i] == kSymMarker) ? ClockSymbol::Marker
+                                      : ClockSymbol::Zero;
+    }
+    return out;
+}
+
+// [wwvb.voter.rollover] Whole-timestamp value vote survives hour/day/year
+// rollovers; a mixed-hour window never votes an off-air hour.
+static void sectionVoterRollover() {
+    std::array<float, 60> conf; conf.fill(1.0f);
+
+    // (a) advanceMinutes helper is calendar-correct in isolation.
+    CHECK(advanceMinutes(TimeFields{59, 21, 200, 26}, 1) == (TimeFields{0, 22, 200, 26}));
+    CHECK(advanceMinutes(TimeFields{59, 23, 200, 26}, 1) == (TimeFields{0, 0, 201, 26}));
+    CHECK(advanceMinutes(TimeFields{59, 23, 365, 26}, 1) == (TimeFields{0, 0, 1, 27}));
+    CHECK(advanceMinutes(TimeFields{59, 23, 366, 28}, 1) == (TimeFields{0, 0, 1, 29}));
+
+    // (b) hour rollover 21:57 -> 22:02.
+    {
+        TimeFrameVoter v(wwvbVoterConfig());
+        struct MH { int mn, hr; };
+        for (const MH e : {MH{57,21}, {58,21}, {59,21}, {0,22}, {1,22}, {2,22}}) {
+            v.addFrame(wwvbVoterFrame(e.mn, e.hr, 200, 26), conf);
+            CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == e.mn);
+            CHECK(v.votedField(TimeFrameVoter::FieldHours)   == e.hr);
+            CHECK(v.votedField(TimeFrameVoter::FieldDoy)     == 200);
+            CHECK(v.votedField(TimeFrameVoter::FieldYear)    == 26);
+        }
+    }
+
+    // (c) day rollover 23:58 -> 00:01, doy 200 -> 201.
+    {
+        TimeFrameVoter v(wwvbVoterConfig());
+        struct MHD { int mn, hr, doy; };
+        for (const MHD e : {MHD{58,23,200}, {59,23,200}, {0,0,201}, {1,0,201}}) {
+            v.addFrame(wwvbVoterFrame(e.mn, e.hr, e.doy, 26), conf);
+            CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == e.mn);
+            CHECK(v.votedField(TimeFrameVoter::FieldHours)   == e.hr);
+            CHECK(v.votedField(TimeFrameVoter::FieldDoy)     == e.doy);
+        }
+    }
+
+    // (d) year rollover on doy 365 -> 1, yr 26 -> 27 (non-leap year length).
+    {
+        TimeFrameVoter v(wwvbVoterConfig());
+        struct T { int mn, hr, doy, yr; };
+        for (const T e : {T{58,23,365,26}, {59,23,365,26}, {0,0,1,27}, {1,0,1,27}}) {
+            v.addFrame(wwvbVoterFrame(e.mn, e.hr, e.doy, e.yr), conf);
+            CHECK(v.votedField(TimeFrameVoter::FieldDoy)  == e.doy);
+            CHECK(v.votedField(TimeFrameVoter::FieldYear) == e.yr);
+        }
+    }
+
+    // (e) bizarre-blend regression: 7 consecutive hour-21 frames then hour-22 —
+    //     voted hour must only ever be 21 or 22, never a per-bit-mixed value.
+    {
+        TimeFrameVoter v(wwvbVoterConfig());
+        struct MH { int mn, hr; };
+        for (const MH e : {MH{53,21}, {54,21}, {55,21}, {56,21}, {57,21}, {58,21},
+                           {59,21}, {0,22}, {1,22}, {2,22}}) {
+            v.addFrame(wwvbVoterFrame(e.mn, e.hr, 200, 26), conf);
+            const int h = v.votedField(TimeFrameVoter::FieldHours);
+            CHECK(h == 21 || h == 22);
+            CHECK(h == e.hr);
+        }
+    }
+}
+
 // ------------------------------------------------------------------------ main
 int main() {
     // Golden truth for the clean 3-frame vector: 06:20/06:21/06:22, doy 200,
@@ -418,6 +523,9 @@ int main() {
         for (const auto& f : c.frames) CHECK(f.minute != 22);
         for (const auto& t : c.times) CHECK(t.minute != 22);
     }
+
+    // --- Section: direct TimeFrameVoter hour/day/year rollover
+    sectionVoterRollover();
 
     // --- WAV dump of the clean golden vector (opt-in via env var) + truth print
     if (const char* dir = std::getenv("AETHERCLOCK_DUMP_WAV_DIR")) {

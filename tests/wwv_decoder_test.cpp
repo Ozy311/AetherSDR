@@ -539,6 +539,107 @@ void sectionConfidenceFloor(const std::vector<float>& clean) {
                  static_cast<double>(minQuality));
 }
 
+// ---- direct TimeFrameVoter rollover tests (WWV field maps) ----------------
+// These drive TimeFrameVoter directly (no audio path) so the whole-timestamp
+// value vote is exercised across hour/day/year rollovers — the case no golden
+// audio vector reached because every vector stayed inside one hour.
+
+TimeFrameVoter::Config wwvVoterConfig() {
+    auto toFieldMap = [](const BcdMap& m) {
+        ClockFieldMap fm;
+        for (const auto& pr : m) fm.push_back(ClockBitWeight{pr.first, pr.second});
+        return fm;
+    };
+    TimeFrameVoter::Config cfg;
+    cfg.fields[TimeFrameVoter::FieldMinutes] = toFieldMap(kMapMin);
+    cfg.fields[TimeFrameVoter::FieldHours]   = toFieldMap(kMapHr);
+    cfg.fields[TimeFrameVoter::FieldDoy]     = toFieldMap(kMapDoy);
+    cfg.fields[TimeFrameVoter::FieldYear]    = toFieldMap(kMapYr);
+    cfg.markerSeconds = {9, 19, 29, 39, 49, 59};
+    cfg.window = 8;
+    cfg.minFramesForLock = 2;
+    cfg.agingFactor = 0.9f;
+    return cfg;
+}
+
+// One voter frame (per-second ClockSymbol) from a timestamp; the s0 minute hole
+// is a non-data second, mapped to Marker (never in a field map).
+std::array<ClockSymbol, 60> wwvVoterFrame(int mn, int hr, int doy, int yr) {
+    Truth t; t.minute = mn; t.hour = hr; t.doy = doy; t.year2 = yr;
+    const std::array<Sym, 60> s = encodeMinute(t);
+    std::array<ClockSymbol, 60> out{};
+    for (int i = 0; i < 60; ++i) {
+        out[i] = (s[i] == Sym::One)    ? ClockSymbol::One
+               : (s[i] == Sym::Zero)   ? ClockSymbol::Zero
+                                       : ClockSymbol::Marker;  // Marker or Hole
+    }
+    return out;
+}
+
+// [wwv.voter.rollover] After every appended frame the voted timestamp equals the
+// newest frame's truth across hour/day/year boundaries, and a mixed-hour window
+// never votes an off-air hour.
+void sectionVoterRollover() {
+    std::array<float, 60> conf; conf.fill(1.0f);
+
+    // (a) advanceMinutes helper is calendar-correct in isolation.
+    CHECK(advanceMinutes(TimeFields{59, 21, 200, 26}, 1) == (TimeFields{0, 22, 200, 26}));
+    CHECK(advanceMinutes(TimeFields{59, 23, 200, 26}, 1) == (TimeFields{0, 0, 201, 26}));
+    CHECK(advanceMinutes(TimeFields{59, 23, 365, 26}, 1) == (TimeFields{0, 0, 1, 27})); // 2026 not leap
+    CHECK(advanceMinutes(TimeFields{59, 23, 366, 28}, 1) == (TimeFields{0, 0, 1, 29})); // 2028 leap
+
+    // (b) hour rollover 21:57 -> 22:02.
+    {
+        TimeFrameVoter v(wwvVoterConfig());
+        struct MH { int mn, hr; };
+        for (const MH e : {MH{57,21}, {58,21}, {59,21}, {0,22}, {1,22}, {2,22}}) {
+            v.addFrame(wwvVoterFrame(e.mn, e.hr, 200, 26), conf);
+            CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == e.mn);
+            CHECK(v.votedField(TimeFrameVoter::FieldHours)   == e.hr);
+            CHECK(v.votedField(TimeFrameVoter::FieldDoy)     == 200);
+            CHECK(v.votedField(TimeFrameVoter::FieldYear)    == 26);
+        }
+    }
+
+    // (c) day rollover 23:58 -> 00:01, doy 200 -> 201.
+    {
+        TimeFrameVoter v(wwvVoterConfig());
+        struct MHD { int mn, hr, doy; };
+        for (const MHD e : {MHD{58,23,200}, {59,23,200}, {0,0,201}, {1,0,201}}) {
+            v.addFrame(wwvVoterFrame(e.mn, e.hr, e.doy, 26), conf);
+            CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == e.mn);
+            CHECK(v.votedField(TimeFrameVoter::FieldHours)   == e.hr);
+            CHECK(v.votedField(TimeFrameVoter::FieldDoy)     == e.doy);
+        }
+    }
+
+    // (d) year rollover on doy 365 -> 1, yr 26 -> 27 (non-leap year length).
+    {
+        TimeFrameVoter v(wwvVoterConfig());
+        struct T { int mn, hr, doy, yr; };
+        for (const T e : {T{58,23,365,26}, {59,23,365,26}, {0,0,1,27}, {1,0,1,27}}) {
+            v.addFrame(wwvVoterFrame(e.mn, e.hr, e.doy, e.yr), conf);
+            CHECK(v.votedField(TimeFrameVoter::FieldDoy)  == e.doy);
+            CHECK(v.votedField(TimeFrameVoter::FieldYear) == e.yr);
+        }
+    }
+
+    // (e) bizarre-blend regression: a window holding hour-21 AND hour-22 frames
+    //     must vote an hour of ONLY 21 or 22 — never a per-bit-mixed third value
+    //     (the live 20:xx symptom). 7 consecutive hour-21 frames, then hour-22.
+    {
+        TimeFrameVoter v(wwvVoterConfig());
+        struct MH { int mn, hr; };
+        for (const MH e : {MH{53,21}, {54,21}, {55,21}, {56,21}, {57,21}, {58,21},
+                           {59,21}, {0,22}, {1,22}, {2,22}}) {
+            v.addFrame(wwvVoterFrame(e.mn, e.hr, 200, 26), conf);
+            const int h = v.votedField(TimeFrameVoter::FieldHours);
+            CHECK(h == 21 || h == 22);                 // never an off-air hour
+            CHECK(h == e.hr);                          // and the newest hour wins
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -556,6 +657,7 @@ int main() {
     sectionTruncatedNoPartial();
     sectionDecadeDegeneracy(clean);
     sectionConfidenceFloor(clean);
+    sectionVoterRollover();
 
     // Print encoded truth for the python cross-check gate.
     std::printf("golden truth: min=%d hr=%d doy=%d yr=%d frames=%d\n",

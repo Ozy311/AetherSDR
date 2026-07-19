@@ -81,6 +81,24 @@ struct ClockTimeInfo {
     ClockStation station = ClockStation::Unknown;
 };
 
+// A complete broadcast timestamp decoded from a single frame. minute/hour are
+// 0-based; doy is 1-based day-of-year; year2 is the two-digit year (century
+// assumption: full year = 2000 + year2, i.e. the 20xx century).
+struct TimeFields {
+    int minute = -1;
+    int hour   = -1;
+    int doy    = -1;
+    int year2  = -1;
+    bool operator==(const TimeFields&) const = default;
+};
+
+// Advance a timestamp forward by `minutes` (>= 0) using calendar arithmetic:
+// minute 59 -> 0 carries the hour, hour 23 -> 0 carries the day-of-year, and
+// doy wraps at the year length (365, or 366 when 2000 + year2 is a Gregorian
+// leap year) carrying year2 (mod 100). Pure/stateless so it is unit-testable in
+// isolation. Inputs are assumed already range-valid.
+TimeFields advanceMinutes(TimeFields t, int minutes);
+
 // Cross-frame confidence-weighted bit voter (reference: wwv_decode_proto.py —
 // weight = max(confidence, 0.01); production adds frame aging).
 class TimeFrameVoter {
@@ -123,11 +141,18 @@ public:
     // (the reference scores increments: marker_score + 4 * increment_count).
     bool locked() const;
 
-    // Confidence-weighted bit vote across the window. For each mapped second,
-    // per-frame vote weight = max(confidence, 0.01) * agingFactor^age (age 0 =
-    // newest frame). For FieldMinutes the per-frame decoded value is first
-    // normalized to the NEWEST frame (+age), so the returned minutes value is
-    // "minutes as of the newest frame".
+    // Voted value of a timestamp field (minute/hour/doy/year), reported "as of
+    // the newest frame". All four fields come from a single VALUE-level vote:
+    // each frame's complete timestamp is decoded from that frame's own bits,
+    // extrapolated forward by its age in minutes (calendar arithmetic), and the
+    // whole tuple is majority-voted with per-frame weight
+    // max(meanConfidence, 0.01) * agingFactor^age (age 0 = newest frame). Voting
+    // the tuple — not each field's bits independently across frames — is what
+    // makes an hour/day rollover safe: a stale hour cannot outvote the current
+    // one for a window length, and per-bit mixing can never synthesize a field
+    // value that no frame in the window actually carried. Per-bit voting remains
+    // only WITHIN a single frame's decode (never across frames for these
+    // fields). Returns -1 if no frame decodes to a range-valid timestamp.
     int votedField(FieldIndex field) const;
 
     // Raw per-frame minutes decode of the newest frame (no voting).
@@ -146,7 +171,17 @@ private:
     };
     Config m_cfg;
     std::vector<Frame> m_frames;   // newest last
-    int decodeMinutes(const Frame& f) const;
+
+    // Per-frame BCD decode of one field: sum the field-map weights whose second
+    // classified as One (Marker/Unknown contribute nothing).
+    int decodeField(const Frame& f, FieldIndex field) const;
+    int decodeMinutes(const Frame& f) const;  // == decodeField(f, FieldMinutes)
+
+    // Value-level, age-extrapolated majority vote of the whole timestamp across
+    // the window (the source of truth for votedField's four fields). Frames
+    // whose decoded fields fall outside valid broadcast ranges are excluded.
+    // Returns all-(-1) TimeFields when no candidate qualifies.
+    TimeFields votedTimestamp() const;
 };
 
 } // namespace AetherSDR
