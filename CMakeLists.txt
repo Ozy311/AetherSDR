@@ -550,6 +550,9 @@ set(CORE_SOURCES
     src/core/SpectralNR.cpp
     src/core/MonoDspStereoAdapter.cpp
     src/core/PanadapterStream.cpp
+    src/core/TimeFrameVoter.cpp
+    src/core/WwvDecoder.cpp
+    src/core/WwvbDecoder.cpp
     src/core/PacketLossConcealment.cpp
     src/core/PerfTelemetry.cpp
     src/core/RigctlProtocol.cpp
@@ -3848,6 +3851,18 @@ target_include_directories(amp_model_test PRIVATE src)
 target_link_libraries(amp_model_test PRIVATE aethercore Qt6::Core Qt6::Test)
 set_target_properties(amp_model_test PROPERTIES AUTOMOC ON)
 add_test(NAME amp_model_test COMMAND amp_model_test)
+
+add_executable(wwv_decoder_test tests/wwv_decoder_test.cpp)
+target_include_directories(wwv_decoder_test PRIVATE src)
+target_link_libraries(wwv_decoder_test PRIVATE aethercore Qt6::Core Qt6::Test)
+set_target_properties(wwv_decoder_test PROPERTIES AUTOMOC ON)
+add_test(NAME wwv_decoder_test COMMAND wwv_decoder_test)
+
+add_executable(wwvb_decoder_test tests/wwvb_decoder_test.cpp)
+target_include_directories(wwvb_decoder_test PRIVATE src)
+target_link_libraries(wwvb_decoder_test PRIVATE aethercore Qt6::Core Qt6::Test)
+set_target_properties(wwvb_decoder_test PROPERTIES AUTOMOC ON)
+add_test(NAME wwvb_decoder_test COMMAND wwvb_decoder_test)
 
 add_executable(aetherd_amp_decode_test tests/aetherd_amp_decode_test.cpp)
 target_include_directories(aetherd_amp_decode_test PRIVATE src)
