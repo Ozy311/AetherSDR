@@ -11,12 +11,14 @@
 // the user picks the listening slice by strip selection; the applet never
 // creates or grabs a slice.
 
+#include <QDateTime>
 #include <QPointer>
 #include <QWidget>
 
 class QFrame;
 class QLabel;
 class QPushButton;
+class QTimer;
 class GuardedComboBox;
 
 namespace AetherSDR {
@@ -58,6 +60,16 @@ private:
     // slice) state.
     void refreshDaxUi();
 
+    // Trust/time surfaces. WWV lands one decode per 60 s frame, so the raw
+    // decodedUtc reads up to a minute stale; refreshTrustAndTime is the 1 Hz
+    // display-side extrapolator (UTC readout + trust line + time-dependent
+    // tooltips) and never touches the engine/model.
+    void updateDecodeAnchor();     // capture (anchorUtc, anchorHostMs) on a decode
+    void refreshTrustAndTime();    // 1 Hz tick: UTC readout + trust line + dyn tips
+    void updateTickTimer();        // run the tick only while running AND anchored
+    void updateDynamicTooltips();  // LED + UTC tooltips (state / quality / age)
+    void applyStaticTooltips();    // one-shot fixed tooltips for every widget
+
     QPointer<AetherClockEngine> m_engine;
     QPointer<AetherClockModel> m_model;
     QPointer<SliceModel> m_slice;       // strip-selected listening slice
@@ -68,6 +80,7 @@ private:
     QLabel* m_offsetValue{nullptr};   // signed offset, glanceable
     QLabel* m_lockLed{nullptr};       // state-colored LED dot
     QLabel* m_stationTag{nullptr};    // WWV / WWVH / WWVB / --
+    QLabel* m_trustLine{nullptr};     // "q<quality> · <age>" decode-trust readout
     QLabel* m_boundSliceTag{nullptr}; // "▸<letter>" bound slice, running only
     QLabel* m_daxDisplay{nullptr};    // "DAX n" inset for the relevant slice
     QLabel* m_daxWarning{nullptr};    // amber no-DAX-channel warning, under status row
@@ -82,6 +95,10 @@ private:
     bool m_updatingDaxFromModel{false};  // guard the DAX combo↔model echo loop
     QMetaObject::Connection m_sliceDaxConn;       // selected slice daxChannelChanged
     QMetaObject::Connection m_boundSliceDaxConn;  // bound slice daxChannelChanged (running)
+
+    QTimer* m_tickTimer{nullptr};  // 1 Hz UTC/trust extrapolation tick
+    QDateTime m_anchorUtc;         // last decoded UTC (display anchor; invalid = none)
+    qint64 m_anchorHostMs{0};      // host clock ms captured at the anchor decode
 };
 
 } // namespace AetherSDR

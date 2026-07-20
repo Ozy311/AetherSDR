@@ -20,6 +20,7 @@
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QString>
+#include <QTimer>
 #include <QVariant>
 #include <QVBoxLayout>
 #include <QVector>
@@ -157,15 +158,6 @@ void applyStationTag(QLabel* tag, const QString& stationName)
                                                           : stationName);
 }
 
-void applyUtcReadout(QLabel* label, const QDateTime& utc)
-{
-    if (!label)
-        return;
-    label->setText(utc.isValid()
-                       ? utc.toUTC().toString(QStringLiteral("HH:mm:ss"))
-                       : QStringLiteral("--:--:--"));
-}
-
 void applyOffsetReadout(QLabel* label, const QDateTime& utc, double offsetMs)
 {
     if (!label)
@@ -176,6 +168,16 @@ void applyOffsetReadout(QLabel* label, const QDateTime& utc, double offsetMs)
     }
     // + = host clock BEHIND the broadcast (engine offset convention).
     label->setText(QString::asprintf("%+.2f s", offsetMs / 1000.0));
+}
+
+// Decode age for the trust line: seconds while under 100 ("6s"), then whole
+// minutes ("2m") so the compact label never widens the status row.
+QString fmtDecodeAge(qint64 ageMs)
+{
+    const qint64 ageS = ageMs < 0 ? 0 : ageMs / 1000;
+    if (ageS < 100)
+        return QStringLiteral("%1s").arg(ageS);
+    return QStringLiteral("%1m").arg(ageS / 60);
 }
 
 // Listening dial (MHz) formatted for the preset note — "9.999 MHz",
@@ -280,10 +282,19 @@ void AetherClockApplet::buildUi()
             " font-weight: bold; }");
         row->addWidget(m_stationTag);
 
+        // Trust line: decode quality + age since the last decoded frame, so a
+        // ticking UTC readout can't be misread as a live-locked clock.
+        m_trustLine = new QLabel(QStringLiteral("q--"), this);
+        ThemeManager::instance().applyStyleSheet(
+            m_trustLine,
+            "QLabel { color: {{color.text.secondary}}; font-size: 10px; }");
+        row->addWidget(m_trustLine);
+
         // Bound-slice indicator ("▸<letter>") — empty unless the engine is
         // running; secondary-text themed like the station tag.
         m_boundSliceTag = new QLabel(this);
-        m_boundSliceTag->setToolTip(QStringLiteral("Bound slice"));
+        m_boundSliceTag->setToolTip(
+            QStringLiteral("Slice the running decoder is bound to"));
         ThemeManager::instance().applyStyleSheet(
             m_boundSliceTag,
             "QLabel { color: {{color.text.secondary}}; font-size: 11px;"
@@ -292,7 +303,7 @@ void AetherClockApplet::buildUi()
 
         row->addStretch(1);
 
-        m_utcValue = makeInsetReadout(this, 64);
+        m_utcValue = makeInsetReadout(this, 60);
         QFont mono = m_utcValue->font();
         mono.setStyleHint(QFont::Monospace);
         mono.setFamily(QStringLiteral("monospace"));
@@ -369,12 +380,23 @@ void AetherClockApplet::buildUi()
 
     setSettingsExpanded(false);
 
+    // 1 Hz display tick — extrapolates the UTC readout between decodes and ages
+    // the trust line. Coarse timer: this is a human-glance readout, not timing.
+    // Runs only while the engine is running AND a decode anchor exists
+    // (updateTickTimer), so it's idle in the detached/stopped state.
+    m_tickTimer = new QTimer(this);
+    m_tickTimer->setInterval(1000);
+    m_tickTimer->setTimerType(Qt::CoarseTimer);
+    connect(m_tickTimer, &QTimer::timeout, this,
+            [this]() { refreshTrustAndTime(); });
+
     // Prime the status row + action enables to the detached/no-signal state.
     applyStationTag(m_stationTag, QStringLiteral("Unknown"));
-    applyUtcReadout(m_utcValue, QDateTime());
     applyOffsetReadout(m_offsetValue, QDateTime(), 0.0);
+    applyStaticTooltips();
     updateStartStopUi();
     refreshDaxUi();
+    refreshTrustAndTime();  // seeds "--:--:--" / "q--" and the dynamic tooltips
 }
 
 void AetherClockApplet::buildSettingsDrawer()
@@ -539,22 +561,29 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
     m_engine = engine;
     m_model = model;
 
-    // Whole status row refreshed on any model change — 1 Hz-class traffic, so
-    // a full re-read is trivially cheap and keeps the four fields consistent.
+    // Event-driven fields (LED, station, offset) refreshed on any model change
+    // — 1 Hz-class traffic, so a full re-read is trivially cheap. The UTC
+    // readout + trust line are NOT set here: they tick from the decode anchor
+    // (refreshTrustAndTime) so they stay live between the once-per-frame decodes.
     auto syncStatus = [this]() {
         AetherClockModel* m = m_model.data();
         applyLockLed(m_lockLed, m ? m->lockState() : ClockLockState::NoSignal);
         applyStationTag(m_stationTag, m ? m->stationName() : QStringLiteral("Unknown"));
         const QDateTime utc = m ? m->decodedUtc() : QDateTime();
-        applyUtcReadout(m_utcValue, utc);
         applyOffsetReadout(m_offsetValue, utc, m ? m->offsetMs() : 0.0);
+        updateDynamicTooltips();
     };
 
     if (!m_model.isNull()) {
         connect(m_model, &AetherClockModel::stateChanged, this, syncStatus);
         connect(m_model, &AetherClockModel::stationChanged, this, syncStatus);
-        connect(m_model, &AetherClockModel::decodedUtcChanged, this, syncStatus);
         connect(m_model, &AetherClockModel::offsetMsChanged, this, syncStatus);
+        // A fresh decode re-anchors the ticking UTC readout + trust age.
+        connect(m_model, &AetherClockModel::decodedUtcChanged, this,
+                &AetherClockApplet::updateDecodeAnchor);
+        // Quality feeds the trust line and the LED tooltip.
+        connect(m_model, &AetherClockModel::lockQualityChanged, this,
+                &AetherClockApplet::refreshTrustAndTime);
     }
 
     if (!m_engine.isNull()) {
@@ -573,8 +602,14 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
                     disconnect(m_boundSliceDaxConn);
                 m_boundSliceDaxConn = {};
                 m_boundSlice = nullptr;
+                // Drop the decode anchor so the UTC readout falls back to
+                // "--:--:--" and the tick stops (updateTickTimer).
+                m_anchorUtc = QDateTime();
+                m_anchorHostMs = 0;
             }
             refreshDaxUi();
+            updateTickTimer();
+            refreshTrustAndTime();
             // History is useful across a NoSignal dropout; only a real stop
             // clears the scope.
             if (!running && m_scope)
@@ -585,6 +620,7 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
     syncStatus();
     updateStartStopUi();
     refreshDaxUi();
+    updateDecodeAnchor();  // seed the anchor if the model already has a decode
 }
 
 void AetherClockApplet::setSlice(SliceModel* slice)
@@ -694,6 +730,146 @@ void AetherClockApplet::refreshDaxUi()
         if (auto* p = parentWidget())
             p->updateGeometry();
     }
+}
+
+void AetherClockApplet::updateDecodeAnchor()
+{
+    // A decode gives the true broadcast second; pin it to the host clock now so
+    // the readout can extrapolate forward between the once-per-frame decodes.
+    AetherClockModel* m = m_model.data();
+    const QDateTime utc = m ? m->decodedUtc() : QDateTime();
+    if (utc.isValid()) {
+        m_anchorUtc = utc;
+        m_anchorHostMs = QDateTime::currentMSecsSinceEpoch();
+    } else {
+        m_anchorUtc = QDateTime();
+        m_anchorHostMs = 0;
+    }
+    updateTickTimer();
+    refreshTrustAndTime();
+}
+
+void AetherClockApplet::updateTickTimer()
+{
+    if (!m_tickTimer)
+        return;
+    // Tick only when there is something to extrapolate: engine running AND a
+    // decode anchor to extrapolate from.
+    const bool running = !m_engine.isNull() && m_engine->isRunning();
+    const bool active = running && m_anchorUtc.isValid();
+    if (active) {
+        if (!m_tickTimer->isActive())
+            m_tickTimer->start();
+    } else if (m_tickTimer->isActive()) {
+        m_tickTimer->stop();
+    }
+}
+
+void AetherClockApplet::refreshTrustAndTime()
+{
+    // 1 Hz-cheap: only the time-dependent fields (UTC readout, trust line, and
+    // their tooltips). The LED / station / offset / DAX surfaces are event-
+    // driven elsewhere and deliberately untouched here.
+    const bool running = !m_engine.isNull() && m_engine->isRunning();
+    const bool haveDecode = m_anchorUtc.isValid();
+
+    // Display-side extrapolation: anchorUtc + (now − anchorHostMs), floored to
+    // the second. Monotonic, so the readout never ticks backward between
+    // anchors. The engine/model are never touched.
+    QDateTime shownUtc;
+    qint64 ageMs = -1;
+    if (running && haveDecode) {
+        ageMs = QDateTime::currentMSecsSinceEpoch() - m_anchorHostMs;
+        shownUtc = m_anchorUtc.addMSecs(ageMs);
+    }
+    if (m_utcValue) {
+        m_utcValue->setText(
+            shownUtc.isValid()
+                ? shownUtc.toUTC().toString(QStringLiteral("HH:mm:ss"))
+                : QStringLiteral("--:--:--"));
+    }
+    if (m_trustLine) {
+        AetherClockModel* m = m_model.data();
+        m_trustLine->setText(
+            (running && haveDecode)
+                ? QStringLiteral("q%1 · %2")
+                      .arg(m ? m->lockQuality() : 0)
+                      .arg(fmtDecodeAge(ageMs))
+                : QStringLiteral("q--"));
+    }
+    updateDynamicTooltips();
+}
+
+void AetherClockApplet::updateDynamicTooltips()
+{
+    AetherClockModel* m = m_model.data();
+    const bool running = !m_engine.isNull() && m_engine->isRunning();
+    const bool haveDecode = m_anchorUtc.isValid();
+    const int quality = m ? m->lockQuality() : 0;
+
+    if (m_lockLed) {
+        QString tip = QStringLiteral("Lock: %1 — quality %2/100")
+                          .arg(m ? m->stateName() : QStringLiteral("NoSignal"))
+                          .arg(quality);
+        if (!haveDecode)
+            tip += QStringLiteral(" · no decode yet");
+        m_lockLed->setToolTip(tip);
+    }
+    if (m_utcValue) {
+        QString tip;
+        if (running && haveDecode) {
+            const qint64 ageS =
+                (QDateTime::currentMSecsSinceEpoch() - m_anchorHostMs) / 1000;
+            tip = QStringLiteral(
+                      "Decoded broadcast time (UTC). Ticks between decodes; "
+                      "last decode %1, %2s ago")
+                      .arg(m_anchorUtc.toUTC().toString(QStringLiteral("HH:mm:ss")))
+                      .arg(ageS < 0 ? 0 : ageS);
+        } else {
+            tip = QStringLiteral(
+                "Decoded broadcast time (UTC). Ticks between decodes; "
+                "no decode yet");
+        }
+        m_utcValue->setToolTip(tip);
+    }
+}
+
+void AetherClockApplet::applyStaticTooltips()
+{
+    if (m_stationTag)
+        m_stationTag->setToolTip(QStringLiteral(
+            "Detected station (WWV/WWVH auto-tagged by tick band; -- until "
+            "confident)"));
+    if (m_trustLine)
+        m_trustLine->setToolTip(QStringLiteral(
+            "Decode quality 0-100 and time since the last decoded frame"));
+    if (m_offsetValue)
+        m_offsetValue->setToolTip(QStringLiteral(
+            "decoded − host at the second edge. Positive = this computer's "
+            "clock is behind the broadcast"));
+    if (m_scope)
+        m_scope->setToolTip(QStringLiteral(
+            "Received envelope vs expected symbol template; ticks mark detected "
+            "second edges; bar lane = per-second confidence; glyph lane = "
+            "decoded symbols (M = marker)"));
+    if (m_presetCombo)
+        m_presetCombo->setToolTip(QStringLiteral(
+            "Station + carrier preset the Tune button applies to the selected "
+            "slice"));
+    if (m_tuneButton)
+        m_tuneButton->setToolTip(QStringLiteral(
+            "Tune the selected slice to the chosen preset — works while "
+            "stopped"));
+    if (m_startStopButton)
+        m_startStopButton->setToolTip(QStringLiteral(
+            "Start or stop decoding on the selected slice"));
+    if (m_drawerToggle)
+        m_drawerToggle->setToolTip(QStringLiteral(
+            "Show or hide the station / tune / start settings"));
+    if (m_daxCombo)
+        m_daxCombo->setToolTip(QStringLiteral(
+            "Assign the selected slice's DAX channel (0 = Off) — the audio "
+            "path"));
 }
 
 } // namespace AetherSDR
