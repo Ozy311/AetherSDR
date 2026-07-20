@@ -292,17 +292,6 @@ void AetherClockApplet::buildUi()
             "QLabel { color: {{color.text.secondary}}; font-size: 10px; }");
         row->addWidget(m_trustLine);
 
-        // Bound-slice indicator ("▸<letter>") — empty unless the engine is
-        // running; secondary-text themed like the station tag.
-        m_boundSliceTag = new QLabel(this);
-        m_boundSliceTag->setToolTip(
-            QStringLiteral("Slice the running decoder is bound to"));
-        ThemeManager::instance().applyStyleSheet(
-            m_boundSliceTag,
-            "QLabel { color: {{color.text.secondary}}; font-size: 11px;"
-            " font-weight: bold; }");
-        row->addWidget(m_boundSliceTag);
-
         row->addStretch(1);
 
         m_utcValue = makeInsetReadout(this, 60);
@@ -340,11 +329,41 @@ void AetherClockApplet::buildUi()
     m_tuneWarning->setVisible(false);
     layout->addWidget(m_tuneWarning);
 
-    // Half-width button-grid row: the settings drawer toggle (collapsed by
-    // default) beside the DAX chooser for the selected slice, each ~50%.
+    // Control row — Enable · Settings · bound-slice tag · DAX chooser. The
+    // primary action lives here, not in the drawer: with the shipped WWV
+    // default preset most users never need the settings at all. "Enable" is
+    // the applet-family toggle convention (DaxApplet precedent): constant
+    // label, checkable, green active state.
     {
         auto* controlRow = new QHBoxLayout;
         controlRow->setSpacing(3);
+
+        m_startStopButton = new QPushButton(QStringLiteral("Enable"), this);
+        m_startStopButton->setCheckable(true);
+        m_startStopButton->setStyleSheet(kButtonBase() + kStartActive + kDisabledBtn);
+        m_startStopButton->setFixedHeight(20);
+        m_startStopButton->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        connect(m_startStopButton, &QPushButton::clicked, this, [this]() {
+            // A checkable button toggles before this fires, so isChecked() is
+            // the user's intended next state; updateStartStopUi reconciles it
+            // with the engine's actual running state afterward.
+            const bool wantRun = m_startStopButton && m_startStopButton->isChecked();
+            if (!m_engine.isNull()) {
+                if (wantRun) {
+                    if (!m_slice.isNull()) {
+                        m_engine->start(m_slice.data(),
+                                        currentChoice(m_presetCombo).station);
+                        bindAndWatchBoundSlice();
+                    }
+                } else {
+                    m_engine->stop();
+                }
+            }
+            updateStartStopUi();
+            refreshDaxUi();
+            refreshTuneWarning();
+        });
+        controlRow->addWidget(m_startStopButton, 1);
 
         m_drawerToggle = new QPushButton(this);
         m_drawerToggle->setStyleSheet(kButtonBase());
@@ -354,6 +373,17 @@ void AetherClockApplet::buildUi()
             setSettingsExpanded(m_settingsDrawer && m_settingsDrawer->isHidden());
         });
         controlRow->addWidget(m_drawerToggle, 1);
+
+        // Bound-slice indicator ("▸<letter>") — empty unless the engine is
+        // running; secondary-text themed like the station tag.
+        m_boundSliceTag = new QLabel(this);
+        m_boundSliceTag->setToolTip(
+            QStringLiteral("Slice the running decoder is bound to"));
+        ThemeManager::instance().applyStyleSheet(
+            m_boundSliceTag,
+            "QLabel { color: {{color.text.secondary}}; font-size: 11px;"
+            " font-weight: bold; }");
+        controlRow->addWidget(m_boundSliceTag);
 
         // DAX chooser acts on the strip's SELECTED slice — a client-scoped DAX
         // assignment. index == channel (0 = Off, 1-4). Disabled with no slice.
@@ -446,33 +476,6 @@ void AetherClockApplet::buildSettingsDrawer()
         m_presetNote,
         "QLabel { color: {{color.text.secondary}}; font-size: 10px; }");
     drawer->addWidget(m_presetNote);
-
-    // Start / Stop.
-    m_startStopButton = new QPushButton(QStringLiteral("Start"), m_settingsDrawer);
-    m_startStopButton->setCheckable(true);
-    m_startStopButton->setStyleSheet(kButtonBase() + kStartActive + kDisabledBtn);
-    m_startStopButton->setFixedHeight(22);
-    m_startStopButton->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    connect(m_startStopButton, &QPushButton::clicked, this, [this]() {
-        // A checkable button toggles before this fires, so isChecked() is the
-        // user's intended next state; updateStartStopUi reconciles it with the
-        // engine's actual running state afterward.
-        const bool wantRun = m_startStopButton && m_startStopButton->isChecked();
-        if (!m_engine.isNull()) {
-            if (wantRun) {
-                if (!m_slice.isNull()) {
-                    m_engine->start(m_slice.data(), currentChoice(m_presetCombo).station);
-                    bindAndWatchBoundSlice();
-                }
-            } else {
-                m_engine->stop();
-            }
-        }
-        updateStartStopUi();
-        refreshDaxUi();
-        refreshTuneWarning();
-    });
-    drawer->addWidget(m_startStopButton);
 
     // Populate carriers from the engine preset list, then restore the saved
     // selection under a signal block so restore never persists or applies.
@@ -678,9 +681,9 @@ void AetherClockApplet::updateStartStopUi()
 
     if (m_startStopButton) {
         QSignalBlocker block(m_startStopButton);
+        // Constant "Enable" label (applet-family toggle convention) — the
+        // checked/green state carries the running signal, never the text.
         m_startStopButton->setChecked(running);
-        m_startStopButton->setText(running ? QStringLiteral("Stop")
-                                           : QStringLiteral("Start"));
         // Always able to stop while running; only startable when attached to
         // both an engine and a slice.
         m_startStopButton->setEnabled(running || (haveEngine && haveSlice));
@@ -889,10 +892,10 @@ void AetherClockApplet::applyStaticTooltips()
             "stopped"));
     if (m_startStopButton)
         m_startStopButton->setToolTip(QStringLiteral(
-            "Start or stop decoding on the selected slice"));
+            "Enable or disable decoding on the selected slice"));
     if (m_drawerToggle)
         m_drawerToggle->setToolTip(QStringLiteral(
-            "Show or hide the station / tune / start settings"));
+            "Show or hide the station / tune settings"));
     if (m_daxCombo)
         m_daxCombo->setToolTip(QStringLiteral(
             "Assign the selected slice's DAX channel (0 = Off) — the audio "
