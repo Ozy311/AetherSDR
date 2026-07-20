@@ -17,8 +17,11 @@
 // consecutive markers (s59 -> s0) mark the minute boundary. BCD field weights
 // are MSB-first (opposite of WWV). Amplitude-only by design: the post-2012
 // BPSK phase layer (a 180 deg flip +100 ms after each second) leaves the AM
-// envelope unchanged, and a magnitude detector is invariant to a phase flip
-// (|-z| == |z|), so this decoder ignores it entirely.
+// envelope unchanged in steady state (|-z| == |z|), and the flip TRANSIENT --
+// the discontinuity briefly rings the I/Q low-pass into a ~1-sample magnitude
+// notch -- is rejected by the ~10 ms boxcar decimation averaging it flat plus
+// the sustained-low edge gate (several consecutive low samples required), so
+// this decoder ignores the BPSK layer entirely; no edge is phase-derived.
 //
 // Chain: one-shot tone search 800-1200 Hz -> complex mix to baseband ->
 // biquad LPF on I/Q -> magnitude -> boxcar-decimate to a 100 Hz envelope ->
