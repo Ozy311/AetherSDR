@@ -135,33 +135,55 @@ public:
     // Lock = at least minFramesForLock frames in the window, AND at least
     // (minFramesForLock - 1) adjacent frame pairs whose per-frame minutes
     // decode increments by exactly +1 (mod 60), AND voted static fields
-    // self-consistent. Increment support is COUNTED across the window, not
-    // required of every pair — live per-frame decodes are routinely imperfect
-    // and one corrupted frame must not permanently prevent or drop the lock
-    // (the reference scores increments: marker_score + 4 * increment_count).
+    // self-consistent (each static field carries a strictly positive winning
+    // margin in the same normalized space votedField/lockConfidence use — an
+    // all-Unknown window yields zero margin everywhere and must not lock).
+    // Increment support is COUNTED across the window, not required of every pair
+    // — live per-frame decodes are routinely imperfect and one corrupted frame
+    // must not permanently prevent or drop the lock (the reference scores
+    // increments: marker_score + 4 * increment_count).
     bool locked() const;
 
     // Voted value of a timestamp field (minute/hour/doy/year), reported "as of
-    // the newest frame". All four fields come from a single VALUE-level vote:
-    // each frame's complete timestamp is decoded from that frame's own bits,
-    // extrapolated forward by its age in minutes (calendar arithmetic), and the
-    // whole tuple is majority-voted with per-frame weight
-    // max(meanConfidence, 0.01) * agingFactor^age (age 0 = newest frame). Voting
-    // the tuple — not each field's bits independently across frames — is what
-    // makes an hour/day rollover safe: a stale hour cannot outvote the current
-    // one for a window length, and per-bit mixing can never synthesize a field
-    // value that no frame in the window actually carried. Per-bit voting remains
-    // only WITHIN a single frame's decode (never across frames for these
-    // fields). Returns -1 if no frame decodes to a range-valid timestamp.
+    // the newest frame". The contract is NORMALIZE, THEN PER-BIT:
+    //   1. Each frame's whole timestamp is decoded from its own bits and
+    //      extrapolated forward by its age in minutes (calendar arithmetic), so
+    //      every in-window frame is expressed at the SAME (newest) epoch.
+    //   2. Bits are then voted per-field across that normalized space. For a
+    //      field the extrapolation left unchanged (the common case away from a
+    //      boundary) each frame votes its ORIGINAL symbols with their ORIGINAL
+    //      per-second confidences — a faded bit carries a low matched-filter
+    //      margin and loses, which is what corrects the single-bit fades that
+    //      corrupt noisy corpora frame-by-frame. For a field the extrapolation
+    //      moved across a carry (minutes almost always; hour/doy/year only when
+    //      the window straddles a boundary) the frame re-encodes the normalized
+    //      value and weights every bit by its field-MIN original confidence — a
+    //      BCD value is only as reliable as its weakest bit.
+    //   3. Per-bit weights are max(confidence, 0.01) * agingFactor^age.
+    // This is rollover-safe BECAUSE the extrapolation removes the epoch skew: a
+    // stale hour can never outvote the current one, since after normalization
+    // every frame is voting on the current hour. Cross-frame bit blending is
+    // confined to normalized space, where the frames are SUPPOSED to agree, so
+    // blending there is correction, not synthesis across epochs. Should the
+    // per-bit blend ever produce an out-of-range BCD value, the vote falls back
+    // to the single highest-aged-weight frame's extrapolated tuple (a guarded
+    // fallback, never the primary path). Returns -1 if no frame decodes to a
+    // range-valid timestamp.
     int votedField(FieldIndex field) const;
 
     // Raw per-frame minutes decode of the newest frame (no voting).
     int lastFrameMinute() const;
 
     // Aggregate lock quality 0..1: mean winning-vote margin across the voted
-    // bits of the static fields, saturating with frame count. Monotonically
-    // non-decreasing for repeated clean frames; ~0 with < minFramesForLock
-    // frames.
+    // bits of the timestamp, measured in the SAME normalized (age-extrapolated)
+    // space as votedField, saturating with frame count. Because the margin is
+    // taken after normalization, quality now reflects the consensus of the voted
+    // space itself: a clean rollover no longer dips (the decode is genuinely
+    // unambiguous once every frame is expressed at the newest epoch), while a
+    // genuinely corrupt window — frames disagreeing at comparable confidence —
+    // does. Value and quality can no longer decouple: a field that had to be
+    // rescued against real cross-frame disagreement carries that dip into the
+    // reported quality. ~0 with < minFramesForLock frames.
     float lockConfidence() const;
 
 private:
@@ -177,10 +199,33 @@ private:
     int decodeField(const Frame& f, FieldIndex field) const;
     int decodeMinutes(const Frame& f) const;  // == decodeField(f, FieldMinutes)
 
-    // Value-level, age-extrapolated majority vote of the whole timestamp across
-    // the window (the source of truth for votedField's four fields). Frames
-    // whose decoded fields fall outside valid broadcast ranges are excluded.
-    // Returns all-(-1) TimeFields when no candidate qualifies.
+    // One in-window frame reduced to its NORMALIZED (age-extrapolated) per-field
+    // bit set — the single representation votedTimestamp / lockConfidence /
+    // locked all consume, so their view of the window is guaranteed identical.
+    struct NormalizedFrame {
+        int age = 0;                 // 0 = newest frame
+        double meanConfidence = 0.0; // frame mean over the four field maps
+        TimeFields ext;              // this frame's timestamp at the newest epoch
+        // Per bit of a field map: the normalized symbol and the confidence that
+        // weights it. symbol == Unknown means "no vote" (an original Marker /
+        // Unknown second that survived into the unchanged-field path).
+        struct Bit {
+            ClockSymbol symbol = ClockSymbol::Unknown;
+            float confidence = 0.0f;
+        };
+        std::array<std::vector<Bit>, FieldCount> bits; // parallel to Config::fields
+    };
+
+    // Reduce every range-valid in-window frame to its NormalizedFrame (newest ->
+    // age 0). Frames whose raw decode falls outside valid broadcast ranges are
+    // dropped, in the same spirit as excluding Marker/Unknown symbols from a bit
+    // vote. Empty when no frame qualifies.
+    std::vector<NormalizedFrame> buildNormalizedFrames() const;
+
+    // Normalize-then-per-bit vote of the whole timestamp across the window (the
+    // source of truth for votedField's four fields). A per-bit blend that lands
+    // out of range falls back to the highest-aged-weight frame's extrapolated
+    // tuple. Returns all-(-1) TimeFields when no candidate qualifies.
     TimeFields votedTimestamp() const;
 };
 

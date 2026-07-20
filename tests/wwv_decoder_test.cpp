@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <random>
 #include <string>
 #include <utility>
@@ -640,6 +641,146 @@ void sectionVoterRollover() {
     }
 }
 
+// One voter frame from a timestamp, then per-second corruptions injected at
+// chosen confidences: each Corrupt overrides one second's symbol and its
+// matched-filter margin. This is how the noisy-corpus vector shapes single-bit
+// fades (low margin) and confident misreads (high margin) the way the live
+// receiver saw them.
+struct Corrupt { int second; ClockSymbol symbol; float confidence; };
+std::pair<std::array<ClockSymbol, 60>, std::array<float, 60>>
+wwvNoisyFrame(int mn, int hr, int doy, int yr, float baseConf,
+              const std::vector<Corrupt>& corruptions) {
+    std::array<ClockSymbol, 60> syms = wwvVoterFrame(mn, hr, doy, yr);
+    std::array<float, 60> conf;
+    conf.fill(baseConf);
+    for (const Corrupt& c : corruptions) {
+        syms[c.second] = c.symbol;
+        conf[c.second] = c.confidence;
+    }
+    return {syms, conf};
+}
+
+// [wwv.voter.noisycorpus] Regression for the WS-3 exact-tuple degeneracy: an
+// 8-frame window inside one hour (06:18..06:25, doy 200, yr 26) where EVERY
+// frame is corrupt in a different field, so no whole-tuple key ever repeats.
+// The old whole-tuple vote then degenerates to the newest frame's corrupt tuple
+// (it carries yr=66, so the voter reports the year 25 off) at a high, honest-
+// looking per-bit static quality — the exact "confident garbage" the live
+// receiver locked onto. Normalize-then-per-bit recovers the true timestamp from
+// the per-field majorities: single-bit fades lose on their low margin, confident
+// misreads lose to the aged weight of the many correct frames, and the reported
+// quality now dips because the voted space itself is contested.
+void sectionVoterNoisyCorpus() {
+    constexpr float C  = 0.35f;   // clean-bit margin (the live corpus ran ~0.35..0.41)
+    constexpr float LO = 0.05f;   // faded minute bit — a low-margin miss
+    constexpr float HI = 0.90f;   // a confident misread — high margin, wrong bit
+
+    TimeFrameVoter v(wwvVoterConfig());
+
+    // Frames added oldest -> newest (newest kept at the back of the window).
+    // The three oldest carry a faded minutes tens bit at LOW margin; the five
+    // newest are minutes-clean but each carries one confident wrong static bit,
+    // so NO frame decodes a fully-correct tuple.
+    struct NF { int mn, hr, doy, yr; std::vector<Corrupt> corr; };
+    const NF frames[] = {
+        // min18: drop the minutes 10-bit (sec 15) -> raw minute 08.
+        {18, 6, 200, 26, {{15, ClockSymbol::Zero, LO}}},
+        // min19: drop the minutes 10-bit -> raw minute 09.
+        {19, 6, 200, 26, {{15, ClockSymbol::Zero, LO}}},
+        // min20: drop the minutes 20-bit (sec 16) -> raw minute 00.
+        {20, 6, 200, 26, {{16, ClockSymbol::Zero, LO}}},
+        // min21: set the doy 2-bit (sec 31) -> raw doy 202.
+        {21, 6, 200, 26, {{31, ClockSymbol::One, HI}}},
+        // min22: set the doy 1-bit (sec 30) -> raw doy 201.
+        {22, 6, 200, 26, {{30, ClockSymbol::One, HI}}},
+        // min23: drop the year 20-bit (sec 52) -> raw year 06.
+        {23, 6, 200, 26, {{52, ClockSymbol::Zero, HI}}},
+        // min24: drop the hour 4-bit (sec 22) -> raw hour 02.
+        {24, 6, 200, 26, {{22, ClockSymbol::Zero, HI}}},
+        // min25 (newest): set the year 40-bit (sec 53) -> raw year 66. An
+        // as-newest / exact-tuple voter reports THIS frame's year (66).
+        {25, 6, 200, 26, {{53, ClockSymbol::One, HI}}},
+    };
+    for (const NF& f : frames) {
+        const auto [syms, conf] = wwvNoisyFrame(f.mn, f.hr, f.doy, f.yr, C, f.corr);
+        v.addFrame(syms, conf);
+    }
+
+    // Normalize-then-per-bit recovers the TRUE timestamp as of the newest frame,
+    // even though the newest frame's own decode carries yr=66 and no tuple repeats.
+    CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == 25);
+    CHECK(v.votedField(TimeFrameVoter::FieldHours)   == 6);
+    CHECK(v.votedField(TimeFrameVoter::FieldDoy)     == 200);
+    CHECK(v.votedField(TimeFrameVoter::FieldYear)    == 26);
+
+    // The newest raw frame really does decode yr=66, so the reported year (26)
+    // could ONLY come from the cross-frame normalized vote, not from any single
+    // frame — this is what the WS-3 exact-tuple voter got wrong.
+    CHECK(v.lastFrameMinute() == 25);
+
+    // Quality is coupled to the voted space now: with the year/hour/doy votes
+    // rescued against confident wrong bits, lockConfidence must NOT sit up in the
+    // clean-lock band. It is a genuine lock (well above zero) but visibly dipped
+    // below a clean window's quality — and below the ~0.926 the old voter emitted
+    // on this same window while reporting the WRONG time. Measured ~0.898 (the
+    // faded minute frames vote their field-MIN margin ~0.05, so the residual dip
+    // is carried by the confident static misreads); the absolute bound is loose,
+    // the strict dip vs the clean window below is the load-bearing check.
+    const float q = v.lockConfidence();
+    CHECK(q > 0.0f && q <= 1.0f);
+    CHECK(q < 0.93f);
+
+    // A clean 8-frame window over the same minutes votes the same timestamp at
+    // strictly higher quality — proving the dip tracks the contention, not luck.
+    TimeFrameVoter clean(wwvVoterConfig());
+    std::array<float, 60> cleanConf;
+    cleanConf.fill(C);
+    for (int mn = 18; mn <= 25; ++mn)
+        clean.addFrame(wwvVoterFrame(mn, 6, 200, 26), cleanConf);
+    CHECK(clean.votedField(TimeFrameVoter::FieldMinutes) == 25);
+    CHECK(clean.votedField(TimeFrameVoter::FieldYear)    == 26);
+    CHECK(clean.lockConfidence() > q);
+}
+
+// [wwv.voter.minutefade] Guards the re-encoded-field weighting: minutes ALWAYS
+// take the re-encode path (extrapolation always moves them), so the per-bit fade
+// rescue reaches minutes only through that path's weight. A window of 5 newest
+// frames whose minutes-20 bit faded (LOW margin) over 3 older clean frames votes
+// the WRONG minute (05, the live "min=03/06" symptom) if the re-encoded value is
+// weighted by its field-MEAN confidence — the one faded bit is diluted ~1/7 and
+// the five heavy-but-wrong frames tip the tally. Weighting by the field-MIN
+// confidence makes each faded frame vote its minutes at ~0.05, so the three
+// clean frames carry the 20 bit and the true minute (25) survives.
+void sectionVoterMinuteFadeWeighting() {
+    constexpr float C  = 0.40f;   // clean-bit margin
+    constexpr float LO = 0.05f;   // faded minutes-20 bit — a low-margin miss
+
+    TimeFrameVoter v(wwvVoterConfig());
+    // Oldest three frames clean (min 18/19/20); newest five fade the minutes 20
+    // bit (sec 16) at LOW margin — each still decodes the other minute bits, so
+    // only the tens is wrong, and all statics stay clean.
+    struct NF { int mn; std::vector<Corrupt> corr; };
+    const NF frames[] = {
+        {18, {}}, {19, {}}, {20, {}},
+        {21, {{16, ClockSymbol::Zero, LO}}}, // 21 has the 20 bit -> raw 01
+        {22, {{16, ClockSymbol::Zero, LO}}}, // -> raw 02
+        {23, {{16, ClockSymbol::Zero, LO}}}, // -> raw 03
+        {24, {{16, ClockSymbol::Zero, LO}}}, // -> raw 04
+        {25, {{16, ClockSymbol::Zero, LO}}}, // newest -> raw 05
+    };
+    for (const NF& f : frames) {
+        const auto [syms, conf] = wwvNoisyFrame(f.mn, 6, 200, 26, C, f.corr);
+        v.addFrame(syms, conf);
+    }
+
+    // Field-MIN weighting: the true minute survives the five heavier faded frames.
+    // (Field-MEAN weighting would vote 05 here — the regression this pins.)
+    CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == 25);
+    CHECK(v.votedField(TimeFrameVoter::FieldHours)   == 6);
+    CHECK(v.votedField(TimeFrameVoter::FieldDoy)     == 200);
+    CHECK(v.votedField(TimeFrameVoter::FieldYear)    == 26);
+}
+
 } // namespace
 
 int main() {
@@ -658,6 +799,8 @@ int main() {
     sectionDecadeDegeneracy(clean);
     sectionConfidenceFloor(clean);
     sectionVoterRollover();
+    sectionVoterNoisyCorpus();
+    sectionVoterMinuteFadeWeighting();
 
     // Print encoded truth for the python cross-check gate.
     std::printf("golden truth: min=%d hr=%d doy=%d yr=%d frames=%d\n",

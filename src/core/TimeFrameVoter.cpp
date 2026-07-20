@@ -2,20 +2,23 @@
 
 #include <algorithm>
 #include <cmath>
-#include <unordered_map>
 #include <utility>
+#include <vector>
 
-// Cross-frame confidence-weighted bit voting per the AetherClock reference
-// decoder: a bit's vote is the sum of its per-frame matched-filter margins
-// (floored at 0.01), with older frames discounted by agingFactor^age. Markers
-// and Unknown symbols never vote. Lock gates on consecutive +1 minute
-// increments plus self-consistent static fields.
+// Cross-frame confidence-weighted voting per the AetherClock reference decoder:
+// a bit's vote is the sum of its per-frame matched-filter margins (floored at
+// 0.01), with older frames discounted by agingFactor^age. Markers and Unknown
+// symbols never vote. The timestamp vote is NORMALIZE-then-per-bit: every frame
+// is first extrapolated to the newest epoch (removing the epoch skew that makes
+// a stale hour dangerous), then bits are voted in that normalized space, where
+// frames are supposed to agree. Lock gates on consecutive +1 minute increments
+// plus self-consistent static fields.
 
 namespace AetherSDR {
 
 namespace {
 
-// Per-frame vote weight for one static bit: max(confidence, 0.01) aged by
+// Per-frame vote weight for one bit: max(confidence, 0.01) aged by
 // agingFactor^age (age 0 = newest frame).
 inline float agedWeight(float confidence, float agingFactor, int age) {
     const float base = std::max(confidence, 0.01f);
@@ -92,71 +95,71 @@ int TimeFrameVoter::decodeMinutes(const Frame& f) const {
     return decodeField(f, FieldMinutes);
 }
 
-bool TimeFrameVoter::locked() const {
+std::vector<TimeFrameVoter::NormalizedFrame>
+TimeFrameVoter::buildNormalizedFrames() const {
     const int n = static_cast<int>(m_frames.size());
-    if (n < m_cfg.minFramesForLock) {
-        return false;
-    }
+    std::vector<NormalizedFrame> out;
+    out.reserve(static_cast<std::size_t>(n));
 
-    // Count adjacent frame pairs whose decoded minutes increment by exactly +1
-    // (mod 60; 59 -> 0 valid). Live per-frame decodes are routinely imperfect,
-    // so increment support is COUNTED across the window rather than required of
-    // every pair (cf. the reference's marker_score + 4 * increment_count) — one
-    // corrupted frame must not permanently prevent or drop the lock.
-    int increments = 0;
-    for (int i = 1; i < n; ++i) {
-        const int prev = decodeMinutes(m_frames[i - 1]);
-        const int cur = decodeMinutes(m_frames[i]);
-        if (((prev + 1) % 60) == cur) {
-            ++increments;
-        }
-    }
-    if (increments < m_cfg.minFramesForLock - 1) {
-        return false;
-    }
-
-    // Confidence-weighted vote weights for one mapped second across the window.
-    auto bitWeights = [&](int second) -> std::pair<float, float> {
-        float w0 = 0.0f, w1 = 0.0f;
-        if (second < 0 || second >= 60) {
-            return {w0, w1};
-        }
-        for (int i = 0; i < n; ++i) {
-            const int age = (n - 1) - i; // newest -> age 0
-            const Frame& f = m_frames[i];
-            const ClockSymbol s = f.symbols[second];
-            if (s == ClockSymbol::One || s == ClockSymbol::Zero) {
-                const float w =
-                    agedWeight(f.confidence[second], m_cfg.agingFactor, age);
-                (s == ClockSymbol::One ? w1 : w0) += w;
+    // Greedy descending-weight BCD encode of `value` over a field map: the maps
+    // carry canonical BCD weights, so subtracting weights largest-first
+    // reconstructs the exact bit pattern (One/Zero, parallel to the map).
+    auto encodeField = [](const ClockFieldMap& map, int value) {
+        std::vector<ClockSymbol> bits(map.size(), ClockSymbol::Zero);
+        std::vector<std::size_t> order(map.size());
+        for (std::size_t k = 0; k < map.size(); ++k) order[k] = k;
+        std::sort(order.begin(), order.end(),
+                  [&](std::size_t a, std::size_t b) {
+                      return map[a].weight > map[b].weight;
+                  });
+        int rem = value;
+        for (std::size_t k : order) {
+            if (map[k].weight > 0 && map[k].weight <= rem) {
+                bits[k] = ClockSymbol::One;
+                rem -= map[k].weight;
             }
         }
-        return {w0, w1};
+        return bits;
     };
 
-    // Static-field self-consistency: each static field must carry at least one
-    // confident bit vote (a strictly positive winning margin). An all-Unknown
-    // window yields zero margin everywhere and must not lock.
-    for (std::size_t fi = FieldHours; fi <= FieldYear; ++fi) {
-        double margin = 0.0;
-        for (const auto& bw : m_cfg.fields[fi]) {
-            const auto [w0, w1] = bitWeights(bw.second);
-            margin += std::max(w0, w1) - std::min(w0, w1);
+    // Weakest of the original per-second confidences over one field map, floored
+    // at 0.01 (a re-encoded field weights every bit by this). A BCD field VALUE is
+    // exactly as reliable as its least-reliable bit — one flipped bit changes the
+    // whole value — so a re-encoded value's vote must carry the weakest bit's
+    // margin, never the average, which would dilute a single faded bit ~1/N.
+    auto fieldMinConf = [&](const Frame& f, FieldIndex fld) -> float {
+        float lo = -1.0f;
+        for (const auto& bw : m_cfg.fields[fld]) {
+            if (bw.second >= 0 && bw.second < 60) {
+                lo = (lo < 0.0f) ? f.confidence[bw.second]
+                                 : std::min(lo, f.confidence[bw.second]);
+            }
         }
-        if (!(margin > 0.0)) {
-            return false;
-        }
-    }
+        return std::max(lo < 0.0f ? 0.0f : lo, 0.01f);
+    };
 
-    return true;
-}
+    for (int i = 0; i < n; ++i) {
+        const int age = (n - 1) - i;  // newest -> age 0
+        const Frame& f = m_frames[i];
 
-TimeFields TimeFrameVoter::votedTimestamp() const {
-    const int n = static_cast<int>(m_frames.size());
+        TimeFields raw;
+        raw.minute = decodeField(f, FieldMinutes);
+        raw.hour   = decodeField(f, FieldHours);
+        raw.doy    = decodeField(f, FieldDoy);
+        raw.year2  = decodeField(f, FieldYear);
 
-    // Field-map bit indices whose per-frame confidences represent a frame's
-    // timestamp-decode quality (union of the four voted field maps).
-    auto meanTimestampConfidence = [&](const Frame& f) -> double {
+        // Whole-frame range gate — a frame decoding outside valid broadcast
+        // ranges is excluded, the same spirit as excluding Marker/Unknown from a
+        // bit vote. (Guards the calendar arithmetic below, too.)
+        if (raw.minute < 0 || raw.minute > 59) continue;
+        if (raw.hour   < 0 || raw.hour   > 23) continue;
+        if (raw.doy    < 1 || raw.doy    > 366) continue;
+        if (raw.year2  < 0 || raw.year2  > 99) continue;
+
+        NormalizedFrame nf;
+        nf.age = age;
+        nf.ext = advanceMinutes(raw, age);
+
         double sum = 0.0;
         int count = 0;
         for (const FieldIndex fld : {FieldMinutes, FieldHours, FieldDoy, FieldYear}) {
@@ -167,60 +170,108 @@ TimeFields TimeFrameVoter::votedTimestamp() const {
                 }
             }
         }
-        return count ? sum / count : 0.0;
-    };
+        nf.meanConfidence = count ? sum / count : 0.0;
 
-    // Encode a range-valid timestamp tuple to a collision-free key so equal
-    // extrapolated timestamps accumulate their weight together.
-    auto encode = [](const TimeFields& t) -> int64_t {
-        return (static_cast<int64_t>(t.year2) * 100000000) +
-               (static_cast<int64_t>(t.doy) * 100000) +
-               (static_cast<int64_t>(t.hour) * 1000) +
-               static_cast<int64_t>(t.minute);
-    };
+        const int rawByField[FieldCount] = {raw.minute, raw.hour, raw.doy, raw.year2};
+        const int extByField[FieldCount] = {nf.ext.minute, nf.ext.hour,
+                                            nf.ext.doy, nf.ext.year2};
 
-    std::unordered_map<int64_t, double> weightByTuple;
-    std::unordered_map<int64_t, TimeFields> tupleByKey;
+        for (std::size_t fld = 0; fld < FieldCount; ++fld) {
+            const ClockFieldMap& map = m_cfg.fields[fld];
+            std::vector<NormalizedFrame::Bit>& dst = nf.bits[fld];
+            dst.resize(map.size());
 
-    for (int i = 0; i < n; ++i) {
-        const int age = (n - 1) - i;  // newest -> age 0
-        const Frame& f = m_frames[i];
+            if (extByField[fld] == rawByField[fld]) {
+                // Extrapolation left this field unchanged (the common case away
+                // from a boundary): vote its ORIGINAL symbols with their ORIGINAL
+                // per-second confidences — a faded bit carries a low matched-
+                // filter margin and loses the cross-frame vote. This is the
+                // reference model that rescues single-bit fades in noisy corpora.
+                for (std::size_t k = 0; k < map.size(); ++k) {
+                    const int sec = map[k].second;
+                    const bool inRange = sec >= 0 && sec < 60;
+                    dst[k].symbol = inRange ? f.symbols[sec] : ClockSymbol::Unknown;
+                    dst[k].confidence = inRange ? f.confidence[sec] : 0.0f;
+                }
+            } else {
+                // Extrapolation moved this field across a carry: re-encode the
+                // NORMALIZED value and weight every bit by the field-MIN original
+                // confidence, so a value whose weakest bit faded votes at that
+                // faded margin. Blending is thus confined to normalized space,
+                // where the frames are supposed to agree.
+                const std::vector<ClockSymbol> bits = encodeField(map, extByField[fld]);
+                const float w = fieldMinConf(f, static_cast<FieldIndex>(fld));
+                for (std::size_t k = 0; k < map.size(); ++k) {
+                    dst[k].symbol = bits[k];
+                    dst[k].confidence = w;
+                }
+            }
+        }
+        out.push_back(std::move(nf));
+    }
+    return out;
+}
 
-        TimeFields tf;
-        tf.minute = decodeField(f, FieldMinutes);
-        tf.hour   = decodeField(f, FieldHours);
-        tf.doy    = decodeField(f, FieldDoy);
-        tf.year2  = decodeField(f, FieldYear);
+// Per-field, per-bit tally across the normalized window: heavier of One/Zero
+// wins. `frames` is the shared normalized view.
+namespace {
+struct BitTally { float w0 = 0.0f, w1 = 0.0f; };
+} // namespace
 
-        // Exclude frames whose fields decode outside valid broadcast ranges —
-        // the same spirit as excluding Marker/Unknown symbols from a bit vote.
-        if (tf.minute < 0 || tf.minute > 59) continue;
-        if (tf.hour   < 0 || tf.hour   > 23) continue;
-        if (tf.doy    < 1 || tf.doy    > 366) continue;
-        if (tf.year2  < 0 || tf.year2  > 99) continue;
-
-        // Extrapolate this frame's timestamp forward to the newest frame, so all
-        // in-window frames vote on the SAME (newest) timestamp.
-        const TimeFields ext = advanceMinutes(tf, age);
-        const double w =
-            agedWeight(static_cast<float>(meanTimestampConfidence(f)),
-                       m_cfg.agingFactor, age);
-        const int64_t key = encode(ext);
-        weightByTuple[key] += w;
-        tupleByKey[key] = ext;
+TimeFields TimeFrameVoter::votedTimestamp() const {
+    const std::vector<NormalizedFrame> frames = buildNormalizedFrames();
+    if (frames.empty()) {
+        return TimeFields{};
     }
 
-    int64_t bestKey = 0;
-    double bestWeight = -1.0;
-    bool have = false;
-    for (const auto& [key, weight] : weightByTuple) {
-        if (weight > bestWeight) {
-            bestWeight = weight;
-            bestKey = key;
-            have = true;
+    int valueByField[FieldCount] = {0, 0, 0, 0};
+    for (std::size_t fld = 0; fld < FieldCount; ++fld) {
+        const ClockFieldMap& map = m_cfg.fields[fld];
+        for (std::size_t k = 0; k < map.size(); ++k) {
+            BitTally t;
+            for (const NormalizedFrame& nf : frames) {
+                const NormalizedFrame::Bit b = nf.bits[fld][k];
+                if (b.symbol == ClockSymbol::One || b.symbol == ClockSymbol::Zero) {
+                    const float w = agedWeight(b.confidence, m_cfg.agingFactor, nf.age);
+                    (b.symbol == ClockSymbol::One ? t.w1 : t.w0) += w;
+                }
+            }
+            if (t.w1 > t.w0) {
+                valueByField[fld] += map[k].weight;
+            }
         }
     }
-    return have ? tupleByKey[bestKey] : TimeFields{};
+
+    TimeFields voted;
+    voted.minute = valueByField[FieldMinutes];
+    voted.hour   = valueByField[FieldHours];
+    voted.doy    = valueByField[FieldDoy];
+    voted.year2  = valueByField[FieldYear];
+
+    // Final-range guard: per-bit blending can in principle synthesize an
+    // out-of-range BCD value (e.g. a minute summing 5+10+20+40). If it did, fall
+    // back to the single highest-aged-weight frame's extrapolated tuple rather
+    // than emit an impossible broadcast time.
+    const bool inRange =
+        voted.minute >= 0 && voted.minute <= 59 &&
+        voted.hour   >= 0 && voted.hour   <= 23 &&
+        voted.doy    >= 1 && voted.doy    <= 366 &&
+        voted.year2  >= 0 && voted.year2  <= 99;
+    if (inRange) {
+        return voted;
+    }
+
+    const NormalizedFrame* best = nullptr;
+    double bestWeight = -1.0;
+    for (const NormalizedFrame& nf : frames) {
+        const double w = agedWeight(static_cast<float>(nf.meanConfidence),
+                                    m_cfg.agingFactor, nf.age);
+        if (w > bestWeight) {
+            bestWeight = w;
+            best = &nf;
+        }
+    }
+    return best ? best->ext : TimeFields{};
 }
 
 int TimeFrameVoter::votedField(FieldIndex field) const {
@@ -244,16 +295,75 @@ int TimeFrameVoter::lastFrameMinute() const {
     return decodeMinutes(m_frames.back());
 }
 
-float TimeFrameVoter::lockConfidence() const {
-    // Deliberately retained as the per-bit winning-margin over the static-field
-    // bits of the window, NOT switched to the winning-tuple weight margin. It
-    // measures raw bit stability, which is the honest quantity here: during an
-    // hour/day rollover the window straddles two timestamps, the per-bit margins
-    // dip, and reporting that dip is correct — quality SHOULD soften through a
-    // transition even though the tuple vote (votedTimestamp) now resolves the
-    // reported time unambiguously.
+bool TimeFrameVoter::locked() const {
     const int n = static_cast<int>(m_frames.size());
     if (n < m_cfg.minFramesForLock) {
+        return false;
+    }
+
+    // Count adjacent frame pairs whose decoded minutes increment by exactly +1
+    // (mod 60; 59 -> 0 valid). Live per-frame decodes are routinely imperfect,
+    // so increment support is COUNTED across the window rather than required of
+    // every pair (cf. the reference's marker_score + 4 * increment_count) — one
+    // corrupted frame must not permanently prevent or drop the lock.
+    int increments = 0;
+    for (int i = 1; i < n; ++i) {
+        const int prev = decodeMinutes(m_frames[i - 1]);
+        const int cur = decodeMinutes(m_frames[i]);
+        if (((prev + 1) % 60) == cur) {
+            ++increments;
+        }
+    }
+    if (increments < m_cfg.minFramesForLock - 1) {
+        return false;
+    }
+
+    // Static-field self-consistency in the SAME normalized space the vote uses:
+    // each static field must carry at least one confident bit vote (a strictly
+    // positive winning margin). No qualifying frame (e.g. an all-Unknown window
+    // whose doy decodes out of range) yields zero margin everywhere — must not
+    // lock.
+    const std::vector<NormalizedFrame> frames = buildNormalizedFrames();
+    if (frames.empty()) {
+        return false;
+    }
+    for (std::size_t fi = FieldHours; fi <= FieldYear; ++fi) {
+        const ClockFieldMap& map = m_cfg.fields[fi];
+        double margin = 0.0;
+        for (std::size_t k = 0; k < map.size(); ++k) {
+            BitTally t;
+            for (const NormalizedFrame& nf : frames) {
+                const NormalizedFrame::Bit b = nf.bits[fi][k];
+                if (b.symbol == ClockSymbol::One || b.symbol == ClockSymbol::Zero) {
+                    const float w = agedWeight(b.confidence, m_cfg.agingFactor, nf.age);
+                    (b.symbol == ClockSymbol::One ? t.w1 : t.w0) += w;
+                }
+            }
+            margin += std::max(t.w0, t.w1) - std::min(t.w0, t.w1);
+        }
+        if (!(margin > 0.0)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+float TimeFrameVoter::lockConfidence() const {
+    // Mean normalized winning margin over the voted timestamp bits, in the SAME
+    // normalized (age-extrapolated) space as votedField. Measuring the margin
+    // after normalization is what couples quality to the reported value: a clean
+    // rollover reads as unambiguous (every frame agrees once expressed at the
+    // newest epoch, so no dip), while a window whose frames genuinely disagree
+    // at comparable confidence carries that disagreement into the quality. The
+    // mean-margin x frame-count-saturation shape is unchanged.
+    const int n = static_cast<int>(m_frames.size());
+    if (n < m_cfg.minFramesForLock) {
+        return 0.0f;
+    }
+
+    const std::vector<NormalizedFrame> frames = buildNormalizedFrames();
+    if (frames.empty()) {
         return 0.0f;
     }
 
@@ -261,26 +371,20 @@ float TimeFrameVoter::lockConfidence() const {
     double marginSum = 0.0;
     int bitCount = 0;
 
-    // Mean normalized winning margin over every static-field mapped bit.
-    for (std::size_t fi = FieldHours; fi <= FieldYear; ++fi) {
-        for (const auto& bw : m_cfg.fields[fi]) {
-            if (bw.second < 0 || bw.second >= 60) {
-                continue;
-            }
-            float w0 = 0.0f, w1 = 0.0f;
-            for (int i = 0; i < n; ++i) {
-                const int age = (n - 1) - i;
-                const Frame& f = m_frames[i];
-                const ClockSymbol s = f.symbols[bw.second];
-                if (s == ClockSymbol::One || s == ClockSymbol::Zero) {
-                    const float w = agedWeight(f.confidence[bw.second],
-                                               m_cfg.agingFactor, age);
-                    (s == ClockSymbol::One ? w1 : w0) += w;
+    for (std::size_t fld = 0; fld < FieldCount; ++fld) {
+        const ClockFieldMap& map = m_cfg.fields[fld];
+        for (std::size_t k = 0; k < map.size(); ++k) {
+            BitTally t;
+            for (const NormalizedFrame& nf : frames) {
+                const NormalizedFrame::Bit b = nf.bits[fld][k];
+                if (b.symbol == ClockSymbol::One || b.symbol == ClockSymbol::Zero) {
+                    const float w = agedWeight(b.confidence, m_cfg.agingFactor, nf.age);
+                    (b.symbol == ClockSymbol::One ? t.w1 : t.w0) += w;
                 }
             }
-            const float winning = std::max(w0, w1);
-            const float losing = std::min(w0, w1);
-            marginSum += (winning - losing) / (w0 + w1 + kEpsilon);
+            const float winning = std::max(t.w0, t.w1);
+            const float losing = std::min(t.w0, t.w1);
+            marginSum += (winning - losing) / (t.w0 + t.w1 + kEpsilon);
             ++bitCount;
         }
     }
