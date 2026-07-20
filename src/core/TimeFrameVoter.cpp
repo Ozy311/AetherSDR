@@ -400,9 +400,22 @@ TimeFrameVoter::Resolution TimeFrameVoter::computeResolution() const {
         constexpr double kEpsilon = 1e-6;
         const double valueMargin = (topW - runnerW) / (totalHeld + kEpsilon);
 
-        if (allCoherent) {
-            // Fade-rescue / clean path: every bit's confidence-winner is also its
-            // count majority, so composing them cannot synthesize a phantom value.
+        // Per-bit coherence is necessary but NOT sufficient to rule out a
+        // synthesized value: rotating multi-bit misreads at comparable
+        // confidence can win every bit from a DIFFERENT frame camp -- each bit
+        // coherent, yet the composed value held by no frame (refuter round 5,
+        // 2026-07-20: frames holding {9, 10, 3} compose hour 11). The composed
+        // value must itself be a held value; otherwise the field demotes to
+        // the held-value fallback below.
+        bool composeHeld = false;
+        for (const auto& hv : held) {
+            if (hv.first == composeValue) { composeHeld = true; break; }
+        }
+
+        if (allCoherent && composeHeld) {
+            // Fade-rescue / clean path: every bit's confidence-winner is also
+            // its count majority AND the composed value is one some frame
+            // actually carried -- composing cannot synthesize a phantom.
             valueByField[fld] = composeValue;
             qualityByField[fld] = minCoherentTrust;
         } else {

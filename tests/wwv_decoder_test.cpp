@@ -875,6 +875,53 @@ void sectionVoterFrankenstein() {
     CHECK(q <= 0.45f);   // held-value margin ~0.418; round-3 read ~0.76 at hour 6
 }
 
+// [wwv.voter.phantom-rotating] Refuter-round-5 regression (2026-07-20): even
+// with EVERY bit coherent (confidence-winner == count majority), rotating
+// 2-of-3 misreads at uniform noise-band confidence can win each hour bit from
+// a different frame camp and compose an hour NO frame held: frames holding
+// {9, 10, 3} per-bit-compose to 8+2+1 = 11, in range, every winning side
+// carrying a floor-clearing vote (the pre-fix voter emitted it at q~0.20,
+// above the lock floor). Per-bit coherence is necessary but not sufficient --
+// the composed value must itself be a HELD value, else the field demotes to
+// the held-value fallback (here: the clean newest frame's hour 3, whose
+// contested margin then honestly refuses the lock).
+void sectionVoterPhantomRotating() {
+    constexpr float N = 0.10f;   // uniform noise-band margin -- clears the
+                                 // trust floor, below the clean corpus band
+
+    TimeFrameVoter::Config cfg = wwvVoterConfig();
+    cfg.minBitConfidence = 0.05f;   // production floors (WS-4.5)
+    cfg.minLockQuality   = 0.05f;
+    TimeFrameVoter v(cfg);
+
+    // Minutes increment 18..20 (lockable); hour truth 3 (s20 + s21). The two
+    // older frames each misread TWO hour bits; the newest is fully correct.
+    {   // holds hour 9 (8+1): s23 set, s21 dropped
+        const auto [syms, conf] = wwvNoisyFrame(
+            18, 3, 200, 26, N,
+            {{23, ClockSymbol::One, N}, {21, ClockSymbol::Zero, N}});
+        v.addFrame(syms, conf);
+    }
+    {   // holds hour 10 (8+2): s23 set, s20 dropped
+        const auto [syms, conf] = wwvNoisyFrame(
+            19, 3, 200, 26, N,
+            {{23, ClockSymbol::One, N}, {20, ClockSymbol::Zero, N}});
+        v.addFrame(syms, conf);
+    }
+    {   // newest: clean, holds the true hour 3
+        std::array<float, 60> conf;
+        conf.fill(N);
+        v.addFrame(wwvVoterFrame(20, 3, 200, 26), conf);
+    }
+
+    const int h = v.votedField(TimeFrameVoter::FieldHours);
+    CHECK(h != 11);   // the phantom -- held by no frame
+    CHECK(h == 3);    // held-value fallback: the newest (true) hour
+    CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == 20);
+    // If it claims a lock at all, the hour must be a value some frame held.
+    CHECK(!v.locked() || h == 3 || h == 9 || h == 10);
+}
+
 // [wwv.voter.lone-voter-participation] A bit only ONE frame actually voted must
 // not read as certain. sec 54 (year-80 bit, truly Zero) is Unknown in three of
 // four otherwise-clean frames; only the newest classifies it (Zero). Its winning
@@ -1230,6 +1277,7 @@ int main() {
     sectionVoterContestedBitQuality();
     sectionVoterDoy366Gate();
     sectionVoterFrankenstein();
+    sectionVoterPhantomRotating();
     sectionVoterLoneVoterParticipation();
     sectionVoterUnanimousFadeNoConfidentGarbage();
     sectionVoterPlausibilityGate();
