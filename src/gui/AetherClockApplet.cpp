@@ -216,10 +216,12 @@ QSize AetherClockApplet::sizeHint() const
                             ? m_settingsDrawer->sizeHint().height() + 3
                             : 0;
     // The half-width toggle row is still one fixed 20 px row (folded into the
-    // +62 baseline); the warning banner adds height only while it is shown.
-    const int warnH = (m_daxWarning && !m_daxWarning->isHidden())
-                          ? m_daxWarning->sizeHint().height() + 3
-                          : 0;
+    // +62 baseline); each warning banner adds height only while it is shown.
+    int warnH = 0;
+    if (m_daxWarning && !m_daxWarning->isHidden())
+        warnH += m_daxWarning->sizeHint().height() + 3;
+    if (m_tuneWarning && !m_tuneWarning->isHidden())
+        warnH += m_tuneWarning->sizeHint().height() + 3;
     return {260, std::max(240, scopeH + drawerH + warnH + 62)};
 }
 
@@ -229,9 +231,11 @@ QSize AetherClockApplet::minimumSizeHint() const
     const int drawerH = (m_settingsDrawer && !m_settingsDrawer->isHidden())
                             ? m_settingsDrawer->minimumSizeHint().height() + 3
                             : 0;
-    const int warnH = (m_daxWarning && !m_daxWarning->isHidden())
-                          ? m_daxWarning->minimumSizeHint().height() + 3
-                          : 0;
+    int warnH = 0;
+    if (m_daxWarning && !m_daxWarning->isHidden())
+        warnH += m_daxWarning->minimumSizeHint().height() + 3;
+    if (m_tuneWarning && !m_tuneWarning->isHidden())
+        warnH += m_tuneWarning->minimumSizeHint().height() + 3;
     return {220, std::max(180, scopeH + drawerH + warnH + 50)};
 }
 
@@ -309,6 +313,17 @@ void AetherClockApplet::buildUi()
     m_daxWarning->setVisible(false);
     layout->addWidget(m_daxWarning);
 
+    // Tuned-away warning, same amber pattern as clockDaxWarning. The user can
+    // always spin the VFO out from under a running decoder — we detect + surface
+    // it, never fight it. Text is set in refreshTuneWarning.
+    m_tuneWarning = new QLabel(this);
+    m_tuneWarning->setObjectName(QStringLiteral("clockTuneWarning"));
+    m_tuneWarning->setWordWrap(true);
+    m_tuneWarning->setStyleSheet(
+        QStringLiteral("QLabel { color: #ffb800; font-size: 10px; }"));
+    m_tuneWarning->setVisible(false);
+    layout->addWidget(m_tuneWarning);
+
     // Half-width button-grid row: the settings drawer toggle (collapsed by
     // default) beside the DAX chooser for the selected slice, each ~50%.
     {
@@ -370,6 +385,7 @@ void AetherClockApplet::buildUi()
     applyStaticTooltips();
     updateStartStopUi();
     refreshDaxUi();
+    refreshTuneWarning();
     refreshTrustAndTime();  // seeds "--:--:--" / "q--" and the dynamic tooltips
 }
 
@@ -430,16 +446,7 @@ void AetherClockApplet::buildSettingsDrawer()
             if (wantRun) {
                 if (!m_slice.isNull()) {
                     m_engine->start(m_slice.data(), currentChoice(m_presetCombo).station);
-                    // The applet is the sole start caller, so binding here is
-                    // authoritative for the running-slice display. Watch the
-                    // bound slice's DAX channel too, so the no-audio warning
-                    // reacts if the user (re)assigns a channel mid-run.
-                    m_boundSlice = m_slice;
-                    if (m_boundSliceDaxConn)
-                        disconnect(m_boundSliceDaxConn);
-                    m_boundSliceDaxConn =
-                        connect(m_boundSlice.data(), &SliceModel::daxChannelChanged,
-                                this, [this](int) { refreshDaxUi(); });
+                    bindAndWatchBoundSlice();
                 }
             } else {
                 m_engine->stop();
@@ -447,6 +454,7 @@ void AetherClockApplet::buildSettingsDrawer()
         }
         updateStartStopUi();
         refreshDaxUi();
+        refreshTuneWarning();
     });
     drawer->addWidget(m_startStopButton);
 
@@ -502,6 +510,27 @@ void AetherClockApplet::buildSettingsDrawer()
             AetherClockSettings::setWwvCarrierMHz(c.carrierMHz);
         }
         refreshPresetUi(m_presetCombo, m_tuneButton, m_presetNote);
+
+        // While RUNNING the dropdown IS the station switch: a running decoder
+        // must never keep decoding the old station under a new label (the
+        // mismatch window). Retune is unambiguous intent here — stop, re-preset,
+        // restart on the new station, and re-bind. While STOPPED the combo stays
+        // browse-only (no tune, no start), so nothing happens below.
+        if (!m_engine.isNull() && m_engine->isRunning()) {
+            if (!m_slice.isNull()) {
+                m_engine->stop();
+                m_engine->applyStationPreset(m_slice.data(), c.station, c.carrierMHz);
+                m_engine->start(m_slice.data(), c.station);
+                bindAndWatchBoundSlice();
+            } else {
+                // Bound slice differs from the strip selection (or none): can't
+                // safely retune — stop and let updateStartStopUi reflect it.
+                m_engine->stop();
+            }
+            updateStartStopUi();
+            refreshDaxUi();
+            refreshTuneWarning();
+        }
     });
 
     refreshPresetUi(m_presetCombo, m_tuneButton, m_presetNote);
@@ -570,11 +599,15 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
                 [this](bool running) {
             updateStartStopUi();
             if (!running) {
-                // A real stop unbinds the slice; drop its DAX watch so a later
-                // channel edit can't revive the running-state warning.
+                // A real stop unbinds the slice; drop its DAX + frequency
+                // watches so a later channel/dial edit can't revive a
+                // running-state warning.
                 if (m_boundSliceDaxConn)
                     disconnect(m_boundSliceDaxConn);
+                if (m_boundSliceFreqConn)
+                    disconnect(m_boundSliceFreqConn);
                 m_boundSliceDaxConn = {};
+                m_boundSliceFreqConn = {};
                 m_boundSlice = nullptr;
                 // Drop the decode anchor so the UTC readout falls back to
                 // "--:--:--" and the tick stops (updateTickTimer).
@@ -584,6 +617,7 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
             refreshDaxUi();
             updateTickTimer();
             refreshTrustAndTime();
+            refreshTuneWarning();
             // History is useful across a NoSignal dropout; only a real stop
             // clears the scope.
             if (!running && m_scope)
@@ -594,6 +628,7 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
     syncStatus();
     updateStartStopUi();
     refreshDaxUi();
+    refreshTuneWarning();
     updateDecodeAnchor();  // seed the anchor if the model already has a decode
 }
 
@@ -811,8 +846,8 @@ void AetherClockApplet::applyStaticTooltips()
             "decoded symbols (M = marker)"));
     if (m_presetCombo)
         m_presetCombo->setToolTip(QStringLiteral(
-            "Station + carrier preset the Tune button applies to the selected "
-            "slice"));
+            "Station + carrier preset. Tune applies it to the selected slice; "
+            "changing it while running restarts decoding on the new station"));
     if (m_tuneButton)
         m_tuneButton->setToolTip(QStringLiteral(
             "Tune the selected slice to the chosen preset — works while "
@@ -828,6 +863,70 @@ void AetherClockApplet::applyStaticTooltips()
             "Assign the selected slice's DAX channel (0 = Off) — the audio "
             "path. Tracks the selected slice; the warning banner flags a "
             "running bound slice that has no channel"));
+}
+
+void AetherClockApplet::bindAndWatchBoundSlice()
+{
+    // The applet is the sole start caller, so binding here is authoritative for
+    // the running-slice display. Both start paths (Start button, running
+    // station-switch) funnel through here so the bind + watch block lives once.
+    m_boundSlice = m_slice;
+
+    // Record the preset the running decoder is actually on — the combo reflects
+    // the just-started / just-switched selection at every call site. Feeds the
+    // tuned-away dial math + banner text.
+    const PresetChoice c = currentChoice(m_presetCombo);
+    m_runningCarrierMHz = c.carrierMHz;
+    m_runningPresetLabel =
+        m_presetCombo ? m_presetCombo->currentText() : QString();
+
+    if (m_boundSliceDaxConn)
+        disconnect(m_boundSliceDaxConn);
+    if (m_boundSliceFreqConn)
+        disconnect(m_boundSliceFreqConn);
+    m_boundSliceDaxConn = {};
+    m_boundSliceFreqConn = {};
+    if (!m_boundSlice.isNull()) {
+        // DAX channel → no-audio warning; frequency → tuned-away warning.
+        m_boundSliceDaxConn =
+            connect(m_boundSlice.data(), &SliceModel::daxChannelChanged, this,
+                    [this](int) { refreshDaxUi(); });
+        m_boundSliceFreqConn =
+            connect(m_boundSlice.data(), &SliceModel::frequencyChanged, this,
+                    [this](double) { refreshTuneWarning(); });
+    }
+}
+
+void AetherClockApplet::refreshTuneWarning()
+{
+    const bool running = !m_engine.isNull() && m_engine->isRunning();
+    SliceModel* bound = m_boundSlice.data();
+
+    bool tunedAway = false;
+    if (running && bound) {
+        const double expectedDial =
+            AetherClockEngine::listeningDialMHz(m_runningCarrierMHz);
+        // 0.5 kHz tolerance — a RIT-sized nudge won't false-trip the banner.
+        tunedAway = std::abs(bound->frequency() - expectedDial) > 0.0005;
+    }
+
+    if (!m_tuneWarning)
+        return;
+    if (tunedAway) {
+        m_tuneWarning->setText(
+            QStringLiteral("Slice tuned away from %1 — no signal")
+                .arg(m_runningPresetLabel));
+    }
+    // Same visibility-flip geometry pattern as the DAX banner: only re-run the
+    // geometry path when the shown/hidden state actually changes.
+    if (m_tuneWarning->isHidden() == tunedAway) {
+        m_tuneWarning->setVisible(tunedAway);
+        setMinimumHeight(minimumSizeHint().height());
+        updateGeometry();
+        adjustSize();
+        if (auto* p = parentWidget())
+            p->updateGeometry();
+    }
 }
 
 } // namespace AetherSDR

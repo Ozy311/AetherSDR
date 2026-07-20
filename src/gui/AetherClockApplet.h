@@ -13,6 +13,7 @@
 
 #include <QDateTime>
 #include <QPointer>
+#include <QString>
 #include <QWidget>
 
 class QFrame;
@@ -70,6 +71,14 @@ private:
     void updateDynamicTooltips();  // LED + UTC tooltips (state / quality / age)
     void applyStaticTooltips();    // one-shot fixed tooltips for every widget
 
+    // Bind m_boundSlice to the strip selection at engine start/switch and watch
+    // its DAX channel + frequency for the run. Sole binder — Start button and
+    // the running station-switch both call it (no duplicated bind block).
+    void bindAndWatchBoundSlice();
+    // Tuned-away banner: shown while running when the bound slice's dial has
+    // drifted off the configured preset's expected dial (VFO spun away).
+    void refreshTuneWarning();
+
     QPointer<AetherClockEngine> m_engine;
     QPointer<AetherClockModel> m_model;
     QPointer<SliceModel> m_slice;       // strip-selected listening slice
@@ -83,6 +92,7 @@ private:
     QLabel* m_trustLine{nullptr};     // "q<quality> · <age>" decode-trust readout
     QLabel* m_boundSliceTag{nullptr}; // "▸<letter>" bound slice, running only
     QLabel* m_daxWarning{nullptr};    // amber no-DAX-channel warning, under status row
+    QLabel* m_tuneWarning{nullptr};   // amber tuned-away warning, under status row
     QFrame* m_settingsDrawer{nullptr};
     QPushButton* m_drawerToggle{nullptr};
     GuardedComboBox* m_presetCombo{nullptr};
@@ -92,12 +102,18 @@ private:
     QLabel* m_presetNote{nullptr};  // per-preset dial note (+ WWVB AGC note)
 
     bool m_updatingDaxFromModel{false};  // guard the DAX combo↔model echo loop
-    QMetaObject::Connection m_sliceDaxConn;       // selected slice daxChannelChanged
-    QMetaObject::Connection m_boundSliceDaxConn;  // bound slice daxChannelChanged (running)
+    QMetaObject::Connection m_sliceDaxConn;        // selected slice daxChannelChanged
+    QMetaObject::Connection m_boundSliceDaxConn;   // bound slice daxChannelChanged (running)
+    QMetaObject::Connection m_boundSliceFreqConn;  // bound slice frequencyChanged (running)
 
     QTimer* m_tickTimer{nullptr};  // 1 Hz UTC/trust extrapolation tick
     QDateTime m_anchorUtc;         // last decoded UTC (display anchor; invalid = none)
     qint64 m_anchorHostMs{0};      // host clock ms captured at the anchor decode
+
+    // Preset the running decoder is actually on (set at every start/switch),
+    // for the tuned-away dial math + banner text.
+    double m_runningCarrierMHz{0.0};
+    QString m_runningPresetLabel;
 };
 
 } // namespace AetherSDR
