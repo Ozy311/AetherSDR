@@ -67,6 +67,10 @@ constexpr double kFoldDecay = 0.99;
 inline bool isMarkerSec(int s) { return (s % 10) == 9; }
 
 // ---- Transposed Direct-Form-II biquad (RBJ cookbook coefficients). ---------
+// MSVC <cmath> does not define M_PI without _USE_MATH_DEFINES; repo core
+// convention is a local constant (Biquad/ClientEq/ClientPhaseRotator).
+constexpr double kPi = 3.14159265358979323846;
+
 struct Biquad {
     double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
     double z1 = 0.0, z2 = 0.0;
@@ -81,7 +85,7 @@ struct Biquad {
 
 Biquad designBandpass(double f0, double q, double fs) {
     // RBJ constant-0dB-peak bandpass.
-    double w0 = 2.0 * M_PI * f0 / fs;
+    double w0 = 2.0 * kPi * f0 / fs;
     double c = std::cos(w0), s = std::sin(w0);
     double alpha = s / (2.0 * q);
     double a0 = 1.0 + alpha;
@@ -95,7 +99,7 @@ Biquad designBandpass(double f0, double q, double fs) {
 }
 
 Biquad designLowpass(double fc, double q, double fs) {
-    double w0 = 2.0 * M_PI * fc / fs;
+    double w0 = 2.0 * kPi * fc / fs;
     double c = std::cos(w0), s = std::sin(w0);
     double alpha = s / (2.0 * q);
     double a0 = 1.0 + alpha;
@@ -265,7 +269,7 @@ void WwvDecoder::Impl::designFilters() {
     for (auto& b : bpTickV) b = designBandpass(2000.0, 12.0, f);
     for (auto& b : bpTickH) b = designBandpass(2200.0, 12.0, f);
 
-    double dth = 2.0 * M_PI * 100.0 / f;   // 100 Hz demod rotation per sample
+    double dth = 2.0 * kPi * 100.0 / f;   // 100 Hz demod rotation per sample
     rotC = std::cos(dth);
     rotS = std::sin(dth);
 }
