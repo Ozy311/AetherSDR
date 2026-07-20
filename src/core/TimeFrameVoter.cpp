@@ -8,11 +8,17 @@
 // Cross-frame confidence-weighted voting per the AetherClock reference decoder:
 // a bit's vote is the sum of its per-frame matched-filter margins (floored at
 // 0.01), with older frames discounted by agingFactor^age. Markers and Unknown
-// symbols never vote. The timestamp vote is NORMALIZE-then-per-bit: every frame
-// is first extrapolated to the newest epoch (removing the epoch skew that makes
-// a stale hour dangerous), then bits are voted in that normalized space, where
-// frames are supposed to agree. Lock gates on consecutive +1 minute increments
-// plus self-consistent static fields.
+// symbols never vote. The timestamp vote is NORMALIZE-then-COHERENCE-GATED-
+// per-bit: every frame is first extrapolated to the newest epoch (removing the
+// epoch skew that makes a stale hour dangerous), then each field is composed from
+// its bits ONLY when every bit is coherent (its confidence-winner agrees with its
+// aging-only count majority); an incoherent field — where sibling bits are carried
+// by different frame camps — falls back to the top value some frame actually held,
+// so per-bit voting can never assemble a phantom value. Quality is computed in the
+// same pass (computeResolution) as the min across fields of per-bit trust
+// (margin x participation) or the held-value margin, so value and quality can
+// never disagree. Lock gates on consecutive +1 minute increments plus
+// self-consistent static fields.
 
 namespace AetherSDR {
 
@@ -218,33 +224,128 @@ TimeFrameVoter::buildNormalizedFrames() const {
     return out;
 }
 
-// Per-field, per-bit tally across the normalized window: heavier of One/Zero
-// wins. `frames` is the shared normalized view.
 namespace {
-struct BitTally { float w0 = 0.0f, w1 = 0.0f; };
+
+// One field's per-bit tallies across the normalized window: confidence-weighted
+// (w) decides the value; aging-only count (c) decides the count majority; the
+// two together decide COHERENCE. `part` is participation (participating weight /
+// potential weight) — the lone-floor-voter guard.
+struct BitStat {
+    double w0 = 0.0, w1 = 0.0;   // confidence-weighted (aged x max(conf,0.01))
+    double c0 = 0.0, c1 = 0.0;   // aging-only count (aged, no confidence)
+    double participation = 0.0;  // Pact / Ppot
+};
+
+// This bit is coherent iff its confidence-winner agrees with its count-winner,
+// or the count is tied (no majority to contradict). Ties in w resolve to Zero,
+// matching the compose rule (value bit set only when w1 > w0).
+inline bool bitCoherent(const BitStat& b) {
+    const bool wOne = b.w1 > b.w0;
+    const bool cOne = b.c1 > b.c0;
+    const bool cTied = b.c0 == b.c1;
+    return cTied || (wOne == cOne);
+}
+
+// Normalized winning margin of a bit, 0 when nothing participated.
+inline double bitMargin(const BitStat& b) {
+    const double total = b.w0 + b.w1;
+    constexpr double kEpsilon = 1e-6;
+    return total > 0.0 ? (std::max(b.w0, b.w1) - std::min(b.w0, b.w1)) / (total + kEpsilon)
+                       : 0.0;
+}
+
 } // namespace
 
-TimeFields TimeFrameVoter::votedTimestamp() const {
+TimeFrameVoter::Resolution TimeFrameVoter::computeResolution() const {
+    Resolution r;  // value all -1, quality 0
     const std::vector<NormalizedFrame> frames = buildNormalizedFrames();
     if (frames.empty()) {
-        return TimeFields{};
+        return r;
     }
 
     int valueByField[FieldCount] = {0, 0, 0, 0};
+    double qualityByField[FieldCount] = {1.0, 1.0, 1.0, 1.0};
+
     for (std::size_t fld = 0; fld < FieldCount; ++fld) {
         const ClockFieldMap& map = m_cfg.fields[fld];
+
+        // Held-value vote: each frame votes its whole ext field VALUE, weighted by
+        // aged x the frame's field-min original confidence (consistent with the
+        // re-encode weighting) — a value a frame actually carried, never composed.
+        std::vector<std::pair<int, double>> held;  // (value, weight)
+        auto addHeld = [&](int value, double weight) {
+            for (auto& hv : held) {
+                if (hv.first == value) { hv.second += weight; return; }
+            }
+            held.push_back({value, weight});
+        };
+
+        bool allCoherent = true;
+        double minCoherentTrust = 1.0;
+        int composeValue = 0;
+
+        for (const NormalizedFrame& nf : frames) {
+            float fmin = -1.0f;
+            for (const auto& b : nf.bits[fld]) {
+                fmin = (fmin < 0.0f) ? b.confidence : std::min(fmin, b.confidence);
+            }
+            const int extByField[FieldCount] = {nf.ext.minute, nf.ext.hour,
+                                                nf.ext.doy, nf.ext.year2};
+            addHeld(extByField[fld],
+                    agedWeight(fmin < 0.0f ? 0.0f : fmin, m_cfg.agingFactor, nf.age));
+        }
+
         for (std::size_t k = 0; k < map.size(); ++k) {
-            BitTally t;
+            BitStat s;
+            double pAct = 0.0, pPot = 0.0;
             for (const NormalizedFrame& nf : frames) {
                 const NormalizedFrame::Bit b = nf.bits[fld][k];
+                const double aged =
+                    std::pow(static_cast<double>(m_cfg.agingFactor), nf.age);
+                const double confW = std::max(b.confidence, 0.01f) * aged;
+                pPot += confW;  // potential: every frame's aged floored confidence
                 if (b.symbol == ClockSymbol::One || b.symbol == ClockSymbol::Zero) {
-                    const float w = agedWeight(b.confidence, m_cfg.agingFactor, nf.age);
-                    (b.symbol == ClockSymbol::One ? t.w1 : t.w0) += w;
+                    (b.symbol == ClockSymbol::One ? s.w1 : s.w0) += confW;
+                    (b.symbol == ClockSymbol::One ? s.c1 : s.c0) += aged;
+                    pAct += confW;
                 }
             }
-            if (t.w1 > t.w0) {
-                valueByField[fld] += map[k].weight;
+            s.participation = pPot > 0.0 ? pAct / pPot : 0.0;
+
+            const double trust = bitMargin(s) * s.participation;
+            if (bitCoherent(s)) {
+                minCoherentTrust = std::min(minCoherentTrust, trust);
+            } else {
+                allCoherent = false;
             }
+            if (s.w1 > s.w0) {
+                composeValue += map[k].weight;
+            }
+        }
+
+        // Top two held values -> held-value margin.
+        double topW = 0.0, runnerW = 0.0, totalHeld = 0.0;
+        int topValue = 0;
+        for (const auto& hv : held) {
+            totalHeld += hv.second;
+            if (hv.second > topW) { runnerW = topW; topW = hv.second; topValue = hv.first; }
+            else if (hv.second > runnerW) { runnerW = hv.second; }
+        }
+        constexpr double kEpsilon = 1e-6;
+        const double valueMargin = (topW - runnerW) / (totalHeld + kEpsilon);
+
+        if (allCoherent) {
+            // Fade-rescue / clean path: every bit's confidence-winner is also its
+            // count majority, so composing them cannot synthesize a phantom value.
+            valueByField[fld] = composeValue;
+            qualityByField[fld] = minCoherentTrust;
+        } else {
+            // A sibling bit was carried by a DIFFERENT frame camp than its count
+            // majority — per-bit composition would Frankenstein a value no frame
+            // held. Fall back to the top held value; quality is the weaker of the
+            // held-value consensus and the coherent bits' trust.
+            valueByField[fld] = topValue;
+            qualityByField[fld] = std::min(valueMargin, minCoherentTrust);
         }
     }
 
@@ -254,30 +355,35 @@ TimeFields TimeFrameVoter::votedTimestamp() const {
     voted.doy    = valueByField[FieldDoy];
     voted.year2  = valueByField[FieldYear];
 
-    // Final-range guard: per-bit blending can in principle synthesize an
-    // out-of-range BCD value (e.g. a minute summing 5+10+20+40). If it did, fall
-    // back to the single highest-aged-weight frame's extrapolated tuple rather
-    // than emit an impossible broadcast time.
+    // Final-range guard: an all-coherent compose can still sum to an out-of-range
+    // BCD value. If it did, the window has no usable consensus — fall back to the
+    // highest-aged-weight frame's tuple and report quality 0 for the emission.
     const bool inRange =
         voted.minute >= 0 && voted.minute <= 59 &&
         voted.hour   >= 0 && voted.hour   <= 23 &&
         voted.doy    >= 1 && voted.doy    <= 366 &&
         voted.year2  >= 0 && voted.year2  <= 99;
-    if (inRange) {
-        return voted;
+    if (!inRange) {
+        const NormalizedFrame* best = nullptr;
+        double bestWeight = -1.0;
+        for (const NormalizedFrame& nf : frames) {
+            const double w = agedWeight(static_cast<float>(nf.meanConfidence),
+                                        m_cfg.agingFactor, nf.age);
+            if (w > bestWeight) { bestWeight = w; best = &nf; }
+        }
+        r.value = best ? best->ext : TimeFields{};
+        r.quality = 0.0;
+        return r;
     }
 
-    const NormalizedFrame* best = nullptr;
-    double bestWeight = -1.0;
-    for (const NormalizedFrame& nf : frames) {
-        const double w = agedWeight(static_cast<float>(nf.meanConfidence),
-                                    m_cfg.agingFactor, nf.age);
-        if (w > bestWeight) {
-            bestWeight = w;
-            best = &nf;
-        }
-    }
-    return best ? best->ext : TimeFields{};
+    r.value = voted;
+    r.quality = std::min({qualityByField[FieldMinutes], qualityByField[FieldHours],
+                          qualityByField[FieldDoy], qualityByField[FieldYear]});
+    return r;
+}
+
+TimeFields TimeFrameVoter::votedTimestamp() const {
+    return computeResolution().value;
 }
 
 int TimeFrameVoter::votedField(FieldIndex field) const {
@@ -337,15 +443,15 @@ bool TimeFrameVoter::locked() const {
         const ClockFieldMap& map = m_cfg.fields[fi];
         double margin = 0.0;
         for (std::size_t k = 0; k < map.size(); ++k) {
-            BitTally t;
+            float w0 = 0.0f, w1 = 0.0f;
             for (const NormalizedFrame& nf : frames) {
                 const NormalizedFrame::Bit b = nf.bits[fi][k];
                 if (b.symbol == ClockSymbol::One || b.symbol == ClockSymbol::Zero) {
                     const float w = agedWeight(b.confidence, m_cfg.agingFactor, nf.age);
-                    (b.symbol == ClockSymbol::One ? t.w1 : t.w0) += w;
+                    (b.symbol == ClockSymbol::One ? w1 : w0) += w;
                 }
             }
-            margin += std::max(t.w0, t.w1) - std::min(t.w0, t.w1);
+            margin += std::max(w0, w1) - std::min(w0, w1);
         }
         if (!(margin > 0.0)) {
             return false;
@@ -356,58 +462,29 @@ bool TimeFrameVoter::locked() const {
 }
 
 float TimeFrameVoter::lockConfidence() const {
-    // MINIMUM normalized winning margin over the voted timestamp bits, in the
-    // SAME normalized (age-extrapolated) space as votedField, x frame-count
-    // saturation. The min — not the mean — is the honest aggregate: a timestamp
-    // is exactly as trustworthy as its least-certain bit (one flipped bit changes
-    // the value), so quality must collapse to the single most-contested bit's
-    // margin. A mean let ~30 clean bits mask the one bit that actually decided a
-    // field, reporting near-1.0 while the value was wrong — confident garbage.
-    // Same principle as the re-encode weighting. Clean/clean-rollover windows:
-    // every bit unanimous once normalized -> every margin ~1.0 -> min ~1.0, so
-    // quality still tracks saturation and does not dip. A bit with ZERO
-    // participating votes (its second decoded Marker/Unknown in every window
-    // frame) has no consensus at all and is scored margin 0 -> quality 0.
+    // Quality is the resolution's own quality (computed WITH the value in
+    // computeResolution, so the two can never disagree) x frame-count saturation.
+    // That quality is the MIN across fields of each field's contribution: for a
+    // coherent field the minimum per-bit TRUST (normalized margin x participation
+    // — participation demotes a bit only one frame actually voted); for an
+    // incoherent field the held-value margin capped by the coherent bits' trust;
+    // and 0 outright when the compose fell out of range. Per-bit statistics alone
+    // (mean OR min) cannot certify a multi-bit BCD value — sibling bits can be
+    // carried by different frame camps — so quality reflects the weakest CERTIFIED
+    // link, not the weakest bit. Clean/clean-rollover windows: every bit coherent
+    // at full participation and margin ~1.0 -> quality ~1.0, tracking saturation.
     const int n = static_cast<int>(m_frames.size());
     if (n < m_cfg.minFramesForLock) {
         return 0.0f;
     }
-
-    const std::vector<NormalizedFrame> frames = buildNormalizedFrames();
-    if (frames.empty()) {
+    if (buildNormalizedFrames().empty()) {
         return 0.0f;
-    }
-
-    constexpr float kEpsilon = 1e-6f;
-    double minMargin = 1.0;
-    bool sawBit = false;
-
-    for (std::size_t fld = 0; fld < FieldCount; ++fld) {
-        const ClockFieldMap& map = m_cfg.fields[fld];
-        for (std::size_t k = 0; k < map.size(); ++k) {
-            BitTally t;
-            for (const NormalizedFrame& nf : frames) {
-                const NormalizedFrame::Bit b = nf.bits[fld][k];
-                if (b.symbol == ClockSymbol::One || b.symbol == ClockSymbol::Zero) {
-                    const float w = agedWeight(b.confidence, m_cfg.agingFactor, nf.age);
-                    (b.symbol == ClockSymbol::One ? t.w1 : t.w0) += w;
-                }
-            }
-            const float total = t.w0 + t.w1;
-            // No participating vote for this bit -> no consensus -> margin 0.
-            const double margin =
-                (total > 0.0f)
-                    ? (std::max(t.w0, t.w1) - std::min(t.w0, t.w1)) / (total + kEpsilon)
-                    : 0.0;
-            minMargin = std::min(minMargin, margin);
-            sawBit = true;
-        }
     }
 
     const double saturation =
         std::min(1.0, static_cast<double>(n) /
                           (2.0 * static_cast<double>(m_cfg.minFramesForLock)));
-    const double quality = (sawBit ? minMargin : 0.0) * saturation;
+    const double quality = computeResolution().quality * saturation;
     return static_cast<float>(std::clamp(quality, 0.0, 1.0));
 }
 

@@ -833,6 +833,76 @@ void sectionVoterDoy366Gate() {
     CHECK(v.votedField(TimeFrameVoter::FieldYear) == 27);
 }
 
+// [wwv.voter.frankenstein] Per-bit voting alone can assemble a value NO frame
+// held when sibling bits are won by DIFFERENT frame camps. Three clean frames
+// read hour 2 with the 4-bit (sec 22, truly Zero) FADED (sec21 One@0.90, sec22
+// Zero@0.05); one confident newest frame reads hour 4 (sec21 Zero@0.05, sec22
+// One@0.90). Per-bit: sec21 -> One (the three), sec22 -> One (the one) -> compose
+// = 2+4 = 6, against a 3:1 frame majority for 2. Coherence catches it: sec22's
+// confidence-winner (One) contradicts its aging-count majority (Zero, 3 frames),
+// so the hour field falls back to the top HELD value (2). Quality collapses to
+// the weak held-value margin (both camps vote at field-min conf 0.05: value 2 =
+// 0.05x(0.9^1+0.9^2+0.9^3)=0.122, value 4 = 0.05, margin 0.072/0.172 = 0.418).
+// The round-3 min-margin voter read hour 6 at q0.76 — confident garbage.
+void sectionVoterFrankenstein() {
+    constexpr float LO = 0.05f;   // faded / wrong-camp bit
+    constexpr float HI = 0.90f;   // confident bit
+    constexpr float C  = 0.40f;
+
+    TimeFrameVoter v(wwvVoterConfig());
+    // Minutes 18..21 increment so it locks; three clean hour-2 frames then one
+    // confident hour-4 newest. (sec 21 = hour 2-bit, sec 22 = hour 4-bit.)
+    for (int mn = 18; mn <= 20; ++mn) {
+        const auto [syms, conf] = wwvNoisyFrame(
+            mn, 2, 200, 26, C,
+            {{21, ClockSymbol::One, HI}, {22, ClockSymbol::Zero, LO}});
+        v.addFrame(syms, conf);
+    }
+    {
+        const auto [syms, conf] = wwvNoisyFrame(
+            21, 4, 200, 26, C,
+            {{21, ClockSymbol::Zero, LO}, {22, ClockSymbol::One, HI}});
+        v.addFrame(syms, conf);  // corrupt newest reads hour 4
+    }
+
+    CHECK(v.locked());
+    CHECK(v.votedField(TimeFrameVoter::FieldHours) == 2);   // held majority, NOT 6
+    CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == 21);
+    CHECK(v.votedField(TimeFrameVoter::FieldDoy)   == 200);
+    CHECK(v.votedField(TimeFrameVoter::FieldYear)  == 26);
+    const float q = v.lockConfidence();
+    CHECK(q > 0.0f);
+    CHECK(q <= 0.45f);   // held-value margin ~0.418; round-3 read ~0.76 at hour 6
+}
+
+// [wwv.voter.lone-voter-participation] A bit only ONE frame actually voted must
+// not read as certain. sec 54 (year-80 bit, truly Zero) is Unknown in three of
+// four otherwise-clean frames; only the newest classifies it (Zero). Its winning
+// margin is ~1.0 (no opposition), but participation = aged_newest / Σ aged =
+// 1.0/(1+0.9+0.81+0.729) = 0.291, so its TRUST = 0.291 pulls quality down. The
+// value is unaffected (year 26); the round-3 min-margin voter read this window
+// at q~1.0 — certain about a bit almost no frame saw.
+void sectionVoterLoneVoterParticipation() {
+    constexpr float C = 0.40f;
+
+    TimeFrameVoter v(wwvVoterConfig());
+    for (int mn = 18; mn <= 20; ++mn) {
+        const auto [syms, conf] =
+            wwvNoisyFrame(mn, 6, 200, 26, C, {{54, ClockSymbol::Unknown, C}});
+        v.addFrame(syms, conf);
+    }
+    std::array<float, 60> newestConf;
+    newestConf.fill(C);
+    v.addFrame(wwvVoterFrame(21, 6, 200, 26), newestConf);  // newest votes sec 54
+
+    CHECK(v.locked());
+    CHECK(v.votedField(TimeFrameVoter::FieldYear) == 26);   // value unaffected
+    CHECK(v.votedField(TimeFrameVoter::FieldHours) == 6);
+    const float q = v.lockConfidence();
+    CHECK(q > 0.0f);
+    CHECK(q <= 0.35f);   // participation ~0.291 caps it; round-3 read ~1.0
+}
+
 } // namespace
 
 int main() {
@@ -855,6 +925,8 @@ int main() {
     sectionVoterMinuteFadeWeighting();
     sectionVoterContestedBitQuality();
     sectionVoterDoy366Gate();
+    sectionVoterFrankenstein();
+    sectionVoterLoneVoterParticipation();
 
     // Print encoded truth for the python cross-check gate.
     std::printf("golden truth: min=%d hr=%d doy=%d yr=%d frames=%d\n",

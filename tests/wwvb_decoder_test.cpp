@@ -536,6 +536,65 @@ static void sectionVoterDoy366Gate() {
     CHECK(v.votedField(TimeFrameVoter::FieldYear) == 27);
 }
 
+// [wwvb.voter.frankenstein] Mirror: three clean hour-2 frames with the 4-bit
+// (sec 16) faded (sec17 One@0.90, sec16 Zero@0.05) and one confident hour-4
+// newest (sec17 Zero@0.05, sec16 One@0.90). Per-bit would compose 2+4 = 6;
+// coherence gates sec16 (confidence-winner One vs count-majority Zero) so the
+// hour falls back to the held majority 2, at the weak held-value margin (~0.42).
+static void sectionVoterFrankenstein() {
+    constexpr float LO = 0.05f;
+    constexpr float HI = 0.90f;
+    constexpr float C  = 0.40f;
+
+    TimeFrameVoter v(wwvbVoterConfig());
+    for (int mn = 18; mn <= 20; ++mn) {
+        const auto [syms, conf] = wwvbNoisyFrame(
+            mn, 2, 200, 26, C,
+            {{17, ClockSymbol::One, HI}, {16, ClockSymbol::Zero, LO}});
+        v.addFrame(syms, conf);
+    }
+    {
+        const auto [syms, conf] = wwvbNoisyFrame(
+            21, 4, 200, 26, C,
+            {{17, ClockSymbol::Zero, LO}, {16, ClockSymbol::One, HI}});
+        v.addFrame(syms, conf);
+    }
+
+    CHECK(v.locked());
+    CHECK(v.votedField(TimeFrameVoter::FieldHours) == 2);   // held majority, NOT 6
+    CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == 21);
+    CHECK(v.votedField(TimeFrameVoter::FieldDoy)   == 200);
+    CHECK(v.votedField(TimeFrameVoter::FieldYear)  == 26);
+    const float q = v.lockConfidence();
+    CHECK(q > 0.0f);
+    CHECK(q <= 0.45f);
+}
+
+// [wwvb.voter.lone-voter-participation] Mirror: sec 45 (year-80 bit) is Unknown
+// in three of four otherwise-clean frames; only the newest classifies it. Its
+// margin is ~1.0 but participation ~0.291 caps its trust, pulling quality down
+// while the value stays year 26.
+static void sectionVoterLoneVoterParticipation() {
+    constexpr float C = 0.40f;
+
+    TimeFrameVoter v(wwvbVoterConfig());
+    for (int mn = 18; mn <= 20; ++mn) {
+        const auto [syms, conf] =
+            wwvbNoisyFrame(mn, 6, 200, 26, C, {{45, ClockSymbol::Unknown, C}});
+        v.addFrame(syms, conf);
+    }
+    std::array<float, 60> newestConf;
+    newestConf.fill(C);
+    v.addFrame(wwvbVoterFrame(21, 6, 200, 26), newestConf);
+
+    CHECK(v.locked());
+    CHECK(v.votedField(TimeFrameVoter::FieldYear) == 26);
+    CHECK(v.votedField(TimeFrameVoter::FieldHours) == 6);
+    const float q = v.lockConfidence();
+    CHECK(q > 0.0f);
+    CHECK(q <= 0.35f);
+}
+
 // ------------------------------------------------------------------------ main
 int main() {
     // Golden truth for the clean 3-frame vector: 06:20/06:21/06:22, doy 200,
@@ -689,6 +748,12 @@ int main() {
 
     // --- Section: doy-366-in-non-leap-year gate
     sectionVoterDoy366Gate();
+
+    // --- Section: cross-bit Frankenstein composition (coherence gating)
+    sectionVoterFrankenstein();
+
+    // --- Section: lone-voter participation scaling
+    sectionVoterLoneVoterParticipation();
 
     // --- WAV dump of the clean golden vector (opt-in via env var) + truth print
     if (const char* dir = std::getenv("AETHERCLOCK_DUMP_WAV_DIR")) {

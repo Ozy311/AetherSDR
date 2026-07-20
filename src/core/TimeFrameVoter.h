@@ -160,15 +160,24 @@ public:
     //      value and weights every bit by its field-MIN original confidence — a
     //      BCD value is only as reliable as its weakest bit.
     //   3. Per-bit weights are max(confidence, 0.01) * agingFactor^age.
+    //   4. Composition is COHERENCE-GATED. Per-bit statistics alone cannot certify
+    //      a multi-bit BCD value: sibling bits can be won by DIFFERENT frame camps
+    //      (a faded bit plus a confident sibling misread), assembling a value no
+    //      frame held. A bit is coherent only when its confidence-weighted winner
+    //      agrees with its aging-only count majority. If every bit of a field is
+    //      coherent the field is that per-bit compose (the fade-rescue / clean
+    //      path); if any bit is incoherent the field falls back to the top HELD
+    //      value — one a frame actually carried, voted per-value with the same
+    //      aged x field-min weighting.
     // This is rollover-safe BECAUSE the extrapolation removes the epoch skew: a
     // stale hour can never outvote the current one, since after normalization
     // every frame is voting on the current hour. Cross-frame bit blending is
-    // confined to normalized space, where the frames are SUPPOSED to agree, so
-    // blending there is correction, not synthesis across epochs. Should the
-    // per-bit blend ever produce an out-of-range BCD value, the vote falls back
-    // to the single highest-aged-weight frame's extrapolated tuple (a guarded
-    // fallback, never the primary path). Returns -1 if no frame decodes to a
-    // range-valid timestamp.
+    // confined to normalized space AND to coherent bits, so blending there is
+    // correction, not synthesis across epochs or across frame camps. Should the
+    // compose ever produce an out-of-range BCD value, the vote falls back to the
+    // single highest-aged-weight frame's extrapolated tuple (a guarded fallback,
+    // never the primary path). Returns -1 if no frame decodes to a range-valid
+    // timestamp.
     int votedField(FieldIndex field) const;
 
     // Raw per-frame minutes decode of the newest frame (no voting).
@@ -222,10 +231,25 @@ private:
     // vote. Empty when no frame qualifies.
     std::vector<NormalizedFrame> buildNormalizedFrames() const;
 
-    // Normalize-then-per-bit vote of the whole timestamp across the window (the
-    // source of truth for votedField's four fields). A per-bit blend that lands
-    // out of range falls back to the highest-aged-weight frame's extrapolated
-    // tuple. Returns all-(-1) TimeFields when no candidate qualifies.
+    // The whole timestamp resolved from the normalized window, PLUS the quality
+    // of that resolution — computed together so value and quality can never
+    // disagree. Per field: if every bit is COHERENT (its confidence-weighted
+    // winner agrees with its aging-only count majority) the field is the per-bit
+    // compose, as before; if any bit is incoherent (a confident sibling misread
+    // would let per-bit voting assemble a value no frame held) the field falls
+    // back to the top HELD value (one a frame actually carried). Quality is the
+    // MIN across fields of the field's contribution: for a coherent field the min
+    // per-bit trust (margin x participation), for an incoherent field the min of
+    // the held-value margin and the coherent bits' trust. An out-of-range compose
+    // falls back to the highest-aged-weight frame's tuple at quality 0.
+    struct Resolution {
+        TimeFields value;    // all -1 when no frame qualifies
+        double quality = 0.0;  // pre-saturation; 0 on the range fallback
+    };
+    Resolution computeResolution() const;
+
+    // Thin wrapper: the resolved timestamp value (the source of truth for
+    // votedField's four fields). Returns all-(-1) TimeFields when none qualifies.
     TimeFields votedTimestamp() const;
 };
 
