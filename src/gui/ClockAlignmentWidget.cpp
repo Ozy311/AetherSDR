@@ -234,10 +234,16 @@ void ClockAlignmentWidget::paintEvent(QPaintEvent* /*event*/)
 
         // 1. + 2. Traces (antialiased). Envelope first, template over it. Empty
         // vectors simply skip the trace — the second's slot still advances.
+        // The template is drawn shifted by edgeOffsetMs — where the matched
+        // filter actually matched this second (WS-4.5): ~0 on a drift-free
+        // stream, nonzero while the decoder absorbs sample-clock drift, so
+        // envelope and template stay honest to each other on screen.
         if (!f.envelope.isEmpty() || !f.expected.isEmpty()) {
             p.setRenderHint(QPainter::Antialiasing, true);
             drawSeries(f.envelope, envelopeCol, 1.2f, x0);
-            drawSeries(f.expected, expectedCol, 1.0f, x0);
+            const float shiftPx =
+                (std::clamp(f.edgeOffsetMs, -500, 500) / 1000.0f) * colW;
+            drawSeries(f.expected, expectedCol, 1.0f, x0 + shiftPx);
         }
 
         // 3. AM-drop edge tick at edgeOffsetMs within this second (0..1000 ms).

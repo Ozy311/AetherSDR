@@ -140,16 +140,32 @@ void applyStationTag(QLabel* tag, const QString& stationName)
                                                           : stationName);
 }
 
-void applyOffsetReadout(QLabel* label, const QDateTime& utc, double offsetMs)
+void applyOffsetReadout(QLabel* label, const QDateTime& utc, double offsetMs,
+                        bool locked)
 {
     if (!label)
         return;
-    if (!utc.isValid()) {
+    // A stale offset is worse than none: once the lock is lost the last
+    // measurement ages open-endedly, so it clears instead of lingering
+    // (WS-4.5 — the live applet showed a 45-minute-old offset as current).
+    if (!utc.isValid() || !locked) {
         label->setText(QStringLiteral("--"));
         return;
     }
     // + = host clock BEHIND the broadcast (engine offset convention).
-    label->setText(QString::asprintf("%+.2f s", offsetMs / 1000.0));
+    // Format widens gracefully with magnitude: the plausibility gate bounds
+    // legitimate offsets to ±24 h, and a badly wrong host clock deserves a
+    // readable number, not a 12-digit seconds count.
+    const double s = offsetMs / 1000.0;
+    const double as = std::abs(s);
+    if (as < 100.0)
+        label->setText(QString::asprintf("%+.2f s", s));
+    else if (as < 600.0)
+        label->setText(QString::asprintf("%+.1f s", s));
+    else if (as < 3600.0)
+        label->setText(QString::asprintf("%+.0f s", s));
+    else
+        label->setText(QString::asprintf("%+.1f h", s / 3600.0));
 }
 
 // Decode age for the trust line: seconds while under 100 ("6s"), then whole
@@ -381,7 +397,7 @@ void AetherClockApplet::buildUi()
 
     // Prime the status row + action enables to the detached/no-signal state.
     applyStationTag(m_stationTag, QStringLiteral("Unknown"));
-    applyOffsetReadout(m_offsetValue, QDateTime(), 0.0);
+    applyOffsetReadout(m_offsetValue, QDateTime(), 0.0, false);
     applyStaticTooltips();
     updateStartStopUi();
     refreshDaxUi();
@@ -570,11 +586,15 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
     // (refreshTrustAndTime) so they stay live between the once-per-frame decodes.
     auto syncStatus = [this]() {
         AetherClockModel* m = m_model.data();
-        applyLockLed(m_lockLed, m ? m->lockState() : ClockLockState::NoSignal);
+        const ClockLockState st = m ? m->lockState() : ClockLockState::NoSignal;
+        applyLockLed(m_lockLed, st);
         applyStationTag(m_stationTag, m ? m->stationName() : QStringLiteral("Unknown"));
         const QDateTime utc = m ? m->decodedUtc() : QDateTime();
-        applyOffsetReadout(m_offsetValue, utc, m ? m->offsetMs() : 0.0);
-        updateDynamicTooltips();
+        applyOffsetReadout(m_offsetValue, utc, m ? m->offsetMs() : 0.0,
+                           st == ClockLockState::Locked);
+        // A state edge changes what the UTC readout is allowed to do (tick vs
+        // stale) — refresh immediately rather than waiting for the 1 Hz tick.
+        refreshTrustAndTime();
     };
 
     if (!m_model.isNull()) {
@@ -764,16 +784,22 @@ void AetherClockApplet::refreshTrustAndTime()
     // driven elsewhere and deliberately untouched here.
     const bool running = !m_engine.isNull() && m_engine->isRunning();
     const bool haveDecode = m_anchorUtc.isValid();
+    AetherClockModel* m = m_model.data();
+    const bool locked =
+        running && m && m->lockState() == ClockLockState::Locked;
 
     // Display-side extrapolation: anchorUtc + (now − anchorHostMs), floored to
     // the second. Monotonic, so the readout never ticks backward between
-    // anchors. The engine/model are never touched.
+    // anchors. The engine/model are never touched. Extrapolation is honest
+    // ONLY while locked — once the lock is lost the anchor ages open-endedly,
+    // and ticking it forward presents a stale decode as a live clock (WS-4.5:
+    // the live applet ticked a 45-minute-old decode as current).
     QDateTime shownUtc;
     qint64 ageMs = -1;
-    if (running && haveDecode) {
+    if (running && haveDecode)
         ageMs = QDateTime::currentMSecsSinceEpoch() - m_anchorHostMs;
+    if (locked && haveDecode)
         shownUtc = m_anchorUtc.addMSecs(ageMs);
-    }
     if (m_utcValue) {
         m_utcValue->setText(
             shownUtc.isValid()
@@ -781,13 +807,18 @@ void AetherClockApplet::refreshTrustAndTime()
                 : QStringLiteral("--:--:--"));
     }
     if (m_trustLine) {
-        AetherClockModel* m = m_model.data();
-        m_trustLine->setText(
-            (running && haveDecode)
-                ? QStringLiteral("q%1 · %2")
-                      .arg(m ? m->lockQuality() : 0)
-                      .arg(fmtDecodeAge(ageMs))
-                : QStringLiteral("q--"));
+        if (locked && haveDecode) {
+            m_trustLine->setText(QStringLiteral("q%1 · %2")
+                                     .arg(m ? m->lockQuality() : 0)
+                                     .arg(fmtDecodeAge(ageMs)));
+        } else if (running && haveDecode) {
+            // Lock lost but a past decode exists: show its age, never its
+            // quality (that certified a decode that is no longer live).
+            m_trustLine->setText(
+                QStringLiteral("q-- · last %1").arg(fmtDecodeAge(ageMs)));
+        } else {
+            m_trustLine->setText(QStringLiteral("q--"));
+        }
     }
     updateDynamicTooltips();
 }
@@ -812,11 +843,15 @@ void AetherClockApplet::updateDynamicTooltips()
         if (running && haveDecode) {
             const qint64 ageS =
                 (QDateTime::currentMSecsSinceEpoch() - m_anchorHostMs) / 1000;
+            const bool locked =
+                m && m->lockState() == ClockLockState::Locked;
             tip = QStringLiteral(
                       "Decoded broadcast time (UTC). Ticks between decodes; "
                       "last decode %1, %2s ago")
                       .arg(m_anchorUtc.toUTC().toString(QStringLiteral("HH:mm:ss")))
                       .arg(ageS < 0 ? 0 : ageS);
+            if (!locked)
+                tip += QStringLiteral(" — lock lost, readout cleared");
         } else {
             tip = QStringLiteral(
                 "Decoded broadcast time (UTC). Ticks between decodes; "
