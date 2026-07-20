@@ -339,6 +339,8 @@ void AetherClockApplet::buildUi()
         controlRow->setSpacing(3);
 
         m_startStopButton = new QPushButton(QStringLiteral("Enable"), this);
+        m_startStopButton->setObjectName(QStringLiteral("clockEnable"));
+        m_startStopButton->setAccessibleName(QStringLiteral("AetherClock enable"));
         m_startStopButton->setCheckable(true);
         m_startStopButton->setStyleSheet(kButtonBase() + kStartActive + kDisabledBtn);
         m_startStopButton->setFixedHeight(20);
