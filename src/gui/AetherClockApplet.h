@@ -82,7 +82,6 @@ private:
     QLabel* m_stationTag{nullptr};    // WWV / WWVH / WWVB / --
     QLabel* m_trustLine{nullptr};     // "q<quality> · <age>" decode-trust readout
     QLabel* m_boundSliceTag{nullptr}; // "▸<letter>" bound slice, running only
-    QLabel* m_daxDisplay{nullptr};    // "DAX n" inset for the relevant slice
     QLabel* m_daxWarning{nullptr};    // amber no-DAX-channel warning, under status row
     QFrame* m_settingsDrawer{nullptr};
     QPushButton* m_drawerToggle{nullptr};

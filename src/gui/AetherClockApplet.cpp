@@ -78,27 +78,6 @@ QLabel* makeSettingLabel(const QString& text, QWidget* parent)
     return label;
 }
 
-// Inset readout stylesheets (style guide inset pattern: dark well, subtle
-// border, centred text). The warn variant swaps only the text colour to amber
-// #ffb800 — the same semantic warning literal as the acquiring LED — so the DAX
-// inset can flag a running-but-no-channel bound slice without losing its chrome.
-const QString& kInsetStyle()
-{
-    static const QString s = QStringLiteral(
-        "QLabel { font-size: 11px; background: #0a0a18;"
-        " border: 1px solid #1e2e3e; border-radius: 3px;"
-        " padding: 1px 4px; color: #c8d8e8; }");
-    return s;
-}
-const QString& kInsetStyleWarn()
-{
-    static const QString s = QStringLiteral(
-        "QLabel { font-size: 11px; background: #0a0a18;"
-        " border: 1px solid #1e2e3e; border-radius: 3px;"
-        " padding: 1px 4px; color: #ffb800; }");
-    return s;
-}
-
 // Inset value readout (style guide inset pattern: dark well, subtle border,
 // centred primary text).
 QLabel* makeInsetReadout(QWidget* parent, int minWidth)
@@ -106,7 +85,10 @@ QLabel* makeInsetReadout(QWidget* parent, int minWidth)
     auto* label = new QLabel(parent);
     label->setAlignment(Qt::AlignCenter);
     label->setMinimumWidth(minWidth);
-    label->setStyleSheet(kInsetStyle());
+    label->setStyleSheet(QStringLiteral(
+        "QLabel { font-size: 11px; background: #0a0a18;"
+        " border: 1px solid #1e2e3e; border-radius: 3px;"
+        " padding: 1px 4px; color: #c8d8e8; }"));
     return label;
 }
 
@@ -312,14 +294,6 @@ void AetherClockApplet::buildUi()
 
         m_offsetValue = makeInsetReadout(this, 52);
         row->addWidget(m_offsetValue);
-
-        // DAX channel of the relevant slice (bound while running, else the
-        // selected slice). Amber when a running bound slice has no channel.
-        m_daxDisplay = makeInsetReadout(this, 40);
-        m_daxDisplay->setToolTip(
-            QStringLiteral("DAX channel — bound slice while running, "
-                           "else the selected slice"));
-        row->addWidget(m_daxDisplay);
 
         layout->addLayout(row);
     }
@@ -699,26 +673,9 @@ void AetherClockApplet::refreshDaxUi()
         m_updatingDaxFromModel = false;
     }
 
-    // A running bound slice with no DAX channel is the no-audio condition — it
-    // drives both the amber DAX inset and the warning banner.
+    // A running bound slice with no DAX channel is the no-audio condition that
+    // drives the warning banner.
     const bool noDaxWhileRunning = running && bound && bound->daxChannel() == 0;
-
-    // DAX display inset: the RELEVANT slice — bound while running, else selected.
-    if (m_daxDisplay) {
-        SliceModel* shown = (running && bound) ? bound : sel;
-        QString text;
-        if (!shown) {
-            text = QStringLiteral("--");
-        } else if (shown->daxChannel() == 0) {
-            // U+2013 en dash: slice present, no channel assigned.
-            text = QStringLiteral("DAX –");
-        } else {
-            text = QStringLiteral("DAX %1").arg(shown->daxChannel());
-        }
-        m_daxDisplay->setText(text);
-        m_daxDisplay->setStyleSheet(noDaxWhileRunning ? kInsetStyleWarn()
-                                                      : kInsetStyle());
-    }
 
     // Warning banner toggles height, so re-run the geometry path (mirroring
     // setSettingsExpanded) only when its visibility actually flips.
@@ -869,7 +826,8 @@ void AetherClockApplet::applyStaticTooltips()
     if (m_daxCombo)
         m_daxCombo->setToolTip(QStringLiteral(
             "Assign the selected slice's DAX channel (0 = Off) — the audio "
-            "path"));
+            "path. Tracks the selected slice; the warning banner flags a "
+            "running bound slice that has no channel"));
 }
 
 } // namespace AetherSDR
