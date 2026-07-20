@@ -25,6 +25,14 @@ namespace AetherSDR {
 
 namespace {
 
+// Absolute-plausibility bound handed to the shared voter (WS-4.5): a voted
+// timestamp farther than this from the host clock refuses to lock. Generous by
+// design — a host clock minutes or even hours wrong is exactly what the applet
+// measures; a decode DECADES away (the 2026-07-20 q100 lock on 2006-01-01)
+// can only be systematic misreads. Lock gating only; decodedUtc composition
+// remains host-free (no host snapping).
+constexpr int kPlausibilityBoundMinutes = 24 * 60;
+
 // Type-erasing holder so the engine can own EITHER time-signal decoder behind
 // one pointer: WwvDecoder and WwvbDecoder expose an identical surface
 // (WwvDecoder.h / WwvbDecoder.h) but share no base class. This is purely an
@@ -39,6 +47,9 @@ struct IDecoder {
     // Live decoder lock state — the decoder suppresses no-change state edges, so
     // after an engine-side lock decay handleSecond resyncs from this accessor.
     virtual ClockLockState lockState() const = 0;
+    // WS-4.5: arm the shared voter's absolute-plausibility gate.
+    virtual void setPlausibility(std::function<TimeFields()> referenceNow,
+                                 int boundMinutes) = 0;
 
     // Engine-side callbacks, forwarded from the concrete decoder's callbacks.
     std::function<void(const ClockSecondInfo&)> onSecond;
@@ -61,6 +72,10 @@ struct DecoderHolder final : IDecoder {
     ClockStation station() const override { return d.station(); }
     std::int64_t samplesConsumed() const override { return d.samplesConsumed(); }
     ClockLockState lockState() const override { return d.state(); }
+    void setPlausibility(std::function<TimeFields()> referenceNow,
+                         int boundMinutes) override {
+        d.setPlausibility(std::move(referenceNow), boundMinutes);
+    }
 };
 
 } // namespace
@@ -169,11 +184,13 @@ struct AetherClockEngine::Impl {
         f.secondOfFrame = info.secondOfFrame;
         f.envelope = QVector<float>(info.envelope.begin(), info.envelope.end());
         f.expected = QVector<float>(info.expected.begin(), info.expected.end());
-        // The decoders' 1 s alignment window is edge-anchored: the window start
-        // IS the detected AM-drop second edge (WwvDecoder.cpp: the window is cut
-        // at the tick-phase boundary and edgeSample = startJ * decim), so there
-        // is no window->edge lead to report.
-        f.edgeOffsetMs = 0;
+        // Where the received pulse sits relative to the template's nominal
+        // position (WS-4.5): ~0 on a drift-free stream, nonzero while the
+        // decoder is absorbing sample-clock drift. The display shifts the
+        // expected overlay by this so envelope and template stay honest.
+        f.edgeOffsetMs = (info.seriesRateHz > 0)
+            ? qRound(info.windowShift * 1000.0 / info.seriesRateHz)
+            : 0;
         f.symbol = static_cast<int>(info.symbol);
         f.confidence = info.confidence;
         f.station = static_cast<quint8>(static_cast<int>(decoder->station()));
@@ -302,6 +319,22 @@ void AetherClockEngine::start(SliceModel* slice, ClockStation station) {
     d.decoder->onFrame = [this](const ClockFrameInfo& fr) { m_impl->handleFrame(fr); };
     d.decoder->onTime = [this](const ClockTimeInfo& t) { m_impl->handleTime(t); };
     d.decoder->onStateChanged = [this](ClockLockState s) { m_impl->handleState(s); };
+
+    // Arm the absolute-plausibility gate with the host clock (WS-4.5). The
+    // callback fires on the feed thread inside process(); nowUtcMs is the same
+    // injectable clock the sample<->host anchor uses, so tests stay in control.
+    d.decoder->setPlausibility(
+        [this] {
+            const QDateTime now = QDateTime::fromMSecsSinceEpoch(
+                m_impl->nowUtcMs(), QTimeZone::utc());
+            TimeFields tf;
+            tf.minute = now.time().minute();
+            tf.hour = now.time().hour();
+            tf.doy = now.date().dayOfYear();
+            tf.year2 = now.date().year() % 100;
+            return tf;
+        },
+        kPlausibilityBoundMinutes);
 
     // Fresh sample<->host and frame anchors for the fresh decoder.
     d.anchorSamples = 0;

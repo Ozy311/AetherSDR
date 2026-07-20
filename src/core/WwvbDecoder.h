@@ -43,6 +43,13 @@ public:
 
     void reset();
 
+    // Arm the shared voter's absolute-plausibility gate (WS-4.5): a voted
+    // timestamp farther than boundMinutes from the reference clock refuses to
+    // lock. The engine plumbs the host clock here; default is disarmed so pure
+    // decoder use (tests, corpus runners) is reference-free.
+    void setPlausibility(std::function<TimeFields()> referenceNow,
+                         int boundMinutes);
+
     ClockLockState state() const;
     ClockStation station() const;      // always Wwvb once acquiring
     std::int64_t samplesConsumed() const;

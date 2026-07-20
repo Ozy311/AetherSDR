@@ -640,6 +640,27 @@ int main() {
         CHECK(lockTransitions == 1);
     }
 
+    // --- Section: WS-4.5 — lock demotes on signal loss, cached vote stops
+    // (Live 2026-07-20 class: a stale Locked must never be pinned; dead air
+    // demotes and the per-second cached re-emission stops with it.)
+    {
+        const auto x = synth(cleanSecs, kWwvbDropDb, /*bpsk*/false, /*sigma*/0.0, 0xD37Au);
+        WwvbDecoder d(24000);
+        Capture c; wire(d, c);
+        feedFixed(d, x, 512);
+        CHECK(d.state() == ClockLockState::Locked);      // precondition
+
+        const std::vector<float> silence(24000 * 240, 0.0f);
+        feedFixed(d, silence, 512);
+        CHECK(d.state() != ClockLockState::Locked);      // demoted, not pinned
+
+        // After the demotion no further voted times may be emitted.
+        const std::size_t nAtDemote = c.times.size();
+        const std::vector<float> moreSilence(24000 * 60, 0.0f);
+        feedFixed(d, moreSilence, 512);
+        CHECK(c.times.size() == nAtDemote);
+    }
+
     // --- Section: 16 dB envelope SNR bit-exact (assert the pinned floor)
     {
         const double sigma16 = (kCarrierAmp / std::sqrt(2.0)) / std::pow(10.0, kEnvSnrFloor / 20.0);

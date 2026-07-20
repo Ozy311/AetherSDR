@@ -14,6 +14,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace AetherSDR {
@@ -57,6 +58,12 @@ struct ClockSecondInfo {
     std::vector<float> envelope; // received amplitude series (normalized 0..1-ish)
     std::vector<float> expected; // zero-mean matched template of `symbol`
     int seriesRateHz = 0;        // 200 for WWV/WWVH, 100 for WWVB
+    // Where the received pulse actually sits relative to the template's nominal
+    // position, in series samples (matched-filter shift minus the nominal chain
+    // delay). ~0 on a drift-free stream; nonzero while the decoder is absorbing
+    // sample-clock drift — the display should shift the expected overlay by
+    // this so envelope and template stay honest to each other (WS-4.5).
+    int windowShift = 0;
 };
 
 // Emitted once per completed frame decode (raw, pre-voting).
@@ -118,9 +125,49 @@ public:
         size_t window = 8;               // sliding window of most recent frames
         int minFramesForLock = 2;        // consistent frames required for lock
         float agingFactor = 0.9f;        // per-frame-age weight multiplier
+
+        // WS-4.5 honesty gates (all default-off = pre-WS-4.5 behavior).
+        //
+        // Trust floor: a bit whose WINNING side has no single vote at/above
+        // this margin contributes zero trust (its value still composes — only
+        // the certification collapses). Rationale (2026-07-20 live false lock,
+        // decoded 2006-01-01 at q100): a deep fade zero-biases the SAME bits in
+        // EVERY window frame, so the misread is unanimous — margin 1.0, full
+        // participation — and a disagreement-based quality metric certifies it.
+        // Unanimity of noise-grade reads is not evidence; a lock-quality floor
+        // then refuses the lock. (Deliberately NOT an eligibility gate on the
+        // votes themselves: silencing noise-grade votes flips coherence
+        // verdicts and vote topology on real corpora — measured 2026-07-20.)
+        float minBitConfidence = 0.0f;
+        // locked() additionally requires the resolution quality to reach this.
+        float minLockQuality = 0.0f;
+        // Absolute-plausibility leg: when armed (bound > 0 and referenceNow
+        // set), locked() refuses any voted timestamp farther than this many
+        // minutes from the reference clock. Systematic misreads (misaligned
+        // windows, coherent zero-bias) are self-consistent by construction, so
+        // an independent reference is the only evidence that can veto them. The
+        // bound is deliberately generous — a host clock that is minutes or even
+        // hours wrong is exactly what the feature measures; a decode DECADES
+        // away can only be garbage.
+        int plausibilityBoundMinutes = 0;
+        std::function<TimeFields()> referenceNow;
+        // Staleness bound: locked() requires a range-VALID frame within the
+        // newest maxNewestValidAge window slots. Without it the voter
+        // dead-reckons: range-invalid garbage frames used to vanish from the
+        // normalized window entirely, so the surviving stale frames kept
+        // extrapolating forward (+1 min per garbage frame) at undiminished
+        // quality — the 2026-07-20 receiver emitted advancing timestamps at
+        // q1.00 for minutes after the air turned to garbage.
+        int maxNewestValidAge = 3;
     };
 
     explicit TimeFrameVoter(Config cfg);
+
+    // Arm (or replace) the absolute-plausibility reference at runtime — the
+    // engine plumbs the host clock through the owning decoder after
+    // construction. boundMinutes <= 0 or a null function disarms the gate.
+    void setPlausibility(std::function<TimeFields()> referenceNow,
+                         int boundMinutes);
 
     // Add one complete 60 s frame of classified symbols + confidences. Frames
     // MUST be consecutive broadcast minutes — the caller resets on gaps or
@@ -213,6 +260,12 @@ private:
     // locked all consume, so their view of the window is guaranteed identical.
     struct NormalizedFrame {
         int age = 0;                 // 0 = newest frame
+        // False for a frame whose raw decode fell outside valid broadcast
+        // ranges: it VOTES nothing and HOLDS nothing, but it still occupies its
+        // window slot and its real per-second confidences still count against
+        // participation — confident air that fails to form a valid timestamp
+        // is evidence AGAINST the surviving stale frames, not silence.
+        bool valid = true;
         double meanConfidence = 0.0; // frame mean over the four field maps
         TimeFields ext;              // this frame's timestamp at the newest epoch
         // Per bit of a field map: the normalized symbol and the confidence that

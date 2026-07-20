@@ -46,6 +46,23 @@ constexpr int kSeriesRate = 200;                 // decimated series rate (Hz)
 constexpr int kSecLen     = kSeriesRate;          // samples per broadcast second
 constexpr int kFrameSecs  = 60;
 
+// Nominal biquad-chain group delay at 200 Hz (~35 ms) — the matched-filter
+// shift a clean, drift-free stream settles at. The tracked delay estimate
+// starts here, and the reported second edge subtracts it back out so the edge
+// label follows REAL stream drift, not the fixed chain delay.
+constexpr int kNominalDelaySamples = 7;
+
+// Matched-filter shift search ceiling (series samples, 200 ms). Wide (WS-4.5)
+// so slow sample-clock drift is ABSORBED by the tracked delay estimate instead
+// of accumulating into systematic misreads; drift beyond the rails triggers a
+// soft resynchronization.
+constexpr int kMaxShift = 40;
+
+// Leaky tick-fold decay per hit (each phase bin is hit once per second, so
+// this is τ ≈ 100 s). The fold must FORGET a stale phase: after a sample
+// discontinuity the re-seed has to find the CURRENT tick phase, not history.
+constexpr double kFoldDecay = 0.99;
+
 // Markers (P1..P5, P0) land at seconds 9/19/29/39/49/59 — i.e. (s % 10 == 9).
 inline bool isMarkerSec(int s) { return (s % 10) == 9; }
 
@@ -136,12 +153,17 @@ struct WwvDecoder::Impl {
     bool tickLocked = false;
     int tickPhase = 0;               // series-sample index of the second edge
 
-    // Slowly-adapted matched-filter group-delay estimate (the biquad chain
-    // delay is FIXED; estimate it once confidently and track it slowly instead
-    // of re-searching freely every second, which flaps under fading/noise).
-    double delayEst = 7.0;           // samples at 200 Hz (~35 ms chain delay)
+    // Slowly-adapted matched-filter delay estimate: nominal chain group delay
+    // plus any accumulated stream drift. Tracked slowly instead of re-searched
+    // freely every second (which flaps under fading/noise); reaching the
+    // search rails means drift exceeded what the window can absorb -> soft
+    // resynchronization.
+    double delayEst = kNominalDelaySamples;   // series samples at 200 Hz
     bool delayLocked = false;
     int delayCount = 0;
+
+    // Consecutive structurally-invalid frames (marker skeleton broken).
+    int badFrameStreak = 0;
 
     // Per-second windowing at 200 Hz.
     std::array<float, kSecLen> curSec{};
@@ -188,6 +210,7 @@ struct WwvDecoder::Impl {
                   int& winShift) const;
     void tryAnchor();
     void feedPendingFrames();
+    void softReacquire();
     ClockFrameInfo decodeFrame(const std::array<int8_t, kFrameSecs>& sym,
                                const std::array<float, kFrameSecs>& conf,
                                std::int64_t frameStartSample) const;
@@ -206,6 +229,15 @@ TimeFrameVoter::Config WwvDecoder::Impl::makeVoterConfig() {
     c.window = 8;
     c.minFramesForLock = 2;
     c.agingFactor = 0.9f;
+    // WS-4.5 honesty floors: noise-grade margins (clean-signal bits run
+    // >= ~0.12 even at the pinned 20 dB SNR floor) must not vote — a deep fade
+    // zero-biases the SAME bits in every frame, and unanimity of noise-grade
+    // reads is how the 2026-07-20 receiver certified 2006-01-01 at q100. The
+    // lock-quality floor sits BELOW the dirty-but-correct band measured on the
+    // 2026-07-19 live corpus (q ~0.11-0.16) and far above unanimous-fade
+    // garbage (~0.00).
+    c.minBitConfidence = 0.05f;
+    c.minLockQuality   = 0.05f;
     return c;
 }
 
@@ -310,9 +342,11 @@ void WwvDecoder::Impl::processSample(float x) {
 void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
     const std::int64_t j = n200++;
 
-    // Fold each tick band's envelope mod 1 s.
+    // Fold each tick band's envelope mod 1 s — leaky, so a stale phase decays
+    // and a post-discontinuity re-seed finds the CURRENT phase (WS-4.5).
     int phase = static_cast<int>(j % kSecLen);
-    foldV[phase] += tickV; foldH[phase] += tickH;
+    foldV[phase] = foldV[phase] * kFoldDecay + tickV;
+    foldH[phase] = foldH[phase] * kFoldDecay + tickH;
 
     // Folded impulsiveness of a band: peak-to-mean ratio + argmax phase.
     auto stats = [](const std::array<double, kSecLen>& fold, double& ratio, int& arg) {
@@ -388,13 +422,14 @@ void WwvDecoder::Impl::classify(const std::array<float, kSecLen>& w,
     double invn = 1.0 / (vnorm + 1e-12);
 
     // Streaming biquads add a FIXED group delay the prototype's zero-phase FFT
-    // filters did not, so the received pulse sits a few samples late. All three
-    // 170/470/770 ms templates are correlated at a COMMON start-shift each
-    // second (a fair duration comparison — a longer template never wins on a
-    // short pulse), and the shift is picked to best explain the second. Once the
-    // delay estimate has settled, the search is constrained to a narrow band
-    // around it so the alignment can't flap second-to-second under fading.
-    constexpr int kMaxShift = 16;    // <= 80 ms of group-delay slack
+    // filters did not, so the received pulse sits a few samples late — and any
+    // sample-clock drift between the DAX stream and true UTC seconds shifts it
+    // further. All three 170/470/770 ms templates are correlated at a COMMON
+    // start-shift each second (a fair duration comparison — a longer template
+    // never wins on a short pulse), and the shift is picked to best explain the
+    // second. Once the delay estimate has settled, the search is constrained to
+    // a narrow band around it so the alignment can't flap second-to-second
+    // under fading, while the estimate itself keeps tracking slow drift.
     int lo = 0, hi = kMaxShift;
     if (delayLocked) {
         int c = static_cast<int>(std::lround(delayEst));
@@ -431,18 +466,33 @@ void WwvDecoder::Impl::processSecond(std::int64_t startJ,
     int8_t sym; float conf; int winShift = 0;
     classify(w, sym, conf, winShift);
 
-    // Slowly adapt the fixed group-delay estimate toward the alignment that
-    // confident seconds actually used; freeze the search band once it settles.
+    // Slowly adapt the delay estimate toward the alignment that confident
+    // seconds actually used; constrain the search band once it settles. The
+    // estimate keeps moving after settling — that is what absorbs slow
+    // sample-clock drift (WS-4.5).
     if (conf > 0.12f) {
         delayEst = 0.85 * delayEst + 0.15 * winShift;
         if (++delayCount >= 4) delayLocked = true;
+    }
+
+    // Drift beyond the search rails cannot be absorbed — the window itself is
+    // wrong. Resynchronize instead of degrading into systematic misreads (the
+    // 2026-07-20 misalignment failure mode).
+    if (delayLocked && (delayEst < 1.5 || delayEst > kMaxShift - 1.5)) {
+        softReacquire();
+        return;
     }
 
     double emean = 0.0;
     for (float v : w) emean += v;
     emean /= kSecLen;
 
-    const std::int64_t edgeSample = startJ * decim;
+    // The second-edge label subtracts the nominal chain delay back out of the
+    // matched shift, so it tracks REAL stream drift: on a clean drift-free
+    // stream winShift ~= kNominalDelaySamples and this reduces to the window
+    // start, unchanged from pre-WS-4.5 behavior.
+    const std::int64_t edgeSample =
+        (startJ + (winShift - kNominalDelaySamples)) * decim;
     const std::int64_t k = secIndex;
     int secOfFrame = anchored
         ? static_cast<int>(((k - anchorSec0) % kFrameSecs + kFrameSecs) % kFrameSecs)
@@ -459,6 +509,7 @@ void WwvDecoder::Impl::processSecond(std::int64_t startJ,
         info.confidence = conf;
         info.secondOfFrame = secOfFrame;
         info.seriesRateHz = kSeriesRate;
+        info.windowShift = winShift - kNominalDelaySamples;
         info.envelope.resize(kSecLen);
         double s = (aScale > 1e-9) ? (1.0 / aScale) : 0.0;
         for (int n = 0; n < kSecLen; ++n)
@@ -558,6 +609,28 @@ void WwvDecoder::Impl::feedPendingFrames() {
         ClockFrameInfo frame = decodeFrame(sym, conf, frameStartSample);
         if (owner && owner->onFrame) owner->onFrame(frame);
 
+        // Structural re-validation (WS-4.5): the marker skeleton is the frame's
+        // ground truth — a healthy frame has its 6 P markers on the 9s and
+        // nowhere else. A STREAK of broken-skeleton frames means the current
+        // window/anchor is systematically wrong (sample discontinuity,
+        // accumulated drift) — resynchronize rather than decode garbage
+        // forever. Individual noisy frames still VOTE below: their bits carry
+        // usable signal and pruning them thins the window the fade rescue
+        // needs (measured on the 2026-07-19 live corpus — the voter's own
+        // range/staleness/trust gates absorb per-frame noise).
+        int mkOk = 0, mkFalse = 0;
+        for (int s = 0; s < kFrameSecs; ++s) {
+            if (sym[s] == 2) (isMarkerSec(s) ? mkOk : mkFalse) += 1;
+        }
+        if (mkOk < 4 || mkFalse > 5) {
+            if (++badFrameStreak >= 3) {
+                softReacquire();
+                return;
+            }
+        } else {
+            badFrameStreak = 0;
+        }
+
         // Feed the cross-frame voter (markers excluded internally).
         voter.addFrame(vsym, conf);
         if (voter.locked()) {
@@ -574,10 +647,37 @@ void WwvDecoder::Impl::feedPendingFrames() {
                 t.station = station;
                 owner->onTime(t);
             }
+        } else if (state == ClockLockState::Locked) {
+            // The voter no longer certifies a timestamp: demote instead of
+            // pinning a stale Locked (the decoder is the lock authority the
+            // engine's state resync trusts — WS-4.5).
+            setState(ClockLockState::Acquiring);
         }
 
         nextFrameStartK += kFrameSecs;
     }
+}
+
+void WwvDecoder::Impl::softReacquire() {
+    // Forget every timing estimate; keep the warm filters, the leaky tick fold
+    // (already integrating the CURRENT phase, which is what makes re-lock
+    // fast), the station tag, and the sample counter. Called when structure
+    // proves the current window/anchor wrong.
+    tickLocked = false;
+    curFill = 0;
+    secStarted = false;
+    secStartJ = 0;
+    delayEst = kNominalDelaySamples;
+    delayLocked = false;
+    delayCount = 0;
+    recs.clear();
+    recBase = secIndex;
+    anchored = false;
+    anchorSec0 = 0;
+    nextFrameStartK = 0;
+    badFrameStreak = 0;
+    voter.reset();
+    if (state != ClockLockState::NoSignal) setState(ClockLockState::Acquiring);
 }
 
 ClockFrameInfo WwvDecoder::Impl::decodeFrame(
@@ -628,7 +728,8 @@ void WwvDecoder::Impl::reset() {
     accA = accTickV = accTickH = 0.0; decCount = 0; n200 = 0;
     foldV.fill(0.0); foldH.fill(0.0);
     tickLocked = false; tickPhase = 0;
-    delayEst = 7.0; delayLocked = false; delayCount = 0;
+    delayEst = kNominalDelaySamples; delayLocked = false; delayCount = 0;
+    badFrameStreak = 0;
     curFill = 0; secStarted = false; secStartJ = 0; aScale = 1e-6;
     recs.clear(); recBase = 0; secIndex = 0;
     anchored = false; anchorSec0 = 0; nextFrameStartK = 0;
@@ -656,6 +757,11 @@ void WwvDecoder::process(const float* mono, std::size_t n) {
 }
 
 void WwvDecoder::reset() { m_impl->reset(); }
+
+void WwvDecoder::setPlausibility(std::function<TimeFields()> referenceNow,
+                                 int boundMinutes) {
+    m_impl->voter.setPlausibility(std::move(referenceNow), boundMinutes);
+}
 
 ClockLockState WwvDecoder::state() const { return m_impl->state; }
 ClockStation WwvDecoder::station() const { return m_impl->station; }

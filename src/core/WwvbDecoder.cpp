@@ -120,6 +120,12 @@ struct WwvbDecoder::Impl {
         c.fields[TimeFrameVoter::FieldYear] =
             {{45, 80}, {46, 40}, {47, 20}, {48, 10}, {50, 8}, {51, 4}, {52, 2}, {53, 1}};
         c.markerSeconds = {0, 9, 19, 29, 39, 49, 59};
+        // WS-4.5 honesty floors (shared rationale with WwvDecoder): noise-grade
+        // margins must not vote, and a window whose trust collapsed must not
+        // lock — unanimity of systematic misreads is not evidence. Floors match
+        // WwvDecoder's (calibrated on the 2026-07-19 live WWV corpus).
+        c.minBitConfidence = 0.05f;
+        c.minLockQuality   = 0.05f;
         return c;
     }
 
@@ -463,6 +469,14 @@ struct WwvbDecoder::Impl {
             votedQuality = voter.lockConfidence();
             haveVoted = true;
             setLockState(ClockLockState::Locked);
+        } else {
+            // WS-4.5: the voter no longer certifies a timestamp — stop the
+            // per-second cached re-emission and demote a stale Locked instead
+            // of pinning it (the decoder is the lock authority the engine's
+            // state resync trusts).
+            haveVoted = false;
+            if (lockState == ClockLockState::Locked)
+                setLockState(ClockLockState::Acquiring);
         }
     }
 
@@ -606,6 +620,11 @@ WwvbDecoder::~WwvbDecoder() = default;
 
 void WwvbDecoder::process(const float* mono, std::size_t n) { m_impl->process(mono, n); }
 void WwvbDecoder::reset() { m_impl->reset(); }
+
+void WwvbDecoder::setPlausibility(std::function<TimeFields()> referenceNow,
+                                  int boundMinutes) {
+    m_impl->voter.setPlausibility(std::move(referenceNow), boundMinutes);
+}
 
 ClockLockState WwvbDecoder::state() const { return m_impl->lockState; }
 

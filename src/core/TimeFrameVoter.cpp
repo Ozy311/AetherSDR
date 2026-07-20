@@ -41,6 +41,16 @@ inline bool isLeapYear2(int year2) {
     return (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0);
 }
 
+// Absolute minute count of a range-valid timestamp since 2000-001T00:00, under
+// the same 20xx century assumption. Used only for plausibility DIFFERENCES, so
+// the epoch choice is arbitrary as long as both sides share it.
+inline long long minutesSince2000(const TimeFields& t) {
+    long long days = 0;
+    for (int y = 0; y < t.year2; ++y) days += isLeapYear2(y) ? 366 : 365;
+    days += t.doy - 1;
+    return ((days * 24 + t.hour) * 60) + t.minute;
+}
+
 } // namespace
 
 // Forward calendar arithmetic with minute/hour/doy/year carries. `minutes` is
@@ -63,6 +73,12 @@ TimeFields advanceMinutes(TimeFields t, int minutes) {
 }
 
 TimeFrameVoter::TimeFrameVoter(Config cfg) : m_cfg(std::move(cfg)) {}
+
+void TimeFrameVoter::setPlausibility(std::function<TimeFields()> referenceNow,
+                                     int boundMinutes) {
+    m_cfg.referenceNow = std::move(referenceNow);
+    m_cfg.plausibilityBoundMinutes = boundMinutes;
+}
 
 void TimeFrameVoter::addFrame(const std::array<ClockSymbol, 60>& symbols,
                               const std::array<float, 60>& confidence) {
@@ -155,18 +171,41 @@ TimeFrameVoter::buildNormalizedFrames() const {
         raw.year2  = decodeField(f, FieldYear);
 
         // Whole-frame range gate — a frame decoding outside valid broadcast
-        // ranges is excluded, the same spirit as excluding Marker/Unknown from a
-        // bit vote. (Guards the calendar arithmetic below, too.)
-        if (raw.minute < 0 || raw.minute > 59) continue;
-        if (raw.hour   < 0 || raw.hour   > 23) continue;
-        if (raw.doy    < 1 || raw.doy    > 366) continue;
-        if (raw.year2  < 0 || raw.year2  > 99) continue;
-        // doy 366 is only ever broadcast in a leap year. Accepting it in a
+        // ranges votes nothing and holds nothing (same spirit as excluding
+        // Marker/Unknown from a bit vote; also guards the calendar arithmetic
+        // below). It is NOT dropped from the window (WS-4.5): it keeps its slot
+        // and its real per-second confidences count against participation, so a
+        // run of garbage frames drags quality down instead of letting the
+        // surviving stale frames dead-reckon at undiminished quality.
+        // doy 366 is only ever broadcast in a leap year — accepting it in a
         // non-leap year would let advanceMinutes wrap a corrupt frame into
-        // January of the next year (doy 366 > 365 = year length) — even at age 0,
-        // where the wrap loop still runs — polluting the vote with an off-air
-        // date. Gate it out with the rest of the range-invalid frames.
-        if (raw.doy == 366 && !isLeapYear2(raw.year2)) continue;
+        // January of the next year, polluting the vote with an off-air date.
+        const bool rangeValid =
+            raw.minute >= 0 && raw.minute <= 59 &&
+            raw.hour   >= 0 && raw.hour   <= 23 &&
+            raw.doy    >= 1 && raw.doy    <= 366 &&
+            raw.year2  >= 0 && raw.year2  <= 99 &&
+            !(raw.doy == 366 && !isLeapYear2(raw.year2));
+
+        if (!rangeValid) {
+            NormalizedFrame nf;
+            nf.age = age;
+            nf.valid = false;
+            nf.meanConfidence = 0.0;
+            for (std::size_t fld = 0; fld < FieldCount; ++fld) {
+                const ClockFieldMap& map = m_cfg.fields[fld];
+                std::vector<NormalizedFrame::Bit>& dst = nf.bits[fld];
+                dst.resize(map.size());
+                for (std::size_t k = 0; k < map.size(); ++k) {
+                    const int sec = map[k].second;
+                    dst[k].symbol = ClockSymbol::Unknown;   // votes nothing
+                    dst[k].confidence =
+                        (sec >= 0 && sec < 60) ? f.confidence[sec] : 0.0f;
+                }
+            }
+            out.push_back(std::move(nf));
+            continue;
+        }
 
         NormalizedFrame nf;
         nf.age = age;
@@ -199,6 +238,12 @@ TimeFrameVoter::buildNormalizedFrames() const {
                 // per-second confidences — a faded bit carries a low matched-
                 // filter margin and loses the cross-frame vote. This is the
                 // reference model that rescues single-bit fades in noisy corpora.
+                // Note (WS-4.5): noise-grade margins still VOTE here — silencing
+                // them flips coherence verdicts and vote topology on real
+                // corpora (measured 2026-07-20 on the live WWV corpus). Their
+                // honesty cost is charged in TRUST instead: a bit whose winning
+                // side has no confident support scores zero trust
+                // (computeResolution), which is what refuses the lock.
                 for (std::size_t k = 0; k < map.size(); ++k) {
                     const int sec = map[k].second;
                     const bool inRange = sec >= 0 && sec < 60;
@@ -210,7 +255,13 @@ TimeFrameVoter::buildNormalizedFrames() const {
                 // NORMALIZED value and weight every bit by the field-MIN original
                 // confidence, so a value whose weakest bit faded votes at that
                 // faded margin. Blending is thus confined to normalized space,
-                // where the frames are supposed to agree.
+                // where the frames are supposed to agree. The eligibility floor
+                // deliberately does NOT apply here: the field-MIN weighting
+                // already discounts a faded frame to near-zero, and silencing it
+                // outright guts the fade rescue on minutes (every frame takes
+                // this path for minutes) — measured on the 2026-07-19 live WWV
+                // corpus, where the floor flipped the voted minute to the
+                // newest frame's corrupt raw value.
                 const std::vector<ClockSymbol> bits = encodeField(map, extByField[fld]);
                 const float w = fieldMinConf(f, static_cast<FieldIndex>(fld));
                 for (std::size_t k = 0; k < map.size(); ++k) {
@@ -285,6 +336,7 @@ TimeFrameVoter::Resolution TimeFrameVoter::computeResolution() const {
         int composeValue = 0;
 
         for (const NormalizedFrame& nf : frames) {
+            if (!nf.valid) continue;   // holds no value
             float fmin = -1.0f;
             for (const auto& b : nf.bits[fld]) {
                 fmin = (fmin < 0.0f) ? b.confidence : std::min(fmin, b.confidence);
@@ -298,6 +350,7 @@ TimeFrameVoter::Resolution TimeFrameVoter::computeResolution() const {
         for (std::size_t k = 0; k < map.size(); ++k) {
             BitStat s;
             double pAct = 0.0, pPot = 0.0;
+            float bestConf0 = 0.0f, bestConf1 = 0.0f;
             for (const NormalizedFrame& nf : frames) {
                 const NormalizedFrame::Bit b = nf.bits[fld][k];
                 const double aged =
@@ -308,11 +361,24 @@ TimeFrameVoter::Resolution TimeFrameVoter::computeResolution() const {
                     (b.symbol == ClockSymbol::One ? s.w1 : s.w0) += confW;
                     (b.symbol == ClockSymbol::One ? s.c1 : s.c0) += aged;
                     pAct += confW;
+                    float& best = (b.symbol == ClockSymbol::One) ? bestConf1
+                                                                 : bestConf0;
+                    best = std::max(best, b.confidence);
                 }
             }
             s.participation = pPot > 0.0 ? pAct / pPot : 0.0;
 
-            const double trust = bitMargin(s) * s.participation;
+            // Trust floor (WS-4.5): a bit whose WINNING side has not one vote
+            // at a confident margin is certified by nothing but noise — a deep
+            // fade misreads the SAME bits in every frame, and unanimity of
+            // noise-grade reads must not score margin-1.0 trust (the
+            // 2026-07-20 q100-on-2006-01-01 mechanism). The vote itself is
+            // untouched; only its certification collapses.
+            const float winnerBest = (s.w1 > s.w0) ? bestConf1 : bestConf0;
+            const bool certified = m_cfg.minBitConfidence <= 0.0f ||
+                                   winnerBest >= m_cfg.minBitConfidence;
+            const double trust =
+                certified ? bitMargin(s) * s.participation : 0.0;
             if (bitCoherent(s)) {
                 minCoherentTrust = std::min(minCoherentTrust, trust);
             } else {
@@ -367,6 +433,7 @@ TimeFrameVoter::Resolution TimeFrameVoter::computeResolution() const {
         const NormalizedFrame* best = nullptr;
         double bestWeight = -1.0;
         for (const NormalizedFrame& nf : frames) {
+            if (!nf.valid) continue;   // never fall back onto a garbage tuple
             const double w = agedWeight(static_cast<float>(nf.meanConfidence),
                                         m_cfg.agingFactor, nf.age);
             if (w > bestWeight) { bestWeight = w; best = &nf; }
@@ -439,6 +506,23 @@ bool TimeFrameVoter::locked() const {
     if (frames.empty()) {
         return false;
     }
+
+    // Staleness bound (WS-4.5): a lock needs a range-VALID frame among the
+    // newest maxNewestValidAge slots. Without this the window dead-reckons on
+    // aged frames while garbage streams in — the vote keeps extrapolating
+    // forward with no live support.
+    if (m_cfg.maxNewestValidAge >= 0) {
+        bool fresh = false;
+        for (const NormalizedFrame& nf : frames) {
+            if (nf.valid && nf.age <= m_cfg.maxNewestValidAge) {
+                fresh = true;
+                break;
+            }
+        }
+        if (!fresh) {
+            return false;
+        }
+    }
     for (std::size_t fi = FieldHours; fi <= FieldYear; ++fi) {
         const ClockFieldMap& map = m_cfg.fields[fi];
         double margin = 0.0;
@@ -455,6 +539,43 @@ bool TimeFrameVoter::locked() const {
         }
         if (!(margin > 0.0)) {
             return false;
+        }
+    }
+
+    // WS-4.5 honesty gates. Both consume the SAME resolution votedField and
+    // lockConfidence report, so a refused lock is always explicable from the
+    // published value/quality pair.
+    if (m_cfg.minLockQuality > 0.0f || (m_cfg.plausibilityBoundMinutes > 0 &&
+                                        m_cfg.referenceNow)) {
+        const Resolution res = computeResolution();
+
+        // Quality floor: unanimity of ineligible (noise-grade) bits shows up
+        // here as collapsed participation -> collapsed trust.
+        if (m_cfg.minLockQuality > 0.0f &&
+            res.quality < static_cast<double>(m_cfg.minLockQuality)) {
+            return false;
+        }
+
+        // Absolute plausibility: a self-consistent decode implausibly far from
+        // the reference clock is vetoed by the only independent evidence there
+        // is. Fields of `res.value` are range-valid by construction (both the
+        // compose and its fallback pass the range gates), so the calendar
+        // arithmetic is safe.
+        if (m_cfg.plausibilityBoundMinutes > 0 && m_cfg.referenceNow) {
+            const TimeFields ref = m_cfg.referenceNow();
+            const bool refValid =
+                ref.minute >= 0 && ref.minute <= 59 &&
+                ref.hour   >= 0 && ref.hour   <= 23 &&
+                ref.doy    >= 1 && ref.doy    <= 366 &&
+                ref.year2  >= 0 && ref.year2  <= 99;
+            if (refValid) {
+                const long long diff =
+                    minutesSince2000(res.value) - minutesSince2000(ref);
+                const long long bound = m_cfg.plausibilityBoundMinutes;
+                if (diff > bound || diff < -bound) {
+                    return false;
+                }
+            }
         }
     }
 

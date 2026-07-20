@@ -903,6 +903,310 @@ void sectionVoterLoneVoterParticipation() {
     CHECK(q <= 0.35f);   // participation ~0.291 caps it; round-3 read ~1.0
 }
 
+// [wwv.voter.unanimous-fade] WS-4.5 regression for the 2026-07-20 live false
+// lock (decoded 2006-01-01 at q100): a deep fade zero-biased the SAME date bits
+// in EVERY window frame — doy 201 -> 001 (s36/s38/s40 lost), year 26 -> 06
+// (s52 lost) — so the wrongness was unanimous: margin 1.0, full participation,
+// and the disagreement-based quality metric certified confident garbage at
+// ~1.0. With the eligibility floor (minBitConfidence) noise-grade bits stop
+// voting entirely: participation collapses, the affected fields' trust goes to
+// ~0, and the minLockQuality gate refuses the lock.
+void sectionVoterUnanimousFadeNoConfidentGarbage() {
+    constexpr float C  = 0.35f;   // healthy bits
+    constexpr float LO = 0.02f;   // deep-fade margin — noise-grade
+
+    auto fadedFrame = [](int mn) {
+        return wwvNoisyFrame(mn, 3, 201, 26, C,
+                             {{36, ClockSymbol::Zero, LO},
+                              {38, ClockSymbol::Zero, LO},
+                              {40, ClockSymbol::Zero, LO},
+                              {52, ClockSymbol::Zero, LO}});
+    };
+
+    // (a) With the production floors armed the unanimously-faded window must
+    //     not lock, and quality must say why.
+    TimeFrameVoter::Config hardened = wwvVoterConfig();
+    hardened.minBitConfidence = 0.05f;
+    hardened.minLockQuality   = 0.10f;
+    TimeFrameVoter v(hardened);
+    for (int mn = 45; mn <= 52; ++mn) {
+        const auto [syms, conf] = fadedFrame(mn);
+        v.addFrame(syms, conf);
+    }
+    CHECK(!v.locked());                 // the 2006-01-01 event must not lock
+    CHECK(v.lockConfidence() < 0.10f);
+
+    // (b) The same window through a floors-off voter locks at high quality —
+    //     pinning that the gate is what kills the live failure mode.
+    TimeFrameVoter legacy(wwvVoterConfig());
+    for (int mn = 45; mn <= 52; ++mn) {
+        const auto [syms, conf] = fadedFrame(mn);
+        legacy.addFrame(syms, conf);
+    }
+    CHECK(legacy.locked());
+    CHECK(legacy.lockConfidence() > 0.9f);
+
+    // (c) The floors must not break a CLEAN window: same minutes, no fade.
+    TimeFrameVoter cleanV(hardened);
+    std::array<float, 60> conf;
+    conf.fill(C);
+    for (int mn = 45; mn <= 52; ++mn)
+        cleanV.addFrame(wwvVoterFrame(mn, 3, 201, 26), conf);
+    CHECK(cleanV.locked());
+    CHECK(cleanV.votedField(TimeFrameVoter::FieldDoy)  == 201);
+    CHECK(cleanV.votedField(TimeFrameVoter::FieldYear) == 26);
+    CHECK(cleanV.lockConfidence() > 0.5f);
+}
+
+// [wwv.voter.plausibility] Absolute-plausibility leg (WS-4.5): even a
+// confident, unanimous, self-consistent decode must not lock when the voted
+// timestamp is implausibly far from the reference clock. Systematic misreads
+// are self-consistent by construction — the reference is the only independent
+// evidence. The bound is generous: a host minutes or hours wrong still
+// measures; decades cannot lock.
+void sectionVoterPlausibilityGate() {
+    constexpr float C = 0.35f;
+    std::array<float, 60> conf;
+    conf.fill(C);
+
+    const TimeFields ref{50, 3, 201, 26};   // "host now": 03:50 doy 201 yr 26
+
+    TimeFrameVoter::Config gated = wwvVoterConfig();
+    gated.plausibilityBoundMinutes = 24 * 60;
+    gated.referenceNow = [ref] { return ref; };
+
+    // (a) Confident garbage 20 years out (the live event): must not lock.
+    TimeFrameVoter garbage(gated);
+    for (int mn = 45; mn <= 52; ++mn)
+        garbage.addFrame(wwvVoterFrame(mn, 3, 1, 6), conf);   // 2006-01-01
+    CHECK(!garbage.locked());
+
+    // (b) A host ~40 minutes wrong is WITHIN the bound — measuring that error
+    //     is the applet's purpose, so this must still lock.
+    TimeFrameVoter hostSlow(gated);
+    for (int mn = 10; mn <= 17; ++mn)
+        hostSlow.addFrame(wwvVoterFrame(mn, 3, 201, 26), conf);
+    CHECK(hostSlow.locked());
+    CHECK(hostSlow.votedField(TimeFrameVoter::FieldMinutes) == 17);
+
+    // (c) Gate disarmed (bound 0, the default): back-compat is explicit.
+    TimeFrameVoter ungated(wwvVoterConfig());
+    for (int mn = 45; mn <= 52; ++mn)
+        ungated.addFrame(wwvVoterFrame(mn, 3, 1, 6), conf);
+    CHECK(ungated.locked());
+
+    // (d) Bound edge: one day out (1438 min at the newest frame) locks at a
+    //     24 h bound; two days out does not.
+    TimeFrameVoter atEdge(gated);
+    for (int mn = 45; mn <= 52; ++mn)
+        atEdge.addFrame(wwvVoterFrame(mn, 3, 200, 26), conf);
+    CHECK(atEdge.locked());
+    TimeFrameVoter pastEdge(gated);
+    for (int mn = 45; mn <= 52; ++mn)
+        pastEdge.addFrame(wwvVoterFrame(mn, 3, 199, 26), conf);
+    CHECK(!pastEdge.locked());
+
+    // (e) setPlausibility arms the gate on a default-constructed config too.
+    TimeFrameVoter armed(wwvVoterConfig());
+    armed.setPlausibility([ref] { return ref; }, 24 * 60);
+    for (int mn = 45; mn <= 52; ++mn)
+        armed.addFrame(wwvVoterFrame(mn, 3, 1, 6), conf);
+    CHECK(!armed.locked());
+}
+
+// [wwv.voter.dead-reckoning] Garbage frames must not let the voter free-run on
+// the stale survivors: pre-WS-4.5, a range-invalid frame (the all-zeros decode
+// a misaligned window produces; doy 0 is invalid) vanished from the normalized
+// window entirely, so the aged good frames kept extrapolating +1 min per
+// garbage frame at q1.00 — advancing timestamps with zero live support (the
+// live receiver did exactly this after its window drifted). The staleness
+// bound caps the free-run; participation accounting drags the quality down.
+void sectionVoterNoDeadReckoning() {
+    constexpr float C = 0.35f;
+    std::array<float, 60> conf;
+    conf.fill(C);
+
+    TimeFrameVoter v(wwvVoterConfig());
+    for (int mn = 10; mn <= 14; ++mn)
+        v.addFrame(wwvVoterFrame(mn, 6, 200, 26), conf);
+    CHECK(v.locked());
+
+    // Confident garbage: every second Zero at margin C -> minute 0, hour 0,
+    // doy 0 (range-invalid) — the all-zeros shape a misaligned window decodes.
+    std::array<ClockSymbol, 60> zeros{};
+    zeros.fill(ClockSymbol::Zero);
+    int locksAfterGarbage = 0;
+    for (int g = 0; g < 6; ++g) {
+        v.addFrame(zeros, conf);
+        if (v.locked()) ++locksAfterGarbage;
+    }
+    CHECK(!v.locked());                  // stale window must not stay locked
+    CHECK(locksAfterGarbage <= 3);       // free-run bounded by the staleness age
+}
+
+// ---- WS-4.5 decoder-level hardening ---------------------------------------
+
+// [wwv.demote] Lock must not survive the signal: after a clean lock, dead air
+// must demote the decoder out of Locked. (Live 2026-07-20: the applet pinned
+// Locked q100 for 45 minutes of stale decode — nothing in the decoder could
+// ever lower the state once set.)
+void sectionLockDemotesOnSignalLoss() {
+    SynthOpts opts;
+    opts.numFrames = 5;
+    const std::vector<float> clean = synthWwv(kGold, opts);
+
+    WwvDecoder dec(kFs);
+    Capture cap; wire(dec, cap);
+    feedChunks(dec, clean, 512);
+    CHECK(dec.state() == ClockLockState::Locked);       // precondition
+
+    const std::vector<float> silence(static_cast<size_t>(kFs) * 300, 0.0f);
+    feedChunks(dec, silence, 512);
+    CHECK(dec.state() != ClockLockState::Locked);       // demoted, not pinned
+}
+
+// [wwv.gap] A sample-stream discontinuity (dropped DAX buffers) must not
+// permanently derail the decoder: pre-WS-4.5 the tick phase and frame anchor
+// were estimated once and frozen, so a 300 ms gap misaligned every subsequent
+// window — confident systematic misreads forever (the live white-vs-blue
+// drift). Structural re-validation detects it, soft reacquire + the leaky
+// fold re-lock on the CURRENT phase, and the decoder is locked on truth again
+// by the end.
+void sectionGapRealignsAndRelocks() {
+    SynthOpts opts;
+    opts.numFrames = 18;
+    opts.leadOutSeconds = 30;
+    const Truth t{10, 6, 200, 26, -3, true, false, true};
+    const std::vector<float> full = synthWwv(t, opts);
+
+    // 10 s lead-in + 5.5 frames -> cut 300 ms mid-minute.
+    const size_t cutAt = static_cast<size_t>(kFs) * (10 + 5 * 60 + 30);
+    const size_t gap = static_cast<size_t>(kFs) * 3 / 10;
+
+    WwvDecoder dec(kFs);
+    Capture cap; wire(dec, cap);
+    dec.process(full.data(), cutAt);
+    CHECK(dec.state() == ClockLockState::Locked);        // locked pre-gap
+
+    const std::vector<float> tail(full.begin() + static_cast<long>(cutAt + gap),
+                                  full.end());
+    feedChunks(dec, tail, 512);
+
+    CHECK(dec.state() == ClockLockState::Locked);        // re-locked post-heal
+    CHECK(!cap.times.empty());
+    const ClockTimeInfo& last = cap.times.back();
+    CHECK(last.hour == 6);
+    CHECK(last.doy == 200);
+    CHECK(last.year2 == 26);
+    CHECK(last.minute >= t.minute + 11 && last.minute <= t.minute + 17);
+    CHECK(last.quality > 0.1f);
+
+    // The re-lock must be LIVE decode, not dead reckoning: post-heal FRAMES
+    // (raw, pre-voting) must decode the on-air truth again. (The old decoder
+    // decoded all-zeros forever here while the voter free-ran — a voted time
+    // in range proved nothing by itself.)
+    bool liveDecodePostGap = false;
+    for (const ClockFrameInfo& f : cap.frames) {
+        if (f.minute >= t.minute + 11 && f.minute <= t.minute + 17 &&
+            f.hour == 6 && f.doy == 200 && f.year2 == 26) {
+            liveDecodePostGap = true;
+        }
+    }
+    CHECK(liveDecodePostGap);
+}
+
+// [wwv.drift] Slow sample-clock drift must be ABSORBED, not accumulated into
+// misreads: +5 ms of stream slip every 20 s (~250 ppm, far beyond any real
+// DAX rate offset) from minute 3 on. The old 80 ms matched-filter cap froze
+// the alignment and turned accumulated drift into the live receiver's
+// systematic misreads; the tracked delay estimate must follow the drift,
+// keep the decode exact and hold the lock the whole way.
+void sectionSlowDriftHoldsLock() {
+    SynthOpts opts;
+    opts.numFrames = 10;
+    opts.leadOutSeconds = 20;
+    const Truth t{30, 6, 200, 26, -3, true, false, true};
+    const std::vector<float> base = synthWwv(t, opts);
+
+    std::vector<float> drifty;
+    drifty.reserve(base.size() + base.size() / 100);
+    const size_t insEvery = static_cast<size_t>(kFs) * 20;
+    size_t nextIns = static_cast<size_t>(kFs) * (10 + 3 * 60);
+    for (size_t i = 0; i < base.size(); ++i) {
+        if (i == nextIns) {
+            drifty.insert(drifty.end(), 120, 0.0f);   // +5 ms of stream slip
+            nextIns += insEvery;
+        }
+        drifty.push_back(base[i]);
+    }
+
+    WwvDecoder dec(kFs);
+    Capture cap; wire(dec, cap);
+    feedChunks(dec, drifty, 512);
+
+    CHECK(dec.state() == ClockLockState::Locked);
+    CHECK(!cap.times.empty());
+    const ClockTimeInfo& last = cap.times.back();
+    CHECK(last.minute == t.minute + opts.numFrames - 1);   // exact to the end
+    CHECK(last.hour == 6);
+    CHECK(last.doy == 200);
+    CHECK(last.year2 == 26);
+
+    // The absorbed drift must not have cost the lock even transiently.
+    bool sawLock = false, demotedAfterLock = false;
+    for (ClockLockState s : cap.states) {
+        if (s == ClockLockState::Locked) sawLock = true;
+        else if (sawLock) demotedAfterLock = true;
+    }
+    CHECK(sawLock);
+    CHECK(!demotedAfterLock);
+
+    // Edge labels must TRACK the drift, not the frozen window grid: the span
+    // between frame s0 edges of minute 30 and minute 39 covers 9 broadcast
+    // minutes PLUS the 18-19 slips inserted between them (the insertion at the
+    // exact minute-39 boundary is ±1). The old fixed-grid labels missed by the
+    // full accumulated drift (~90-110 ms); the compensated labels stay within
+    // a few series samples. (Constant chain-delay bias cancels in the span.)
+    const ClockFrameInfo* f30 = nullptr;
+    const ClockFrameInfo* f39 = nullptr;
+    for (const ClockFrameInfo& f : cap.frames) {
+        if (f.minute == 30 && !f30) f30 = &f;
+        if (f.minute == 39) f39 = &f;
+    }
+    CHECK(f30 != nullptr && f39 != nullptr);
+    if (f30 && f39) {
+        const long long trueSpan = 9LL * 60 * kFs + 18LL * 120;
+        const long long measured = f39->frameStartSample - f30->frameStartSample;
+        const long long tolerance = 6LL * (kFs / 200) + 120;   // 30 ms + slip ambiguity
+        CHECK(std::llabs(measured - trueSpan) <= tolerance);
+    }
+}
+
+// [wwv.plumb-plausibility] setPlausibility reaches the shared voter: a signal
+// broadcasting a date 20 years from the reference must never lock, while the
+// same signal locks against a matching reference. (Gate semantics are
+// unit-tested at the voter level; this pins the decoder plumbing.)
+void sectionDecoderPlausibilityPlumbing() {
+    SynthOpts opts;
+    opts.numFrames = 4;
+    const Truth wrongEra{20, 6, 1, 6, 0, false, false, false};   // 2006-001
+    const std::vector<float> sig = synthWwv(wrongEra, opts);
+
+    WwvDecoder rej(kFs);
+    rej.setPlausibility([] { return TimeFields{50, 3, 201, 26}; }, 24 * 60);
+    Capture capR; wire(rej, capR);
+    feedChunks(rej, sig, 512);
+    CHECK(rej.state() != ClockLockState::Locked);
+    CHECK(capR.times.empty());
+
+    WwvDecoder acc(kFs);
+    acc.setPlausibility([] { return TimeFields{21, 6, 1, 6}; }, 24 * 60);
+    Capture capA; wire(acc, capA);
+    feedChunks(acc, sig, 512);
+    CHECK(acc.state() == ClockLockState::Locked);
+    CHECK(!capA.times.empty());
+}
+
 } // namespace
 
 int main() {
@@ -927,6 +1231,13 @@ int main() {
     sectionVoterDoy366Gate();
     sectionVoterFrankenstein();
     sectionVoterLoneVoterParticipation();
+    sectionVoterUnanimousFadeNoConfidentGarbage();
+    sectionVoterPlausibilityGate();
+    sectionVoterNoDeadReckoning();
+    sectionLockDemotesOnSignalLoss();
+    sectionGapRealignsAndRelocks();
+    sectionSlowDriftHoldsLock();
+    sectionDecoderPlausibilityPlumbing();
 
     // Print encoded truth for the python cross-check gate.
     std::printf("golden truth: min=%d hr=%d doy=%d yr=%d frames=%d\n",
