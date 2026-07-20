@@ -174,16 +174,16 @@ public:
     // Raw per-frame minutes decode of the newest frame (no voting).
     int lastFrameMinute() const;
 
-    // Aggregate lock quality 0..1: mean winning-vote margin across the voted
-    // bits of the timestamp, measured in the SAME normalized (age-extrapolated)
-    // space as votedField, saturating with frame count. Because the margin is
-    // taken after normalization, quality now reflects the consensus of the voted
-    // space itself: a clean rollover no longer dips (the decode is genuinely
-    // unambiguous once every frame is expressed at the newest epoch), while a
-    // genuinely corrupt window — frames disagreeing at comparable confidence —
-    // does. Value and quality can no longer decouple: a field that had to be
-    // rescued against real cross-frame disagreement carries that dip into the
-    // reported quality. ~0 with < minFramesForLock frames.
+    // Aggregate lock quality 0..1: the MINIMUM winning-vote margin across the
+    // voted bits of the timestamp, measured in the SAME normalized
+    // (age-extrapolated) space as votedField, saturating with frame count. The
+    // min — not the mean — is the honest aggregate: a timestamp is only as
+    // trustworthy as its least-certain bit, so quality collapses to the single
+    // most-contested bit's margin. Averaging let dozens of clean bits mask the
+    // one bit that decided a field, reporting near-1.0 while the value was wrong.
+    // A clean rollover still reads ~1.0 (every bit unanimous once normalized), so
+    // value and quality can no longer decouple. A bit with zero participating
+    // votes across the window scores margin 0. ~0 with < minFramesForLock frames.
     float lockConfidence() const;
 
 private:

@@ -446,15 +446,12 @@ static void sectionVoterNoisyCorpus() {
     CHECK(v.votedField(TimeFrameVoter::FieldYear)    == 26);
     CHECK(v.lastFrameMinute() == 25);   // newest raw frame really is minute 25/yr 66
 
-    // Quality is coupled to the voted space: with the static votes rescued
-    // against confident wrong bits, lockConfidence dips out of the clean-lock
-    // band (measured ~0.898 — the faded minute frames vote their field-MIN margin
-    // ~0.05, so the residual dip is carried by the confident static misreads) yet
-    // stays a genuine lock. The absolute bound is loose; the strict dip vs the
-    // clean window below is the load-bearing check.
+    // Quality is coupled to the voted space: lockConfidence is the MINIMUM
+    // per-bit margin, so this window's several contested bits collapse it far out
+    // of the clean-lock band — measured ~0.292 — while the value is recovered.
     const float q = v.lockConfidence();
     CHECK(q > 0.0f && q <= 1.0f);
-    CHECK(q < 0.93f);
+    CHECK(q < 0.35f);
 
     // A clean 8-frame window over the same minutes votes the same timestamp at
     // strictly higher quality — the dip tracks the contention, not luck.
@@ -495,6 +492,48 @@ static void sectionVoterMinuteFadeWeighting() {
     CHECK(v.votedField(TimeFrameVoter::FieldHours)   == 6);
     CHECK(v.votedField(TimeFrameVoter::FieldDoy)     == 200);
     CHECK(v.votedField(TimeFrameVoter::FieldYear)    == 26);
+}
+
+// [wwvb.voter.contested-bit-quality] Mirror: the year-40 bit is flipped in the
+// four newest frames (raw year 26 -> 66); votedField votes 66 on recency, but a
+// single bit decided the field, so lockConfidence must collapse to that bit's
+// normalized margin (~0.208) rather than average it into the clean-lock band
+// (~0.974 under a mean over 31 bits).
+static void sectionVoterContestedBitQuality() {
+    std::array<float, 60> conf;
+    conf.fill(0.40f);
+
+    TimeFrameVoter v(wwvbVoterConfig());
+    for (int mn = 18; mn <= 21; ++mn) v.addFrame(wwvbVoterFrame(mn, 6, 200, 26), conf);
+    for (int mn = 22; mn <= 25; ++mn) v.addFrame(wwvbVoterFrame(mn, 6, 200, 66), conf);
+
+    CHECK(v.locked());
+    CHECK(v.votedField(TimeFrameVoter::FieldYear) == 66);
+    const float q = v.lockConfidence();
+    CHECK(q > 0.0f);
+    CHECK(q <= 0.35f);
+    CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == 25);
+    CHECK(v.votedField(TimeFrameVoter::FieldHours)   == 6);
+    CHECK(v.votedField(TimeFrameVoter::FieldDoy)     == 200);
+}
+
+// [wwvb.voter.doy366gate] Mirror: a confident newest frame decodes doy 366 in yr
+// 27 (2027 is not a leap year). advanceMinutes would wrap doy 366 into Jan 1 of
+// yr 28 (even at age 0), so the gate excludes it and the two clean frames hold
+// the vote at doy 200 / yr 27; without the gate the vote becomes doy 1 / yr 28.
+static void sectionVoterDoy366Gate() {
+    constexpr float C  = 0.35f;
+    constexpr float HI = 0.90f;
+    std::array<float, 60> cc;  cc.fill(C);
+    std::array<float, 60> chi; chi.fill(HI);
+
+    TimeFrameVoter v(wwvbVoterConfig());
+    v.addFrame(wwvbVoterFrame(23, 6, 200, 27), cc);
+    v.addFrame(wwvbVoterFrame(24, 6, 200, 27), cc);
+    v.addFrame(wwvbVoterFrame(25, 6, 366, 27), chi);  // doy 366 in a non-leap year
+
+    CHECK(v.votedField(TimeFrameVoter::FieldDoy)  == 200);
+    CHECK(v.votedField(TimeFrameVoter::FieldYear) == 27);
 }
 
 // ------------------------------------------------------------------------ main
@@ -644,6 +683,12 @@ int main() {
 
     // --- Section: re-encoded-field weighting (field-min vs field-mean)
     sectionVoterMinuteFadeWeighting();
+
+    // --- Section: quality honesty on a single decisive contested bit
+    sectionVoterContestedBitQuality();
+
+    // --- Section: doy-366-in-non-leap-year gate
+    sectionVoterDoy366Gate();
 
     // --- WAV dump of the clean golden vector (opt-in via env var) + truth print
     if (const char* dir = std::getenv("AETHERCLOCK_DUMP_WAV_DIR")) {

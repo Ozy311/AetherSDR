@@ -718,17 +718,14 @@ void sectionVoterNoisyCorpus() {
     // frame — this is what the WS-3 exact-tuple voter got wrong.
     CHECK(v.lastFrameMinute() == 25);
 
-    // Quality is coupled to the voted space now: with the year/hour/doy votes
-    // rescued against confident wrong bits, lockConfidence must NOT sit up in the
-    // clean-lock band. It is a genuine lock (well above zero) but visibly dipped
-    // below a clean window's quality — and below the ~0.926 the old voter emitted
-    // on this same window while reporting the WRONG time. Measured ~0.898 (the
-    // faded minute frames vote their field-MIN margin ~0.05, so the residual dip
-    // is carried by the confident static misreads); the absolute bound is loose,
-    // the strict dip vs the clean window below is the load-bearing check.
+    // Quality is coupled to the voted space now: lockConfidence is the MINIMUM
+    // per-bit margin, so this window's several contested bits collapse it far out
+    // of the clean-lock band — measured ~0.292 (the single most-contested voted
+    // bit's normalized margin), vs the ~0.926 the mean-aggregating voter reported
+    // on this same window while emitting the WRONG time. No confident garbage.
     const float q = v.lockConfidence();
     CHECK(q > 0.0f && q <= 1.0f);
-    CHECK(q < 0.93f);
+    CHECK(q < 0.35f);
 
     // A clean 8-frame window over the same minutes votes the same timestamp at
     // strictly higher quality — proving the dip tracks the contention, not luck.
@@ -781,6 +778,61 @@ void sectionVoterMinuteFadeWeighting() {
     CHECK(v.votedField(TimeFrameVoter::FieldYear)    == 26);
 }
 
+// [wwv.voter.contested-bit-quality] Quality must be HONEST about a single
+// decisive contested bit. The year-40 bit is flipped in the four NEWEST frames
+// (raw year 26 -> 66, in-range so the frame gate keeps them); their aged weight
+// (0.40 x (0.9^0..0.9^3) = 1.3756) beats the four clean oldest frames' (0.40 x
+// (0.9^4..0.9^7) = 0.9025), so votedField votes year 66 — recency wins and that
+// is accepted. The invariant here is quality: exactly ONE bit decided a whole
+// field against real cross-frame disagreement, so lockConfidence must collapse
+// to that bit's normalized margin ((1.3756-0.9025)/(1.3756+0.9025) = 0.2077),
+// not average it away. A mean over the 31 timestamp bits reads (30*1.0 + 0.208)/
+// 31 = 0.974 — confident garbage; the MIN aggregation reports ~0.208.
+void sectionVoterContestedBitQuality() {
+    std::array<float, 60> conf;
+    conf.fill(0.40f);
+
+    TimeFrameVoter v(wwvVoterConfig());
+    // Minutes increment (18..25) so the window locks; oldest four carry the true
+    // year 26, newest four carry 66 (only the year-40 bit differs).
+    for (int mn = 18; mn <= 21; ++mn) v.addFrame(wwvVoterFrame(mn, 6, 200, 26), conf);
+    for (int mn = 22; mn <= 25; ++mn) v.addFrame(wwvVoterFrame(mn, 6, 200, 66), conf);
+
+    CHECK(v.locked());                                          // it IS a lock...
+    CHECK(v.votedField(TimeFrameVoter::FieldYear) == 66);       // ...voting year 66...
+    // ...but quality is honest about the lone decisive bit (mean-agg reads ~0.974).
+    const float q = v.lockConfidence();
+    CHECK(q > 0.0f);
+    CHECK(q <= 0.35f);
+    // The other three fields are unanimous, so they don't prop the quality up.
+    CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == 25);
+    CHECK(v.votedField(TimeFrameVoter::FieldHours)   == 6);
+    CHECK(v.votedField(TimeFrameVoter::FieldDoy)     == 200);
+}
+
+// [wwv.voter.doy366gate] A doy-366 frame in a NON-leap year is off-air and must
+// be gated out: advanceMinutes wraps doy 366 > 365 into Jan 1 of the next year
+// (even at age 0, where the wrap loop still runs), so an un-gated corrupt frame
+// would drag the vote onto an off-air date. Here a confident (high-margin) newest
+// frame decodes doy 366 in yr 27 (2027 is not a leap year); the gate excludes it
+// so the two clean frames hold the vote at doy 200 / yr 27. Without the gate this
+// frame outweighs them and the vote becomes doy 1 / yr 28.
+void sectionVoterDoy366Gate() {
+    constexpr float C  = 0.35f;
+    constexpr float HI = 0.90f;
+    std::array<float, 60> cc;  cc.fill(C);
+    std::array<float, 60> chi; chi.fill(HI);
+
+    TimeFrameVoter v(wwvVoterConfig());
+    v.addFrame(wwvVoterFrame(23, 6, 200, 27), cc);   // clean
+    v.addFrame(wwvVoterFrame(24, 6, 200, 27), cc);   // clean
+    v.addFrame(wwvVoterFrame(25, 6, 366, 27), chi);  // corrupt newest: doy 366 in a non-leap year
+
+    // The corrupt frame is gated out; the clean frames hold the true date.
+    CHECK(v.votedField(TimeFrameVoter::FieldDoy)  == 200);
+    CHECK(v.votedField(TimeFrameVoter::FieldYear) == 27);
+}
+
 } // namespace
 
 int main() {
@@ -801,6 +853,8 @@ int main() {
     sectionVoterRollover();
     sectionVoterNoisyCorpus();
     sectionVoterMinuteFadeWeighting();
+    sectionVoterContestedBitQuality();
+    sectionVoterDoy366Gate();
 
     // Print encoded truth for the python cross-check gate.
     std::printf("golden truth: min=%d hr=%d doy=%d yr=%d frames=%d\n",

@@ -155,6 +155,12 @@ TimeFrameVoter::buildNormalizedFrames() const {
         if (raw.hour   < 0 || raw.hour   > 23) continue;
         if (raw.doy    < 1 || raw.doy    > 366) continue;
         if (raw.year2  < 0 || raw.year2  > 99) continue;
+        // doy 366 is only ever broadcast in a leap year. Accepting it in a
+        // non-leap year would let advanceMinutes wrap a corrupt frame into
+        // January of the next year (doy 366 > 365 = year length) — even at age 0,
+        // where the wrap loop still runs — polluting the vote with an off-air
+        // date. Gate it out with the rest of the range-invalid frames.
+        if (raw.doy == 366 && !isLeapYear2(raw.year2)) continue;
 
         NormalizedFrame nf;
         nf.age = age;
@@ -350,13 +356,18 @@ bool TimeFrameVoter::locked() const {
 }
 
 float TimeFrameVoter::lockConfidence() const {
-    // Mean normalized winning margin over the voted timestamp bits, in the SAME
-    // normalized (age-extrapolated) space as votedField. Measuring the margin
-    // after normalization is what couples quality to the reported value: a clean
-    // rollover reads as unambiguous (every frame agrees once expressed at the
-    // newest epoch, so no dip), while a window whose frames genuinely disagree
-    // at comparable confidence carries that disagreement into the quality. The
-    // mean-margin x frame-count-saturation shape is unchanged.
+    // MINIMUM normalized winning margin over the voted timestamp bits, in the
+    // SAME normalized (age-extrapolated) space as votedField, x frame-count
+    // saturation. The min — not the mean — is the honest aggregate: a timestamp
+    // is exactly as trustworthy as its least-certain bit (one flipped bit changes
+    // the value), so quality must collapse to the single most-contested bit's
+    // margin. A mean let ~30 clean bits mask the one bit that actually decided a
+    // field, reporting near-1.0 while the value was wrong — confident garbage.
+    // Same principle as the re-encode weighting. Clean/clean-rollover windows:
+    // every bit unanimous once normalized -> every margin ~1.0 -> min ~1.0, so
+    // quality still tracks saturation and does not dip. A bit with ZERO
+    // participating votes (its second decoded Marker/Unknown in every window
+    // frame) has no consensus at all and is scored margin 0 -> quality 0.
     const int n = static_cast<int>(m_frames.size());
     if (n < m_cfg.minFramesForLock) {
         return 0.0f;
@@ -368,8 +379,8 @@ float TimeFrameVoter::lockConfidence() const {
     }
 
     constexpr float kEpsilon = 1e-6f;
-    double marginSum = 0.0;
-    int bitCount = 0;
+    double minMargin = 1.0;
+    bool sawBit = false;
 
     for (std::size_t fld = 0; fld < FieldCount; ++fld) {
         const ClockFieldMap& map = m_cfg.fields[fld];
@@ -382,18 +393,21 @@ float TimeFrameVoter::lockConfidence() const {
                     (b.symbol == ClockSymbol::One ? t.w1 : t.w0) += w;
                 }
             }
-            const float winning = std::max(t.w0, t.w1);
-            const float losing = std::min(t.w0, t.w1);
-            marginSum += (winning - losing) / (t.w0 + t.w1 + kEpsilon);
-            ++bitCount;
+            const float total = t.w0 + t.w1;
+            // No participating vote for this bit -> no consensus -> margin 0.
+            const double margin =
+                (total > 0.0f)
+                    ? (std::max(t.w0, t.w1) - std::min(t.w0, t.w1)) / (total + kEpsilon)
+                    : 0.0;
+            minMargin = std::min(minMargin, margin);
+            sawBit = true;
         }
     }
 
-    const double meanMargin = bitCount ? marginSum / bitCount : 0.0;
     const double saturation =
         std::min(1.0, static_cast<double>(n) /
                           (2.0 * static_cast<double>(m_cfg.minFramesForLock)));
-    const double quality = meanMargin * saturation;
+    const double quality = (sawBit ? minMargin : 0.0) * saturation;
     return static_cast<float>(std::clamp(quality, 0.0, 1.0));
 }
 
