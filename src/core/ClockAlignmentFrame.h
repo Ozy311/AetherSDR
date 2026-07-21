@@ -15,7 +15,7 @@ struct ClockAlignmentFrame {
     QVector<float> envelope;     // received envelope over the 1 s window
                                  // (series rate = envelope.size() per second)
     QVector<float> expected;     // matched template of the decoded symbol, same rate
-    int     edgeOffsetMs = 0;    // detected AM-drop edge vs window start
+    int     edgeOffsetMs = 0;    // signed drift of the detected edge vs the nominal window start, ms (~0 drift-free)
     int     symbol = -1;         // 0, 1, 2 = marker, -1 = unknown
     float   confidence = 0.0f;   // classification margin, 0..1
     quint8  station = 0;         // ClockStation enum value
