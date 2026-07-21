@@ -246,10 +246,14 @@ void ClockAlignmentWidget::paintEvent(QPaintEvent* /*event*/)
             drawSeries(f.expected, expectedCol, 1.0f, x0 + shiftPx);
         }
 
-        // 3. AM-drop edge tick at edgeOffsetMs within this second (0..1000 ms).
+        // 3. AM-drop edge tick — where the DETECTED second edge landed. The
+        // engine emits edgeOffsetMs as SIGNED drift from the nominal window
+        // start (~0 on a drift-free stream), so the tick takes the exact same
+        // shift as the template overlay; reading it as an absolute 0..1000 ms
+        // position pins the tick to the column edge and hides drift.
         if (!f.envelope.isEmpty()) {
             p.setRenderHint(QPainter::Antialiasing, false);
-            const float frac = std::clamp(f.edgeOffsetMs, 0, 1000) / 1000.0f;
+            const float frac = std::clamp(f.edgeOffsetMs, -500, 500) / 1000.0f;
             const float ex = x0 + frac * colW;
             p.setPen(QPen(edgeCol, 1));
             p.drawLine(QPointF(ex, float(scopeBottom)),
