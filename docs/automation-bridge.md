@@ -286,7 +286,7 @@ transmit-gated verbs (refused unless `AETHER_AUTOMATION_ALLOW_TX=1` — see
 | | [`get tracedebug`](#get-tracedebug) | Per-panadapter Flex/Kiwi FFT and 3D trace diagnostics. |
 | | [`get clients`](#get-clients) | Radio client roster, GUI IDs + foreign-pan-write forensics (#3977/#4166). |
 | | [`get sync`](#get-sync) | Receive-Sync (Auto Assist) state. |
-| | [`get clock`](#get) | AetherClock time-signal decode state (lock, station, decoded UTC, offset, quality). |
+| | [`get clock`](#get-clock) | AetherClock time-signal decode state (lock, station, decoded UTC, offset, quality). |
 | | [`get wavestats`](#get-wavestats) | WAVE/strip scope paint-cost counters. |
 | | `get waveforms` | Installed waveform list, WFP state, local D-STAR service/configuration, delivery health/metrics, and recent waveform status reports. |
 | | [`get dax`](#get-dax) | DAX RX channel-ownership table (holders/streams, #3305). |
@@ -1833,6 +1833,31 @@ Useful fields:
 | `stableEstimateCount` | Count of consecutive near-equal candidate offsets |
 | `lastAcceptedLock` | Whether the latest estimator pass changed/confirmed the applied lock |
 | `flex*BufferMs`, `kiwi*BufferMs`, `playbackQueuedMs` | Current live-to-ear staging counters |
+
+### `get clock`
+Read the AetherClock time-signal decode snapshot (engine + voter state for the
+WWV/WWVH/WWVB decoders). Served before the radio guard, so it answers even
+while disconnected; until the GUI wires a model it replies
+`"no clock model available"`.
+
+```json
+→ {"cmd":"get","model":"clock"}
+← {"ok":true,"model":"clock","state":2,"stateName":"Locked",
+   "station":1,"stationName":"WWV","decodedUtc":"2026-07-20T22:52:59.000Z",
+   "offsetMs":-129.7,"lockQuality":75,"sliceId":0,"gpsTimeAvailable":false}
+```
+
+Useful fields:
+
+| field | meaning |
+|---|---|
+| `state` / `stateName` | `NoSignal`, `Acquiring`, `Locked` — the authoritative currency signal |
+| `station` / `stationName` | Auto-tagged station: WWV / WWVH / WWVB |
+| `decodedUtc` | Last voted broadcast time (ISO-8601; empty until a first decode). Retained after demotion so age-since-decode stays computable — always read it beside `stateName` |
+| `offsetMs` | decoded − host at the second edge; positive = host behind broadcast |
+| `lockQuality` | Voter lock confidence 0–100 (weakest-voted-bit semantics) |
+| `sliceId` | Bound slice while running, −1 when stopped |
+| `gpsTimeAvailable` | Whether the connected radio reports GPS time (context for the offset) |
 
 ### `audioCapture`
 Bounded, automation-only PCM capture for receive-sync diagnostics. It is active

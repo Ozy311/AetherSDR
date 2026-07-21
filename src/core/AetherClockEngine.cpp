@@ -439,7 +439,11 @@ void AetherClockEngine::feedRxAudio(int channel, const QByteArray& pcm) {
     if (!d.running || !d.decoder || !d.slice) return;
     if (channel != d.slice->daxChannel()) return;  // live channel filter
 
-    // Payload: float32 interleaved stereo, native-endian, 24 kHz (8 bytes/frame).
+    // Payload contract (shared with the Bridge/Tci/Rade DAX consumers):
+    // float32 interleaved stereo, native-endian, 24 kHz, 8 bytes per frame,
+    // 4-byte-aligned buffer. A trailing partial frame is deliberately floored
+    // away by the /8 — the stream is frame-oriented and a fragment carries no
+    // usable sample pair.
     const std::size_t n = static_cast<std::size_t>(pcm.size()) / 8;
     if (n == 0) return;
     const float* in = reinterpret_cast<const float*>(pcm.constData());
