@@ -365,11 +365,13 @@ void AetherClockApplet::buildUi()
         layout->addLayout(row);
     }
 
-    // WS-7 acquisition funnel + verdict (PRD-C; Ozy §8: dedicated row, visible
-    // pre-lock only, collapses when Locked). Five gating stages rendered as
-    // compact state-tinted cells; the verdict line below translates them into
-    // plain language, with the terse technical numbers in its tooltip. Every
-    // readout is a measured ClockDiagnostics value — nothing display-derived.
+    // WS-7 acquisition funnel + verdict (PRD-C). Five gating stages rendered
+    // as compact state-tinted cells; the verdict line below translates them
+    // into plain language, with the terse technical numbers in its tooltip.
+    // Every readout is a measured ClockDiagnostics value — nothing
+    // display-derived. Visible whenever the engine runs: Ozy's live field
+    // review (2026-07-22) superseded the earlier collapse-on-lock call — a
+    // lock shows the whole row green rather than vanishing the surface.
     {
         m_funnelRow = new QWidget(this);
         m_funnelRow->setObjectName(QStringLiteral("clockFunnelRow"));
@@ -746,7 +748,11 @@ void AetherClockApplet::refreshFunnel()
     const bool running = !m_engine.isNull() && m_engine->isRunning();
     AetherClockModel* m = m_model.data();
     const ClockLockState st = m ? m->lockState() : ClockLockState::NoSignal;
-    const bool show = running && st != ClockLockState::Locked;
+    // Visible for the whole run — on lock the row reads full green instead of
+    // disappearing (Ozy field review 2026-07-22; also keeps the layout stable
+    // when a fading band flaps the lock).
+    const bool show = running;
+    const bool locked = st == ClockLockState::Locked;
 
     const bool wasShown = m_funnelRow && m_funnelRow->isVisible();
     if (m_funnelRow)
@@ -786,16 +792,16 @@ void AetherClockApplet::refreshFunnel()
         m_qualityTrend.removeFirst();
 
     // Stage tinting: passed stages green, the FIRST unpassed stage amber
-    // (that's where acquisition currently sits), the rest dim. Stage 5 is
-    // never "done" pre-lock — a lock collapses the whole row.
+    // (that's where acquisition currently sits), the rest dim. A lock is the
+    // whole ladder holding at once — full greens across the board.
     const bool pass[5] = {
-        d.toneDetected,
-        d.phaseLocked,
-        d.anchored,
-        d.anchored && d.classifiedPct >= kVerdictCorruptPct,
-        false,
+        locked || d.toneDetected,
+        locked || d.phaseLocked,
+        locked || d.anchored,
+        locked || (d.anchored && d.classifiedPct >= kVerdictCorruptPct),
+        locked,
     };
-    bool activeAssigned = false;
+    bool activeAssigned = locked;  // no amber while locked
     for (int i = 0; i < 5; ++i) {
         StageState s = StageState::Pending;
         if (pass[i]) {
@@ -892,6 +898,10 @@ QString AetherClockApplet::verdictText(const ClockDiagnostics& d) const
 {
     // PRD-C §6: evaluated top-down, first match wins; every condition is a
     // measured stage or a real gate verdict — no fabricated probabilities.
+    if (!m_model.isNull()
+        && m_model->lockState() == ClockLockState::Locked) {
+        return QStringLiteral("Locked — all stages green");
+    }
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (!d.toneDetected && m_stage1FailSinceMs
         && now - m_stage1FailSinceMs >= 60000) {

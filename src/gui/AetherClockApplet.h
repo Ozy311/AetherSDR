@@ -83,9 +83,11 @@ private:
     void refreshTuneWarning();
 
     // WS-7 acquisition telemetry surfaces (PRD-C). The funnel row + verdict
-    // line render the model's ClockDiagnostics snapshot pre-lock and collapse
-    // when Locked; the debug pane is the read-only "raw nerd info" feed in the
-    // settings drawer (AetherModem mechanics, SupportDialog token treatment).
+    // line render the model's ClockDiagnostics snapshot for the whole run —
+    // full green when Locked (Ozy field review 2026-07-22 superseded the
+    // earlier collapse-on-lock); the debug pane is the read-only "raw nerd
+    // info" feed in the settings drawer (AetherModem mechanics, SupportDialog
+    // token treatment).
     void refreshFunnel();          // diagnosticsChanged → stages + verdict
     QString verdictText(const ClockDiagnostics& d) const;  // §6 heuristic — measured only
     void setDebugExpanded(bool expanded);
