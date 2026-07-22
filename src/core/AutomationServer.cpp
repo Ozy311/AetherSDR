@@ -3708,6 +3708,22 @@ QJsonObject clockSnapshot(const AetherClockModel* m)
         {QStringLiteral("lockQuality"), m->lockQuality()},
         {QStringLiteral("sliceId"), m->sliceId()},
         {QStringLiteral("gpsTimeAvailable"), m->gpsTimeAvailable()},
+        // WS-7 acquisition telemetry (additive — existing consumers see the
+        // original keys unchanged). delayEstMs is NaN when the decoder has no
+        // estimate; QJsonValue maps NaN to null.
+        {QStringLiteral("toneSnrDb"), m->toneSnrDb()},
+        {QStringLiteral("pwmContrast"), m->pwmContrast()},
+        {QStringLiteral("toneDetected"), m->toneDetected()},
+        {QStringLiteral("phaseLocked"), m->phaseLocked()},
+        {QStringLiteral("delayEstMs"), m->delayEstMs()},
+        {QStringLiteral("anchored"), m->anchored()},
+        {QStringLiteral("badFrameStreak"), m->badFrameStreak()},
+        {QStringLiteral("classifiedPct"), m->classifiedPct()},
+        {QStringLiteral("framesInWindow"), m->framesInWindow()},
+        {QStringLiteral("windowSize"), m->windowSize()},
+        {QStringLiteral("voteQuality"), m->voteQuality()},
+        {QStringLiteral("refusalReason"), m->refusalReason()},
+        {QStringLiteral("refusalName"), m->refusalName()},
     };
 }
 } // namespace

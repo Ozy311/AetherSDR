@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -167,6 +168,7 @@ struct WwvbDecoder::Impl {
     void reset() {
         phase = Phase::Searching;
         acqCount = 0;
+        lastToneSnrDb = 0.0f;
         std::fill(gS1.begin(), gS1.end(), 0.0);
         std::fill(gS2.begin(), gS2.end(), 0.0);
         oscRe = 1.0; oscIm = 0.0; oscRenorm = 0;
@@ -209,6 +211,13 @@ struct WwvbDecoder::Impl {
         std::vector<double> med = pw;
         std::nth_element(med.begin(), med.begin() + med.size() / 2, med.end());
         double median = med[med.size() / 2];
+
+        // WS-7 telemetry: remember what the tone search measured (read-only
+        // store — the gate decision below is untouched). Updated every 2 s
+        // search window until the tone gate passes, so the funnel's stage-1
+        // readout is live even when nothing is there.
+        if (median > 0.0)
+            lastToneSnrDb = static_cast<float>(10.0 * std::log10(peakP / median));
 
         if (peakP > kToneGate * median && median > 0.0) {
             f0 = gFreq[peak];
@@ -567,6 +576,7 @@ struct WwvbDecoder::Impl {
     // acquisition
     std::vector<double> gFreq, gCoeff, gS1, gS2;
     int64_t acqCount = 0, acqTarget = 0;
+    float lastToneSnrDb = 0.0f;   // WS-7 telemetry: last tone-search peak/median (dB)
 
     // mixer / envelope generation
     double f0 = 1000.0;
@@ -634,5 +644,22 @@ ClockStation WwvbDecoder::station() const {
 }
 
 std::int64_t WwvbDecoder::samplesConsumed() const { return m_impl->samplesConsumed; }
+
+ClockDecoderDiagnostics WwvbDecoder::diagnostics() const {
+    const Impl& d = *m_impl;
+    ClockDecoderDiagnostics g;
+    g.toneSnrDb = d.lastToneSnrDb;
+    g.pwmContrast = (d.pP10 > 1e-6f) ? d.pP90 / d.pP10 : 0.0f;
+    g.toneDetected = (d.phase == Impl::Phase::Running);
+    g.phaseLocked = d.phaseKnown;
+    g.delayEstMs = std::numeric_limits<float>::quiet_NaN();  // WWV-only metric
+    g.anchored = d.anchored;
+    g.badFrameStreak = 0;  // WWV-only metric (marker-skeleton streak)
+    g.framesInWindow = d.voter.frameCount();
+    g.windowSize = d.voter.windowSize();
+    g.voteQuality = d.voter.lockConfidence();
+    g.refusalReason = static_cast<std::uint8_t>(d.voter.lockRefusal());
+    return g;
+}
 
 } // namespace AetherSDR

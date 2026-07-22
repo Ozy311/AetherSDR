@@ -84,4 +84,16 @@ void AetherClockSettings::setWwvCarrierMHz(double mhz)
     write(o);
 }
 
+bool AetherClockSettings::debugLogVisible()
+{
+    return readObj().value(QStringLiteral("debugLogVisible")).toBool(false);
+}
+
+void AetherClockSettings::setDebugLogVisible(bool visible)
+{
+    QJsonObject o = readObj();
+    o[QStringLiteral("debugLogVisible")] = visible;
+    write(o);
+}
+
 } // namespace AetherSDR

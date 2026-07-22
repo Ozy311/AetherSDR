@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <vector>
 
 namespace AetherSDR {
@@ -770,5 +771,41 @@ void WwvDecoder::setPlausibility(std::function<TimeFields()> referenceNow,
 ClockLockState WwvDecoder::state() const { return m_impl->state; }
 ClockStation WwvDecoder::station() const { return m_impl->station; }
 std::int64_t WwvDecoder::samplesConsumed() const { return m_impl->samplesConsumed; }
+
+ClockDecoderDiagnostics WwvDecoder::diagnostics() const {
+    const Impl& d = *m_impl;
+    ClockDecoderDiagnostics g;
+
+    // Stage 1: folded tick-band impulsiveness — the same peak-to-mean statistic
+    // the tick lock gates on, recomputed here from the leaky folds (read-only).
+    const auto foldRatio = [](const std::array<double, kSecLen>& fold) {
+        double peak = 0.0, sum = 0.0;
+        for (int p = 0; p < kSecLen; ++p) {
+            sum += fold[p];
+            if (fold[p] > peak) peak = fold[p];
+        }
+        const double mean = sum / kSecLen;
+        return (mean > 0.0) ? peak / mean : 0.0;
+    };
+    const double ratio = std::max(foldRatio(d.foldV), foldRatio(d.foldH));
+    g.toneSnrDb = (ratio > 0.0)
+        ? static_cast<float>(10.0 * std::log10(ratio)) : 0.0f;
+    g.pwmContrast = 0.0f;  // WWVB-only metric
+    g.toneDetected = d.tickLocked;
+
+    g.phaseLocked = d.tickLocked;
+    g.delayEstMs = d.delayLocked
+        ? static_cast<float>(d.delayEst * 1000.0 / kSeriesRate)
+        : std::numeric_limits<float>::quiet_NaN();
+
+    g.anchored = d.anchored;
+    g.badFrameStreak = d.badFrameStreak;
+
+    g.framesInWindow = d.voter.frameCount();
+    g.windowSize = d.voter.windowSize();
+    g.voteQuality = d.voter.lockConfidence();
+    g.refusalReason = static_cast<std::uint8_t>(d.voter.lockRefusal());
+    return g;
+}
 
 } // namespace AetherSDR

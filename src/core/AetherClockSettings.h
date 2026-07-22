@@ -21,6 +21,11 @@ public:
     static double wwvCarrierMHz(); // default 10.0
     static void setWwvCarrierMHz(double mhz);
 
+    // Debug-log pane visibility in the applet's settings drawer (WS-7).
+    // Collapsed by default; a field in the same nested blob, never a flat key.
+    static bool debugLogVisible(); // default false
+    static void setDebugLogVisible(bool visible);
+
 private:
     static QJsonObject readObj();
     static void write(const QJsonObject& o);

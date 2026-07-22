@@ -54,6 +54,11 @@ public:
     ClockStation station() const;      // always Wwvb once acquiring
     std::int64_t samplesConsumed() const;
 
+    // WS-7 acquisition telemetry: read-only snapshot assembled ON CALL from
+    // state the decoder already keeps (tone search, envelope percentiles,
+    // anchor, voter) — zero cost on the sample path, no feedback into decoding.
+    ClockDecoderDiagnostics diagnostics() const;
+
     // Callbacks (any may be left unset).
     std::function<void(const ClockSecondInfo&)> onSecond;
     std::function<void(const ClockFrameInfo&)> onFrame;

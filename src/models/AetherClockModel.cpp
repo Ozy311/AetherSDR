@@ -29,6 +29,12 @@ void AetherClockModel::attachEngine(AetherClockEngine* engine)
             this, &AetherClockModel::onStationDetected, Qt::QueuedConnection);
     connect(engine, &AetherClockEngine::timeDecoded,
             this, &AetherClockModel::onTimeDecoded, Qt::QueuedConnection);
+    connect(engine, &AetherClockEngine::diagnosticsUpdated,
+            this, &AetherClockModel::onDiagnostics, Qt::QueuedConnection);
+    // Signal-to-signal forward: the model adds no state for per-frame decodes,
+    // it just carries them across the thread boundary for the debug pane.
+    connect(engine, &AetherClockEngine::frameDecoded,
+            this, &AetherClockModel::frameDecoded, Qt::QueuedConnection);
 }
 
 QString AetherClockModel::stateName() const
@@ -39,6 +45,18 @@ QString AetherClockModel::stateName() const
     case ClockLockState::Locked:    return QStringLiteral("Locked");
     }
     return QStringLiteral("NoSignal");
+}
+
+QString AetherClockModel::refusalName() const
+{
+    switch (ClockLockRefusal(m_diag.refusalReason)) {
+    case ClockLockRefusal::None:         return QStringLiteral("None");
+    case ClockLockRefusal::QualityFloor: return QStringLiteral("QualityFloor");
+    case ClockLockRefusal::Plausibility: return QStringLiteral("Plausibility");
+    case ClockLockRefusal::Staleness:    return QStringLiteral("Staleness");
+    case ClockLockRefusal::Contested:    return QStringLiteral("Contested");
+    }
+    return QStringLiteral("None");
 }
 
 QString AetherClockModel::stationName() const
@@ -78,6 +96,12 @@ void AetherClockModel::onStationDetected(AetherSDR::ClockStation station)
     if (m_station == station) return;
     m_station = station;
     emit stationChanged(int(station));
+}
+
+void AetherClockModel::onDiagnostics(const AetherSDR::ClockDiagnostics& diag)
+{
+    m_diag = diag;
+    emit diagnosticsChanged();  // one snapshot, one notify (arrives at ~1 Hz)
 }
 
 void AetherClockModel::onTimeDecoded(const QDateTime& utc, double offsetMs, int quality)

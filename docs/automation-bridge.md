@@ -1859,6 +1859,24 @@ Useful fields:
 | `sliceId` | Bound slice while running, −1 when stopped |
 | `gpsTimeAvailable` | Whether the connected radio reports GPS time (context for the offset) |
 
+Acquisition telemetry (additive; mirrors the engine's ~1 Hz `ClockDiagnostics`
+snapshot — every value is a real measurement or a real gate verdict, updated
+while the engine runs):
+
+| field | meaning |
+|---|---|
+| `toneSnrDb` | Stage 1 carrier readout: WWVB tone-search peak/median in dB; WWV/WWVH folded tick-band peak-to-mean in dB |
+| `pwmContrast` | WWVB envelope p90/p10 contrast (0 when n/a); ≥ ~1.4 means a real AM drop exists |
+| `toneDetected` | Carrier gate result (WWVB tone gate / WWV tick-fold lock) |
+| `phaseLocked` | Second-edge timing sync (WWV tick lock / WWVB envelope phase) |
+| `delayEstMs` | WWV tracked matched-filter delay estimate; `null` when the decoder has none |
+| `anchored` | Minute frame anchored (marker sync) |
+| `badFrameStreak` | Consecutive broken-marker-skeleton frames (WWV; 3 triggers resync) |
+| `classifiedPct` | % of the last 60 s that classified into a symbol |
+| `framesInWindow` / `windowSize` | Voter sliding-window occupancy |
+| `voteQuality` | Raw voter lock confidence 0–1 (pre-scale; `lockQuality` is the 0–100 post-lock mirror) |
+| `refusalReason` / `refusalName` | Which lock gate is currently refusing: `None`, `QualityFloor`, `Plausibility`, `Staleness`, `Contested` (`None` = locked or still collecting frames) |
+
 ### `audioCapture`
 Bounded, automation-only PCM capture for receive-sync diagnostics. It is active
 only inside an `AETHER_AUTOMATION=1` process, is read-only, and does not change

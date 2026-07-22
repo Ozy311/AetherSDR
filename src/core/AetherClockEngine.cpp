@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -50,6 +51,8 @@ struct IDecoder {
     // WS-4.5: arm the shared voter's absolute-plausibility gate.
     virtual void setPlausibility(std::function<TimeFields()> referenceNow,
                                  int boundMinutes) = 0;
+    // WS-7: read-only acquisition snapshot (funnel stages 1-3 + 5).
+    virtual ClockDecoderDiagnostics diagnostics() const = 0;
 
     // Engine-side callbacks, forwarded from the concrete decoder's callbacks.
     std::function<void(const ClockSecondInfo&)> onSecond;
@@ -76,6 +79,7 @@ struct DecoderHolder final : IDecoder {
                          int boundMinutes) override {
         d.setPlausibility(std::move(referenceNow), boundMinutes);
     }
+    ClockDecoderDiagnostics diagnostics() const override { return d.diagnostics(); }
 };
 
 } // namespace
@@ -89,6 +93,14 @@ struct AetherClockEngine::Impl {
         decayTimer = new QTimer(q);
         decayTimer->setSingleShot(true);
         QObject::connect(decayTimer, &QTimer::timeout, q, [this] { onDecayTimeout(); });
+
+        // WS-7: ~1 Hz diagnostics emission while running. Same threading story
+        // as decayTimer — every start/stop happens on the engine's thread.
+        diagTimer = new QTimer(q);
+        diagTimer->setInterval(1000);
+        QObject::connect(diagTimer, &QTimer::timeout, q, [this] {
+            if (running) emit q->diagnosticsUpdated(q->currentDiagnostics());
+        });
     }
 
     AetherClockEngine* q = nullptr;
@@ -113,6 +125,17 @@ struct AetherClockEngine::Impl {
     // step so a stalled feed cannot pin a stale Locked/Acquiring.
     QTimer* decayTimer = nullptr;
     int decayTimeoutMs = 10000;
+
+    // WS-7 diagnostics cadence + the stage-4 classified-seconds ring: host-ms
+    // stamps of the last minute's classified seconds (each handleSecond call IS
+    // a classified second — the decoders emit nothing for an unclassified one).
+    QTimer* diagTimer = nullptr;
+    std::deque<qint64> classifiedMs;
+
+    void pruneClassified(qint64 nowMs) {
+        while (!classifiedMs.empty() && nowMs - classifiedMs.front() > 60000)
+            classifiedMs.pop_front();
+    }
 
     std::function<qint64()> nowUtcMs =
         [] { return QDateTime::currentMSecsSinceEpoch(); };
@@ -212,6 +235,11 @@ struct AetherClockEngine::Impl {
         armDecayTimer();
         const ClockLockState ds = decoder->lockState();
         if (ds != lastState) setState(ds);
+
+        // WS-7 stage-4 ring: this callback fires once per CLASSIFIED second.
+        const qint64 nowMs = nowUtcMs();
+        classifiedMs.push_back(nowMs);
+        pruneClassified(nowMs);
     }
 
     void handleFrame(const ClockFrameInfo& frame) {
@@ -220,6 +248,10 @@ struct AetherClockEngine::Impl {
         // lastEdgeSample and the host anchor).
         lastFrameStartSample = frame.frameStartSample;
         haveFrame = true;
+
+        // WS-7: re-emit the raw per-frame decode (previously discarded here —
+        // frameConfidence, DUT1/DST/leap now reach the debug pane).
+        emit q->frameDecoded(frame);
     }
 
     void handleTime(const ClockTimeInfo& t) {
@@ -257,6 +289,8 @@ AetherClockEngine::AetherClockEngine(QObject* parent)
     qRegisterMetaType<AetherSDR::ClockAlignmentFrame>();
     qRegisterMetaType<AetherSDR::ClockLockState>("AetherSDR::ClockLockState");
     qRegisterMetaType<AetherSDR::ClockStation>("AetherSDR::ClockStation");
+    qRegisterMetaType<AetherSDR::ClockDiagnostics>();
+    qRegisterMetaType<AetherSDR::ClockFrameInfo>();
 }
 
 AetherClockEngine::~AetherClockEngine() {
@@ -295,6 +329,33 @@ ClockStation AetherClockEngine::configuredStation() const {
 }
 
 ClockLockState AetherClockEngine::lockState() const { return m_impl->lastState; }
+
+ClockDiagnostics AetherClockEngine::currentDiagnostics() const {
+    auto& d = *m_impl;
+    ClockDiagnostics g;
+    if (d.decoder) {
+        const ClockDecoderDiagnostics dd = d.decoder->diagnostics();
+        g.toneSnrDb = dd.toneSnrDb;
+        g.pwmContrast = dd.pwmContrast;
+        g.toneDetected = dd.toneDetected;
+        g.phaseLocked = dd.phaseLocked;
+        g.delayEstMs = dd.delayEstMs;
+        g.anchored = dd.anchored;
+        g.badFrameStreak = dd.badFrameStreak;
+        g.framesInWindow = dd.framesInWindow;
+        g.windowSize = dd.windowSize;
+        g.voteQuality = dd.voteQuality;
+        g.refusalReason = dd.refusalReason;
+    }
+    // Count, don't prune — this accessor is const; handleSecond's prune keeps
+    // the ring bounded.
+    const qint64 nowMs = d.nowUtcMs();
+    std::size_t live = 0;
+    for (qint64 t : d.classifiedMs)
+        if (nowMs - t <= 60000) ++live;
+    g.classifiedPct = static_cast<int>(std::min<std::size_t>(100, live * 100 / 60));
+    return g;
+}
 
 void AetherClockEngine::start(SliceModel* slice, ClockStation station) {
     auto& d = *m_impl;
@@ -386,6 +447,8 @@ void AetherClockEngine::start(SliceModel* slice, ClockStation station) {
     d.running = true;
     d.lastState = ClockLockState::NoSignal;  // state starts NoSignal
     d.armDecayTimer();                       // watchdog runs while running
+    d.classifiedMs.clear();
+    d.diagTimer->start();                    // ~1 Hz diagnostics while running
     emit runningChanged(true);
 }
 
@@ -393,6 +456,8 @@ void AetherClockEngine::stop() {
     auto& d = *m_impl;
     const bool was = d.running;
     d.decayTimer->stop();
+    d.diagTimer->stop();
+    d.classifiedMs.clear();
     d.releaseHold();
     d.disconnectAll();
     if (d.decoder) d.decoder->reset();

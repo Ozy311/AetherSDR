@@ -586,6 +586,78 @@ void sectionLockDecayDemotes() {
     engine.stop();
 }
 
+// [WS-7] Acquisition telemetry: currentDiagnostics() stages flip on the happy
+// path, frameDecoded re-emits every completed frame (previously discarded at
+// the engine boundary), the classified-seconds ring reports a full last
+// minute, the refusal tag is None once locked, and the ~1 Hz timer emission
+// fires while running.
+void sectionDiagnosticsTelemetry() {
+    SynthOpts opts;
+    const std::vector<float> mono = synthWwv(kGold, opts);
+    const qint64 epochMs = synthEpochMs(kGold, opts);
+
+    PanadapterStream stream;
+    SliceModel slice(0);
+    slice.setDaxChannel(2);
+
+    AetherClockEngine engine;
+    wireProvider(engine, stream);
+    qint64 fakeNow = epochMs + kSkewMs;
+    engine.setHostClock([&fakeNow] { return fakeNow; });
+
+    QSignalSpy spyFrame(&engine, &AetherClockEngine::frameDecoded);
+    QSignalSpy spyDiag(&engine, &AetherClockEngine::diagnosticsUpdated);
+
+    // Not running: default-constructed snapshot.
+    {
+        const ClockDiagnostics d0 = engine.currentDiagnostics();
+        CHECK(!d0.toneDetected);
+        CHECK(d0.framesInWindow == 0);
+        CHECK(d0.classifiedPct == 0);
+    }
+
+    engine.start(&slice, ClockStation::Wwv);
+    qint64 samplesFed = 0;
+    feedStereo(engine, 2, mono, epochMs, kSkewMs, samplesFed, fakeNow, /*advance*/ true);
+    CHECK(engine.lockState() == ClockLockState::Locked);
+
+    const ClockDiagnostics d = engine.currentDiagnostics();
+    // stages 1-2: tick fold locked on the synth signal; delay settled.
+    CHECK(d.toneDetected);
+    CHECK(d.phaseLocked);
+    CHECK(d.toneSnrDb > 0.0f);
+    CHECK(std::isfinite(d.delayEstMs));
+    // stage 3
+    CHECK(d.anchored);
+    CHECK(d.badFrameStreak == 0);
+    // stage 4: the fake clock advanced with the feed, so the last 60 s of host
+    // time carry a full minute of classified seconds.
+    CHECK(d.classifiedPct >= 90);
+    // stage 5
+    CHECK(d.framesInWindow >= 2);
+    CHECK(d.windowSize == 8);
+    CHECK(d.voteQuality > 0.0f);
+    CHECK(d.refusalReason == quint8(ClockLockRefusal::None));
+
+    // frameDecoded re-emission: one per completed synth frame (3 frames), with
+    // the raw fields intact.
+    CHECK(spyFrame.count() >= 3);
+    if (spyFrame.count() >= 1) {
+        const auto fi = spyFrame.back().at(0).value<ClockFrameInfo>();
+        CHECK(fi.station == ClockStation::Wwv);
+        CHECK(fi.frameConfidence > 0.0f);
+        CHECK(fi.minute >= 0 && fi.minute <= 59);
+    }
+
+    // ~1 Hz emission while running (wall-clock timer; one wait is enough).
+    CHECK(spyDiag.count() >= 1 || spyDiag.wait(1500));
+
+    engine.stop();
+    const ClockDiagnostics dStop = engine.currentDiagnostics();
+    CHECK(dStop.framesInWindow == 0);   // decoder torn down -> defaults
+    CHECK(dStop.classifiedPct == 0);    // ring cleared
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -607,6 +679,7 @@ int main(int argc, char** argv) {
     sectionStationPresetOverload();
     sectionLockDecayNoSignalStable();
     sectionLockDecayDemotes();
+    sectionDiagnosticsTelemetry();
 
     if (g_failures == 0) {
         std::printf("aetherclock_engine_test: all checks passed\n");

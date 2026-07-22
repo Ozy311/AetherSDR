@@ -487,10 +487,19 @@ int TimeFrameVoter::lastFrameMinute() const {
     return decodeMinutes(m_frames.back());
 }
 
-bool TimeFrameVoter::locked() const {
+bool TimeFrameVoter::locked() const { return lockVerdict().locked; }
+
+ClockLockRefusal TimeFrameVoter::lockRefusal() const {
+    return lockVerdict().reason;
+}
+
+// The original locked() body, verbatim, with each refusal tagged (WS-7): same
+// gates, same order, same short-circuits — the tag names the branch that was
+// already taken, so tagging cannot change lock behavior (corpus-gated A/B).
+TimeFrameVoter::LockVerdict TimeFrameVoter::lockVerdict() const {
     const int n = static_cast<int>(m_frames.size());
     if (n < m_cfg.minFramesForLock) {
-        return false;
+        return {false, ClockLockRefusal::None};  // still collecting
     }
 
     // Count adjacent frame pairs whose decoded minutes increment by exactly +1
@@ -507,7 +516,7 @@ bool TimeFrameVoter::locked() const {
         }
     }
     if (increments < m_cfg.minFramesForLock - 1) {
-        return false;
+        return {false, ClockLockRefusal::Contested};
     }
 
     // Static-field self-consistency in the SAME normalized space the vote uses:
@@ -517,7 +526,7 @@ bool TimeFrameVoter::locked() const {
     // lock.
     const std::vector<NormalizedFrame> frames = buildNormalizedFrames();
     if (frames.empty()) {
-        return false;
+        return {false, ClockLockRefusal::Staleness};
     }
 
     // Staleness bound (WS-4.5): a lock needs a range-VALID frame among the
@@ -533,7 +542,7 @@ bool TimeFrameVoter::locked() const {
             }
         }
         if (!fresh) {
-            return false;
+            return {false, ClockLockRefusal::Staleness};
         }
     }
     for (std::size_t fi = FieldHours; fi <= FieldYear; ++fi) {
@@ -551,7 +560,7 @@ bool TimeFrameVoter::locked() const {
             margin += std::max(w0, w1) - std::min(w0, w1);
         }
         if (!(margin > 0.0)) {
-            return false;
+            return {false, ClockLockRefusal::Contested};
         }
     }
 
@@ -566,7 +575,7 @@ bool TimeFrameVoter::locked() const {
         // here as collapsed participation -> collapsed trust.
         if (m_cfg.minLockQuality > 0.0f &&
             res.quality < static_cast<double>(m_cfg.minLockQuality)) {
-            return false;
+            return {false, ClockLockRefusal::QualityFloor};
         }
 
         // Absolute plausibility: a self-consistent decode implausibly far from
@@ -586,13 +595,13 @@ bool TimeFrameVoter::locked() const {
                     minutesSince2000(res.value) - minutesSince2000(ref);
                 const long long bound = m_cfg.plausibilityBoundMinutes;
                 if (diff > bound || diff < -bound) {
-                    return false;
+                    return {false, ClockLockRefusal::Plausibility};
                 }
             }
         }
     }
 
-    return true;
+    return {true, ClockLockRefusal::None};
 }
 
 float TimeFrameVoter::lockConfidence() const {

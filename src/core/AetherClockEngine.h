@@ -23,6 +23,7 @@
 // feedRxAudio() — the signals carry 1 bit/s, so this is trivially cheap.
 
 #include "ClockAlignmentFrame.h"
+#include "ClockDiagnostics.h"
 #include "TimeFrameVoter.h"
 
 #include <QByteArray>
@@ -79,6 +80,13 @@ public:
     ClockStation configuredStation() const; // station selected at start()
     ClockLockState lockState() const;
 
+    // WS-7 acquisition telemetry: the current diagnostics snapshot, assembled
+    // on call from the decoder's read-only accessors plus the engine's
+    // classified-seconds ring. The same snapshot is emitted at ~1 Hz via
+    // diagnosticsUpdated() while running; this accessor is the test/bridge
+    // seam (no event loop required). Default-constructed when not running.
+    ClockDiagnostics currentDiagnostics() const;
+
 public slots:
     // Bind `slice` and start decoding. `station` selects the decoder:
     // Wwv (auto-tags Wwvh by tick band) or Wwvb. Acquires the DAX hold on
@@ -116,6 +124,12 @@ signals:
     // edge — POSITIVE means the host clock is BEHIND the broadcast.
     void timeDecoded(const QDateTime& utc, double offsetMs, int quality);
     void alignmentFrame(const AetherSDR::ClockAlignmentFrame& frame);
+    // WS-7 telemetry (both additive, read-only w.r.t. decode behavior):
+    // ~1 Hz diagnostics while running, and the raw per-frame decode re-emitted
+    // instead of dying at the engine boundary (frameConfidence, DUT1/DST/leap
+    // feed the debug pane).
+    void diagnosticsUpdated(const AetherSDR::ClockDiagnostics& diag);
+    void frameDecoded(const AetherSDR::ClockFrameInfo& frame);
 
 private:
     struct Impl;

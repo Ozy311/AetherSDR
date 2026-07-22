@@ -348,6 +348,23 @@ void sectionCleanBitExact(const std::vector<float>& clean) {
     CHECK(dec.state()   == ClockLockState::Locked);
     CHECK(dec.station() == ClockStation::Wwv);
 
+    // WS-7 diagnostics snapshot: on the clean locked vector every funnel stage
+    // reads "passed" and the refusal tag is None. (Stage 4 lives engine-side.)
+    {
+        const ClockDecoderDiagnostics g = dec.diagnostics();
+        CHECK(g.toneDetected);
+        CHECK(g.phaseLocked);
+        CHECK(g.toneSnrDb > 0.0f);            // folded tick impulse, honest dB
+        CHECK(g.pwmContrast == 0.0f);         // WWVB-only metric
+        CHECK(!std::isnan(g.delayEstMs));     // delay settled on the clean vector
+        CHECK(g.anchored);
+        CHECK(g.badFrameStreak == 0);
+        CHECK(g.framesInWindow >= 2);
+        CHECK(g.windowSize == 8);
+        CHECK(g.voteQuality >= kConfidenceFloor);
+        CHECK(g.refusalReason == static_cast<std::uint8_t>(ClockLockRefusal::None));
+    }
+
     // Voted time "as of the newest frame".
     CHECK(!cap.times.empty());
     if (!cap.times.empty()) {
@@ -920,6 +937,9 @@ void sectionVoterPhantomRotating() {
     CHECK(v.votedField(TimeFrameVoter::FieldMinutes) == 20);
     // If it claims a lock at all, the hour must be a value some frame held.
     CHECK(!v.locked() || h == 3 || h == 9 || h == 10);
+    // WS-7: any refusal must carry a tag (never an unexplained "no").
+    if (!v.locked())
+        CHECK(v.lockRefusal() != ClockLockRefusal::None);
 }
 
 // [wwv.voter.lone-voter-participation] A bit only ONE frame actually voted must
@@ -982,6 +1002,8 @@ void sectionVoterUnanimousFadeNoConfidentGarbage() {
     }
     CHECK(!v.locked());                 // the 2006-01-01 event must not lock
     CHECK(v.lockConfidence() < 0.10f);
+    // WS-7: the refusal is attributable — the quality floor said no.
+    CHECK(v.lockRefusal() == ClockLockRefusal::QualityFloor);
 
     // (b) The same window through a floors-off voter locks at high quality —
     //     pinning that the gate is what kills the live failure mode.
@@ -992,6 +1014,7 @@ void sectionVoterUnanimousFadeNoConfidentGarbage() {
     }
     CHECK(legacy.locked());
     CHECK(legacy.lockConfidence() > 0.9f);
+    CHECK(legacy.lockRefusal() == ClockLockRefusal::None);   // locked -> None
 
     // (c) The floors must not break a CLEAN window: same minutes, no fade.
     TimeFrameVoter cleanV(hardened);
@@ -1027,6 +1050,8 @@ void sectionVoterPlausibilityGate() {
     for (int mn = 45; mn <= 52; ++mn)
         garbage.addFrame(wwvVoterFrame(mn, 3, 1, 6), conf);   // 2006-01-01
     CHECK(!garbage.locked());
+    // WS-7: the refusal is attributable — the plausibility gate said no.
+    CHECK(garbage.lockRefusal() == ClockLockRefusal::Plausibility);
 
     // (b) A host ~40 minutes wrong is WITHIN the bound — measuring that error
     //     is the applet's purpose, so this must still lock.
@@ -1035,6 +1060,7 @@ void sectionVoterPlausibilityGate() {
         hostSlow.addFrame(wwvVoterFrame(mn, 3, 201, 26), conf);
     CHECK(hostSlow.locked());
     CHECK(hostSlow.votedField(TimeFrameVoter::FieldMinutes) == 17);
+    CHECK(hostSlow.lockRefusal() == ClockLockRefusal::None);
 
     // (c) Gate disarmed (bound 0, the default): back-compat is explicit.
     TimeFrameVoter ungated(wwvVoterConfig());
@@ -1089,6 +1115,40 @@ void sectionVoterNoDeadReckoning() {
     }
     CHECK(!v.locked());                  // stale window must not stay locked
     CHECK(locksAfterGarbage <= 3);       // free-run bounded by the staleness age
+    // WS-7: the refusal is attributable — the staleness bound said no.
+    CHECK(v.lockRefusal() == ClockLockRefusal::Staleness);
+}
+
+// [wwv.voter.refusal-tags] WS-7: lockRefusal() distinguishes "still
+// collecting" (None) from an actual gate refusal, and tags the disagreement
+// gates as Contested. locked()/lockRefusal() read one verdict pass, so a
+// locked voter is always None and a refused one is never unexplained.
+void sectionVoterRefusalTags() {
+    constexpr float C = 0.35f;
+    std::array<float, 60> conf;
+    conf.fill(C);
+
+    // (a) Collecting: one frame is below minFramesForLock — not a refusal.
+    TimeFrameVoter collecting(wwvVoterConfig());
+    collecting.addFrame(wwvVoterFrame(10, 6, 200, 26), conf);
+    CHECK(!collecting.locked());
+    CHECK(collecting.frameCount() == 1);
+    CHECK(collecting.lockRefusal() == ClockLockRefusal::None);
+
+    // (b) Contested: two frames whose minutes do not chain (+1) — the window
+    //     disagrees with itself.
+    TimeFrameVoter contested(wwvVoterConfig());
+    contested.addFrame(wwvVoterFrame(10, 6, 200, 26), conf);
+    contested.addFrame(wwvVoterFrame(25, 6, 200, 26), conf);
+    CHECK(!contested.locked());
+    CHECK(contested.lockRefusal() == ClockLockRefusal::Contested);
+
+    // (c) Locked: a clean incrementing window refuses nothing.
+    TimeFrameVoter clean(wwvVoterConfig());
+    for (int mn = 10; mn <= 13; ++mn)
+        clean.addFrame(wwvVoterFrame(mn, 6, 200, 26), conf);
+    CHECK(clean.locked());
+    CHECK(clean.lockRefusal() == ClockLockRefusal::None);
 }
 
 // ---- WS-4.5 decoder-level hardening ---------------------------------------
@@ -1282,6 +1342,7 @@ int main() {
     sectionVoterUnanimousFadeNoConfidentGarbage();
     sectionVoterPlausibilityGate();
     sectionVoterNoDeadReckoning();
+    sectionVoterRefusalTags();
     sectionLockDemotesOnSignalLoss();
     sectionGapRealignsAndRelocks();
     sectionSlowDriftHoldsLock();

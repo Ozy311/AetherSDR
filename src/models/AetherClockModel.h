@@ -5,7 +5,8 @@
 // engine state, owns no DSP. All engine→model wiring is QUEUED
 // (attachEngine) so the engine may live on a worker thread.
 
-#include "core/TimeFrameVoter.h" // ClockLockState / ClockStation
+#include "core/ClockDiagnostics.h" // WS-7 acquisition telemetry
+#include "core/TimeFrameVoter.h"   // ClockLockState / ClockStation
 
 #include <QDateTime>
 #include <QObject>
@@ -28,6 +29,22 @@ class AetherClockModel : public QObject {
     Q_PROPERTY(int sliceId READ sliceId WRITE setSliceId NOTIFY sliceIdChanged)
     Q_PROPERTY(bool gpsTimeAvailable READ gpsTimeAvailable
                WRITE setGpsTimeAvailable NOTIFY gpsTimeAvailableChanged)
+    // WS-7 acquisition telemetry (PRD-C): the funnel-relevant diagnostics
+    // subset, all riding ONE notify — the snapshot arrives atomically at
+    // ~1 Hz, so per-field signals would only fragment a single update.
+    Q_PROPERTY(double toneSnrDb READ toneSnrDb NOTIFY diagnosticsChanged)
+    Q_PROPERTY(double pwmContrast READ pwmContrast NOTIFY diagnosticsChanged)
+    Q_PROPERTY(bool toneDetected READ toneDetected NOTIFY diagnosticsChanged)
+    Q_PROPERTY(bool phaseLocked READ phaseLocked NOTIFY diagnosticsChanged)
+    Q_PROPERTY(double delayEstMs READ delayEstMs NOTIFY diagnosticsChanged)
+    Q_PROPERTY(bool anchored READ anchored NOTIFY diagnosticsChanged)
+    Q_PROPERTY(int badFrameStreak READ badFrameStreak NOTIFY diagnosticsChanged)
+    Q_PROPERTY(int classifiedPct READ classifiedPct NOTIFY diagnosticsChanged)
+    Q_PROPERTY(int framesInWindow READ framesInWindow NOTIFY diagnosticsChanged)
+    Q_PROPERTY(int windowSize READ windowSize NOTIFY diagnosticsChanged)
+    Q_PROPERTY(double voteQuality READ voteQuality NOTIFY diagnosticsChanged)
+    Q_PROPERTY(int refusalReason READ refusalReason NOTIFY diagnosticsChanged)
+    Q_PROPERTY(QString refusalName READ refusalName NOTIFY diagnosticsChanged)
 public:
     explicit AetherClockModel(QObject* parent = nullptr);
 
@@ -46,6 +63,22 @@ public:
     int sliceId() const { return m_sliceId; }
     bool gpsTimeAvailable() const { return m_gpsTimeAvailable; }
 
+    // WS-7 diagnostics mirror (last snapshot received from the engine).
+    double toneSnrDb() const { return m_diag.toneSnrDb; }
+    double pwmContrast() const { return m_diag.pwmContrast; }
+    bool toneDetected() const { return m_diag.toneDetected; }
+    bool phaseLocked() const { return m_diag.phaseLocked; }
+    double delayEstMs() const { return m_diag.delayEstMs; }
+    bool anchored() const { return m_diag.anchored; }
+    int badFrameStreak() const { return m_diag.badFrameStreak; }
+    int classifiedPct() const { return m_diag.classifiedPct; }
+    int framesInWindow() const { return m_diag.framesInWindow; }
+    int windowSize() const { return m_diag.windowSize; }
+    double voteQuality() const { return m_diag.voteQuality; }
+    int refusalReason() const { return int(m_diag.refusalReason); }
+    QString refusalName() const;  // "None" | "QualityFloor" | ...
+    const ClockDiagnostics& diagnostics() const { return m_diag; }
+
 public slots:
     void setSliceId(int id);
     void setGpsTimeAvailable(bool available);
@@ -58,11 +91,16 @@ signals:
     void lockQualityChanged(int quality);
     void sliceIdChanged(int id);
     void gpsTimeAvailableChanged(bool available);
+    // WS-7: one notify per diagnostics snapshot; frameDecoded forwards the
+    // engine's raw per-frame decode to the debug pane.
+    void diagnosticsChanged();
+    void frameDecoded(const AetherSDR::ClockFrameInfo& frame);
 
 private slots:
     void onLockStateChanged(AetherSDR::ClockLockState state);
     void onStationDetected(AetherSDR::ClockStation station);
     void onTimeDecoded(const QDateTime& utc, double offsetMs, int quality);
+    void onDiagnostics(const AetherSDR::ClockDiagnostics& diag);
 
 private:
     QPointer<AetherClockEngine> m_engine;
@@ -73,6 +111,7 @@ private:
     int m_lockQuality{0};
     int m_sliceId{-1};
     bool m_gpsTimeAvailable{false};
+    ClockDiagnostics m_diag;
 };
 
 } // namespace AetherSDR

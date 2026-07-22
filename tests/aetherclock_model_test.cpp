@@ -42,6 +42,8 @@ int main(int argc, char** argv)
     // private slots via Q_ARG — they must be known to the metatype system.
     qRegisterMetaType<AetherSDR::ClockLockState>("AetherSDR::ClockLockState");
     qRegisterMetaType<AetherSDR::ClockStation>("AetherSDR::ClockStation");
+    qRegisterMetaType<AetherSDR::ClockDiagnostics>("AetherSDR::ClockDiagnostics");
+    qRegisterMetaType<AetherSDR::ClockFrameInfo>("AetherSDR::ClockFrameInfo");
 
     // ---- 1. Defaults ----
     {
@@ -211,6 +213,84 @@ int main(int argc, char** argv)
         pump();
         CHECK(stateSpy.count() == 2);            // single delivery, not doubled
         CHECK(m.state() == int(ClockLockState::Locked));
+    }
+
+    // ---- 7. WS-7 diagnostics mirror: one snapshot, one notify; Q_PROPERTY +
+    // refusalName map; frameDecoded forwards through the model unchanged ----
+    {
+        AetherClockModel m;
+        // Defaults before any snapshot arrives.
+        CHECK(m.toneSnrDb() == 0.0);
+        CHECK(!m.toneDetected());
+        CHECK(m.framesInWindow() == 0);
+        CHECK(m.refusalName() == QStringLiteral("None"));
+
+        QSignalSpy diagSpy(&m, &AetherClockModel::diagnosticsChanged);
+        ClockDiagnostics d;
+        d.toneSnrDb = 18.5f;
+        d.pwmContrast = 3.2f;
+        d.toneDetected = true;
+        d.phaseLocked = true;
+        d.delayEstMs = 105.0f;
+        d.anchored = true;
+        d.badFrameStreak = 1;
+        d.classifiedPct = 87;
+        d.framesInWindow = 3;
+        d.windowSize = 8;
+        d.voteQuality = 0.034f;
+        d.refusalReason = quint8(ClockLockRefusal::QualityFloor);
+        QMetaObject::invokeMethod(&m, "onDiagnostics", Qt::QueuedConnection,
+                                  Q_ARG(AetherSDR::ClockDiagnostics, d));
+        pump();
+
+        CHECK(diagSpy.count() == 1);   // one snapshot, one notify
+        CHECK(m.property("toneSnrDb").toDouble() > 18.4 &&
+              m.property("toneSnrDb").toDouble() < 18.6);
+        CHECK(m.property("toneDetected").toBool());
+        CHECK(m.property("phaseLocked").toBool());
+        CHECK(m.property("anchored").toBool());
+        CHECK(m.property("badFrameStreak").toInt() == 1);
+        CHECK(m.property("classifiedPct").toInt() == 87);
+        CHECK(m.property("framesInWindow").toInt() == 3);
+        CHECK(m.property("windowSize").toInt() == 8);
+        CHECK(m.property("voteQuality").toDouble() > 0.03 &&
+              m.property("voteQuality").toDouble() < 0.04);
+        CHECK(m.property("refusalReason").toInt() ==
+              int(ClockLockRefusal::QualityFloor));
+        CHECK(m.property("refusalName").toString() == QStringLiteral("QualityFloor"));
+
+        // The full name map (bridge asserts read these strings).
+        auto nameFor = [&m](ClockLockRefusal r) {
+            ClockDiagnostics x;
+            x.refusalReason = quint8(r);
+            QMetaObject::invokeMethod(&m, "onDiagnostics", Qt::QueuedConnection,
+                                      Q_ARG(AetherSDR::ClockDiagnostics, x));
+            pump();
+            return m.refusalName();
+        };
+        CHECK(nameFor(ClockLockRefusal::Plausibility) == QStringLiteral("Plausibility"));
+        CHECK(nameFor(ClockLockRefusal::Staleness) == QStringLiteral("Staleness"));
+        CHECK(nameFor(ClockLockRefusal::Contested) == QStringLiteral("Contested"));
+        CHECK(nameFor(ClockLockRefusal::None) == QStringLiteral("None"));
+
+        // frameDecoded: engine signal → model signal, payload intact.
+        AetherClockEngine engine;
+        m.attachEngine(&engine);
+        QSignalSpy frameSpy(&m, &AetherClockModel::frameDecoded);
+        ClockFrameInfo fi;
+        fi.minute = 22; fi.hour = 6; fi.doy = 200; fi.year2 = 26;
+        fi.frameConfidence = 0.5f;
+        fi.station = ClockStation::Wwv;
+        QMetaObject::invokeMethod(&engine, "frameDecoded", Qt::DirectConnection,
+                                  Q_ARG(AetherSDR::ClockFrameInfo, fi));
+        pump();
+        CHECK(frameSpy.count() == 1);
+        if (frameSpy.count() == 1) {
+            const auto got = frameSpy.at(0).at(0).value<ClockFrameInfo>();
+            CHECK(got.minute == 22);
+            CHECK(got.station == ClockStation::Wwv);
+            CHECK(got.frameConfidence > 0.49f && got.frameConfidence < 0.51f);
+        }
     }
 
     if (g_failures == 0) {

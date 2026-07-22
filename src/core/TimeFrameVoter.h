@@ -40,6 +40,21 @@ enum class ClockStation : int {
     Wwvb    = 3,
 };
 
+// Why locked() currently says no (WS-7 acquisition telemetry). A tag on the
+// EXISTING lock gates — the verdict logic is unchanged, the tag just names
+// which gate refused (PRD-C: refusal reasons are set exactly where the voter
+// already branches, never new logic). None means locked, or simply not enough
+// frames yet (still collecting — the funnel reports frameCount separately).
+// uint8_t so it crosses the engine boundary as a plain byte.
+enum class ClockLockRefusal : std::uint8_t {
+    None         = 0,
+    QualityFloor = 1,  // resolution quality below Config::minLockQuality
+    Plausibility = 2,  // voted timestamp implausibly far from the reference
+    Staleness    = 3,  // no range-valid frame recent enough (or none at all)
+    Contested    = 4,  // window disagrees with itself: minute-increment chain
+                       // short, or a static field carries zero winning margin
+};
+
 // One BCD map entry: which second-of-frame carries which weight. A field's
 // value is the sum of weights whose seconds decoded as One.
 struct ClockBitWeight {
@@ -86,6 +101,32 @@ struct ClockTimeInfo {
     int64_t lastEdgeSample = 0;      // sample index of the most recent second edge
     int lastEdgeSecondOfFrame = -1;  // second-of-frame of that edge
     ClockStation station = ClockStation::Unknown;
+};
+
+// Read-only decoder acquisition snapshot (WS-7 / PRD-C): the pre-lock funnel's
+// stages 1-3 and 5, assembled ON CALL from state the decoder already keeps —
+// nothing here feeds back into decode behavior, and no field is display-derived
+// (every value is a real measurement or a real gate verdict). Stage 4 (the
+// classified-seconds ring) is engine-side. Pure std types — the decoders are
+// Qt-free (EB1/EB2); the engine mirrors this into the Qt-facing
+// ClockDiagnostics struct it emits at ~1 Hz.
+struct ClockDecoderDiagnostics {
+    // stage 1 — carrier
+    float toneSnrDb = 0.0f;    // WWVB: last tone-search peak/median in dB;
+                               // WWV/WWVH: folded tick-band peak-to-mean in dB
+    float pwmContrast = 0.0f;  // WWVB: p90/p10 envelope contrast (0 when n/a)
+    bool toneDetected = false; // WWVB tone-gate passed / WWV tick fold locked
+    // stage 2 — timing
+    bool phaseLocked = false;  // WWV tickLocked / WWVB phaseKnown
+    float delayEstMs = 0.0f;   // WWV tracked matched-filter delay; NaN when n/a
+    // stage 3 — frame
+    bool anchored = false;
+    int badFrameStreak = 0;    // WWV marker-skeleton health (WWVB: 0)
+    // stage 5 — vote
+    int framesInWindow = 0;    // TimeFrameVoter::frameCount()
+    int windowSize = 0;        // Config::window
+    float voteQuality = 0.0f;  // lockConfidence() raw 0..1
+    std::uint8_t refusalReason = 0;  // ClockLockRefusal
 };
 
 // A complete broadcast timestamp decoded from a single frame. minute/hour are
@@ -178,6 +219,7 @@ public:
     void reset();
 
     int frameCount() const;   // frames currently in the window
+    int windowSize() const { return static_cast<int>(m_cfg.window); }
 
     // Lock = at least minFramesForLock frames in the window, AND at least
     // (minFramesForLock - 1) adjacent frame pairs whose per-frame minutes
@@ -190,6 +232,12 @@ public:
     // must not permanently prevent or drop the lock (the reference scores
     // increments: marker_score + 4 * increment_count).
     bool locked() const;
+
+    // WS-7: which gate locked() is currently refusing on (None when locked, or
+    // when merely short of minFramesForLock — the funnel reports frameCount()
+    // separately). locked() and lockRefusal() both read one lockVerdict() pass,
+    // so the two can never disagree.
+    ClockLockRefusal lockRefusal() const;
 
     // Voted value of a timestamp field (minute/hour/doy/year), reported "as of
     // the newest frame". The contract is NORMALIZE, THEN PER-BIT:
@@ -304,6 +352,14 @@ private:
     // Thin wrapper: the resolved timestamp value (the source of truth for
     // votedField's four fields). Returns all-(-1) TimeFields when none qualifies.
     TimeFields votedTimestamp() const;
+
+    // The lock gates, evaluated in their original order, with each refusal
+    // tagged (WS-7). locked() == lockVerdict().locked by construction.
+    struct LockVerdict {
+        bool locked = false;
+        ClockLockRefusal reason = ClockLockRefusal::None;
+    };
+    LockVerdict lockVerdict() const;
 };
 
 } // namespace AetherSDR

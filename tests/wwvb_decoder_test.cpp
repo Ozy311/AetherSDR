@@ -640,6 +640,45 @@ int main() {
         CHECK(lockTransitions == 1);
     }
 
+    // --- Section: WS-7 diagnostics — stage flips on the clean vector; stage-1
+    // readouts stay honest on noise-only air (tone measured, gate not passed).
+    {
+        const auto x = synth(cleanSecs, kWwvbDropDb, /*bpsk*/false, /*sigma*/0.0, 0x1D1A6u);
+        WwvbDecoder d(24000);
+        Capture c; wire(d, c);
+        feedFixed(d, x, 512);
+        CHECK(d.state() == ClockLockState::Locked);      // precondition
+        const ClockDecoderDiagnostics g = d.diagnostics();
+        CHECK(g.toneDetected);
+        CHECK(g.toneSnrDb > 10.0f);      // gate is peak > 12x median (~10.8 dB)
+        CHECK(g.pwmContrast >= 1.4f);    // kMinContrast — a real AM drop exists
+        CHECK(g.phaseLocked);
+        CHECK(std::isnan(g.delayEstMs)); // WWV-only metric
+        CHECK(g.anchored);
+        CHECK(g.badFrameStreak == 0);    // WWV-only metric
+        CHECK(g.framesInWindow >= 2);
+        CHECK(g.windowSize == 8);
+        CHECK(g.voteQuality > 0.0f);
+        CHECK(g.refusalReason == static_cast<std::uint8_t>(ClockLockRefusal::None));
+
+        // Noise-only: MEASURED decoder behavior (fail-first run 2026-07-22) is
+        // that the early stages can transiently pass on pure AWGN — the 12x
+        // Goertzel tone gate false-fires within ~60 s of windows, and random
+        // symbol chatter can even double-marker-anchor briefly. What refuses
+        // noise is the frame/voter machinery: no structurally-valid frame ever
+        // completes. The diagnostics must report exactly that shape — late
+        // stages empty, no lock, no unexplained verdict.
+        WwvbDecoder n(24000);
+        Capture cn; wire(n, cn);
+        const auto nx = noiseVector(static_cast<std::size_t>(60) * kSR, 0.2, 0xF00Du);
+        feedFixed(n, nx, 512);
+        CHECK(n.state() != ClockLockState::Locked);
+        const ClockDecoderDiagnostics gn = n.diagnostics();
+        CHECK(gn.framesInWindow == 0);   // no valid frame ever survives noise
+        CHECK(gn.voteQuality == 0.0f);
+        CHECK(gn.refusalReason <= 4);    // always a valid ClockLockRefusal
+    }
+
     // --- Section: WS-4.5 — lock demotes on signal loss, cached vote stops
     // (Live 2026-07-20 class: a stale Locked must never be pinned; dead air
     // demotes and the per-second cached re-emission stops with it.)
