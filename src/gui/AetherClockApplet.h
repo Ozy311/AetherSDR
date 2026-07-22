@@ -14,11 +14,13 @@
 #include <QDateTime>
 #include <QPointer>
 #include <QString>
+#include <QVector>
 #include <QWidget>
 
 class QFrame;
 class QLabel;
 class QPushButton;
+class QTextEdit;
 class QTimer;
 class GuardedComboBox;
 
@@ -28,6 +30,7 @@ class AetherClockEngine;
 class AetherClockModel;
 class ClockAlignmentWidget;
 class SliceModel;
+struct ClockDiagnostics;
 
 class AetherClockApplet : public QWidget {
     Q_OBJECT
@@ -79,6 +82,15 @@ private:
     // drifted off the configured preset's expected dial (VFO spun away).
     void refreshTuneWarning();
 
+    // WS-7 acquisition telemetry surfaces (PRD-C). The funnel row + verdict
+    // line render the model's ClockDiagnostics snapshot pre-lock and collapse
+    // when Locked; the debug pane is the read-only "raw nerd info" feed in the
+    // settings drawer (AetherModem mechanics, SupportDialog token treatment).
+    void refreshFunnel();          // diagnosticsChanged → stages + verdict
+    QString verdictText(const ClockDiagnostics& d) const;  // §6 heuristic — measured only
+    void setDebugExpanded(bool expanded);
+    void appendDebugLine(const QString& tag, const QString& msg);
+
     QPointer<AetherClockEngine> m_engine;
     QPointer<AetherClockModel> m_model;
     QPointer<SliceModel> m_slice;       // strip-selected listening slice
@@ -93,6 +105,11 @@ private:
     QLabel* m_boundSliceTag{nullptr}; // "▸<letter>" bound slice, running only
     QLabel* m_daxWarning{nullptr};    // amber no-DAX-channel warning, under status row
     QLabel* m_tuneWarning{nullptr};   // amber tuned-away warning, under status row
+    QWidget* m_funnelRow{nullptr};    // WS-7 five-stage acquisition funnel (pre-lock)
+    QLabel* m_stageCells[5]{};        // Car / Tick / Frm / Dec / Vote cells
+    QLabel* m_verdictLine{nullptr};   // plain-English verdict, terse tech tooltip
+    QPushButton* m_debugToggle{nullptr};  // "▸ Debug" toggle inside the drawer
+    QTextEdit* m_debugLog{nullptr};   // read-only scrolling diagnostics pane
     QFrame* m_settingsDrawer{nullptr};
     QPushButton* m_drawerToggle{nullptr};
     GuardedComboBox* m_presetCombo{nullptr};
@@ -114,6 +131,14 @@ private:
     // for the tuned-away dial math + banner text.
     double m_runningCarrierMHz{0.0};
     QString m_runningPresetLabel;
+
+    // WS-7 funnel/verdict working state (display-side only).
+    int m_lastSecondOfFrame{-1};      // newest alignmentFrame secondOfFrame
+    qint64 m_stage1FailSinceMs{0};    // host ms since carrier stage started failing
+    qint64 m_stage2FailSinceMs{0};    // host ms since timing stage started failing
+    QVector<double> m_qualityTrend;   // last 3 voteQuality samples (verdict trend)
+    int m_lastLoggedFrames{-1};       // VOTE debug-line change detection
+    quint8 m_lastLoggedRefusal{0};
 };
 
 } // namespace AetherSDR

@@ -5,6 +5,8 @@
 #include "GuardedSlider.h"  // GuardedComboBox
 #include "core/AetherClockEngine.h"
 #include "core/AetherClockSettings.h"
+#include "core/ClockDiagnostics.h"  // WS-7 acquisition telemetry
+#include "core/LogManager.h"        // lcClock (debug-pane dual-write)
 #include "core/ThemeManager.h"
 #include "core/TimeFrameVoter.h"  // ClockStation / ClockLockState
 #include "models/AetherClockModel.h"
@@ -17,9 +19,12 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QString>
+#include <QTextEdit>
+#include <QTime>
 #include <QTimer>
 #include <QVariant>
 #include <QVBoxLayout>
@@ -44,6 +49,50 @@ constexpr int kStationRole = Qt::UserRole + 1;
 constexpr const char* kLedNoSignal = "#405060";
 constexpr const char* kLedAcquiring = "#ffb800";
 constexpr const char* kLedLocked = "#00ff88";
+
+// WS-7 verdict display floors — mirrors of the CITED core gate constants
+// (PRD-C §5): TimeFrameVoter.h minFramesForLock 2 (WwvDecoder.cpp voter
+// config), minLockQuality 0.05 (WwvDecoder.cpp / WwvbDecoder.cpp). Wording
+// thresholds only — the funnel never gates anything.
+constexpr int kVerdictMinFrames = 2;
+constexpr float kVerdictQualityFloor = 0.05f;
+// "Too corrupt" percent for the verdict wording. Loose by design: on the
+// banked live corpora the decoders classify essentially every second once
+// tick-locked even on a dirty band, so a sub-40% classified minute means the
+// timing lock itself is chattering — a genuinely borderline band.
+constexpr int kVerdictCorruptPct = 40;
+
+// WS-7 funnel stage cell state. The palette reuses the semantic status
+// colours of the lock LED family (literal by the same rationale as kLed*).
+enum class StageState { Pending, Active, Done };
+
+QLabel* makeStageCell(QWidget* parent)
+{
+    auto* cell = new QLabel(parent);
+    cell->setAlignment(Qt::AlignCenter);
+    cell->setMinimumWidth(28);
+    return cell;
+}
+
+void applyStageStyle(QLabel* cell, StageState st)
+{
+    if (!cell)
+        return;
+    const char* color = "#556070";   // pending: dim slate
+    const char* border = "#2a3040";
+    if (st == StageState::Done) {
+        color = kLedLocked;
+        border = "#00a060";
+    } else if (st == StageState::Active) {
+        color = kLedAcquiring;
+        border = "#806000";
+    }
+    cell->setStyleSheet(
+        QStringLiteral("QLabel { font-size: 9px; font-weight: bold;"
+                       " background: #0a0a18; border: 1px solid %1;"
+                       " border-radius: 3px; padding: 1px 2px; color: %2; }")
+            .arg(QLatin1String(border), QLatin1String(color)));
+}
 
 // Shared themed button chrome (matches the applet style guide standard
 // button: compact, bold, token-driven so it live-re-themes).
@@ -232,12 +281,17 @@ QSize AetherClockApplet::sizeHint() const
                             ? m_settingsDrawer->sizeHint().height() + 3
                             : 0;
     // The half-width toggle row is still one fixed 20 px row (folded into the
-    // +62 baseline); each warning banner adds height only while it is shown.
+    // +62 baseline); each warning banner adds height only while it is shown,
+    // as do the WS-7 funnel row + verdict line (pre-lock only).
     int warnH = 0;
     if (m_daxWarning && !m_daxWarning->isHidden())
         warnH += m_daxWarning->sizeHint().height() + 3;
     if (m_tuneWarning && !m_tuneWarning->isHidden())
         warnH += m_tuneWarning->sizeHint().height() + 3;
+    if (m_funnelRow && !m_funnelRow->isHidden())
+        warnH += m_funnelRow->sizeHint().height() + 3;
+    if (m_verdictLine && !m_verdictLine->isHidden())
+        warnH += m_verdictLine->sizeHint().height() + 3;
     return {260, std::max(240, scopeH + drawerH + warnH + 62)};
 }
 
@@ -252,6 +306,10 @@ QSize AetherClockApplet::minimumSizeHint() const
         warnH += m_daxWarning->minimumSizeHint().height() + 3;
     if (m_tuneWarning && !m_tuneWarning->isHidden())
         warnH += m_tuneWarning->minimumSizeHint().height() + 3;
+    if (m_funnelRow && !m_funnelRow->isHidden())
+        warnH += m_funnelRow->minimumSizeHint().height() + 3;
+    if (m_verdictLine && !m_verdictLine->isHidden())
+        warnH += m_verdictLine->minimumSizeHint().height() + 3;
     return {220, std::max(180, scopeH + drawerH + warnH + 50)};
 }
 
@@ -305,6 +363,45 @@ void AetherClockApplet::buildUi()
         row->addWidget(m_offsetValue);
 
         layout->addLayout(row);
+    }
+
+    // WS-7 acquisition funnel + verdict (PRD-C; Ozy §8: dedicated row, visible
+    // pre-lock only, collapses when Locked). Five gating stages rendered as
+    // compact state-tinted cells; the verdict line below translates them into
+    // plain language, with the terse technical numbers in its tooltip. Every
+    // readout is a measured ClockDiagnostics value — nothing display-derived.
+    {
+        m_funnelRow = new QWidget(this);
+        m_funnelRow->setObjectName(QStringLiteral("clockFunnelRow"));
+        auto* row = new QHBoxLayout(m_funnelRow);
+        row->setContentsMargins(0, 0, 0, 0);
+        row->setSpacing(3);
+        static const char* kStageNames[5] = {"Car", "Tick", "Frm", "Dec", "Vote"};
+        static const char* kStageTips[5] = {
+            "Stage 1 — carrier: station tone/subcarrier detected",
+            "Stage 2 — ticks: second-edge timing sync",
+            "Stage 3 — frame: minute frame anchored (marker sync)",
+            "Stage 4 — decode: % of the last 60 s classifying into symbols",
+            "Stage 5 — vote: frames in the voter window vs lock floor",
+        };
+        for (int i = 0; i < 5; ++i) {
+            m_stageCells[i] = makeStageCell(m_funnelRow);
+            m_stageCells[i]->setText(QLatin1String(kStageNames[i]));
+            m_stageCells[i]->setToolTip(QLatin1String(kStageTips[i]));
+            applyStageStyle(m_stageCells[i], StageState::Pending);
+            row->addWidget(m_stageCells[i], 1);
+        }
+        m_funnelRow->setVisible(false);
+        layout->addWidget(m_funnelRow);
+
+        m_verdictLine = new QLabel(this);
+        m_verdictLine->setObjectName(QStringLiteral("clockVerdict"));
+        m_verdictLine->setWordWrap(true);
+        ThemeManager::instance().applyStyleSheet(
+            m_verdictLine,
+            "QLabel { color: {{color.text.secondary}}; font-size: 10px; }");
+        m_verdictLine->setVisible(false);
+        layout->addWidget(m_verdictLine);
     }
 
     // No-DAX warning directly under the status row: amber, word-wrapped, hidden
@@ -479,6 +576,44 @@ void AetherClockApplet::buildSettingsDrawer()
         "QLabel { color: {{color.text.secondary}}; font-size: 10px; }");
     drawer->addWidget(m_presetNote);
 
+    // WS-7 debug-log pane: read-only scrolling diagnostics at the bottom of
+    // the drawer behind its own compact toggle (text-glyph convention, mirrors
+    // "▸ Settings"). QTextEdit mechanics per the AetherModem decode log
+    // (Ax25HfPacketDecodeDialog); chrome via theme tokens per SupportDialog —
+    // deliberately NOT AetherModem's pre-token hex blob. Visibility persists
+    // in the AetherClock settings blob (debugLogVisible — never a flat key).
+    m_debugToggle = new QPushButton(m_settingsDrawer);
+    m_debugToggle->setObjectName(QStringLiteral("clockDebugToggle"));
+    m_debugToggle->setAccessibleName(QStringLiteral("AetherClock debug log"));
+    m_debugToggle->setStyleSheet(kButtonBase());
+    m_debugToggle->setFixedHeight(20);
+    m_debugToggle->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    connect(m_debugToggle, &QPushButton::clicked, this, [this]() {
+        const bool expand = m_debugLog && m_debugLog->isHidden();
+        setDebugExpanded(expand);
+        AetherClockSettings::setDebugLogVisible(expand);  // user intent only
+    });
+    drawer->addWidget(m_debugToggle);
+
+    m_debugLog = new QTextEdit(m_settingsDrawer);
+    m_debugLog->setObjectName(QStringLiteral("clockDebugLog"));
+    m_debugLog->setReadOnly(true);
+    m_debugLog->document()->setMaximumBlockCount(2000);
+    m_debugLog->setLineWrapMode(QTextEdit::NoWrap);
+    m_debugLog->setFixedHeight(110);
+    m_debugLog->setPlaceholderText(
+        QStringLiteral("AetherClock diagnostics appear here while running."));
+    ThemeManager::instance().applyStyleSheet(
+        m_debugLog,
+        "QTextEdit { background: {{color.background.0}};"
+        " color: {{color.text.secondary}};"
+        " font-family: monospace; font-size: 10px;"
+        " border: 1px solid {{color.background.1}}; }");
+    drawer->addWidget(m_debugLog);
+
+    // Restore last visibility (no write-back on restore).
+    setDebugExpanded(AetherClockSettings::debugLogVisible());
+
     // Populate carriers from the engine preset list, then restore the saved
     // selection under a signal block so restore never persists or applies.
     const QVector<double> wwvCarriers = AetherClockEngine::wwvCarrierFrequenciesMHz();
@@ -575,6 +710,244 @@ void AetherClockApplet::setSettingsExpanded(bool expanded)
         p->updateGeometry();
 }
 
+void AetherClockApplet::setDebugExpanded(bool expanded)
+{
+    if (!m_debugLog)
+        return;
+    m_debugLog->setVisible(expanded);
+    if (m_debugToggle) {
+        // U+25BE / U+25B8 triangles — text glyphs, not emoji icons.
+        m_debugToggle->setText(expanded ? QStringLiteral("▾ Debug")
+                                        : QStringLiteral("▸ Debug"));
+    }
+    setMinimumHeight(minimumSizeHint().height());
+    updateGeometry();
+    adjustSize();
+    if (auto* p = parentWidget())
+        p->updateGeometry();
+}
+
+void AetherClockApplet::appendDebugLine(const QString& tag, const QString& msg)
+{
+    // Dual-write (the AetherModem lcAx25 precedent): every line also goes to
+    // the lcClock LogManager category, so file logging + Support-dialog
+    // visibility come for free.
+    qCDebug(lcClock).noquote() << tag << msg;
+    if (!m_debugLog || !m_debugLog->isVisible())
+        return;  // zero GUI cost while the pane is hidden
+    m_debugLog->append(QStringLiteral("%1 %2 %3").arg(
+        QTime::currentTime().toString(QStringLiteral("HH:mm:ss.zzz")), tag, msg));
+    if (auto* sb = m_debugLog->verticalScrollBar())
+        sb->setValue(sb->maximum());  // keep the newest line in view
+}
+
+void AetherClockApplet::refreshFunnel()
+{
+    const bool running = !m_engine.isNull() && m_engine->isRunning();
+    AetherClockModel* m = m_model.data();
+    const ClockLockState st = m ? m->lockState() : ClockLockState::NoSignal;
+    const bool show = running && st != ClockLockState::Locked;
+
+    const bool wasShown = m_funnelRow && m_funnelRow->isVisible();
+    if (m_funnelRow)
+        m_funnelRow->setVisible(show);
+    if (m_verdictLine)
+        m_verdictLine->setVisible(show);
+    if (wasShown != show) {
+        setMinimumHeight(minimumSizeHint().height());
+        updateGeometry();
+        adjustSize();
+        if (auto* p = parentWidget())
+            p->updateGeometry();
+    }
+    if (!show || !m)
+        return;
+
+    const ClockDiagnostics& d = m->diagnostics();
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+
+    // Fail-since clocks for the timed verdict rows (display-side only).
+    if (!d.toneDetected) {
+        if (!m_stage1FailSinceMs)
+            m_stage1FailSinceMs = now;
+    } else {
+        m_stage1FailSinceMs = 0;
+    }
+    if (!d.phaseLocked) {
+        if (!m_stage2FailSinceMs)
+            m_stage2FailSinceMs = now;
+    } else {
+        m_stage2FailSinceMs = 0;
+    }
+
+    // 3-sample quality trend for the verdict's climbing/flat word.
+    m_qualityTrend.append(double(d.voteQuality));
+    while (m_qualityTrend.size() > 3)
+        m_qualityTrend.removeFirst();
+
+    // Stage tinting: passed stages green, the FIRST unpassed stage amber
+    // (that's where acquisition currently sits), the rest dim. Stage 5 is
+    // never "done" pre-lock — a lock collapses the whole row.
+    const bool pass[5] = {
+        d.toneDetected,
+        d.phaseLocked,
+        d.anchored,
+        d.anchored && d.classifiedPct >= kVerdictCorruptPct,
+        false,
+    };
+    bool activeAssigned = false;
+    for (int i = 0; i < 5; ++i) {
+        StageState s = StageState::Pending;
+        if (pass[i]) {
+            s = StageState::Done;
+        } else if (!activeAssigned) {
+            s = StageState::Active;
+            activeAssigned = true;
+        }
+        applyStageStyle(m_stageCells[i], s);
+    }
+
+    // Live cell text for the value-bearing stages.
+    if (m_stageCells[0]) {
+        m_stageCells[0]->setText(
+            d.toneSnrDb > 0.0f
+                ? QString::asprintf("Car %.0fdB", double(d.toneSnrDb))
+                : QStringLiteral("Car"));
+        m_stageCells[0]->setToolTip(
+            QString::asprintf("Stage 1 — carrier: SNR %.1f dB, contrast %.1f, "
+                              "detected %s",
+                              double(d.toneSnrDb), double(d.pwmContrast),
+                              d.toneDetected ? "yes" : "no"));
+    }
+    if (m_stageCells[1]) {
+        m_stageCells[1]->setToolTip(
+            std::isnan(d.delayEstMs)
+                ? QStringLiteral("Stage 2 — ticks: timing sync %1")
+                      .arg(d.phaseLocked ? QStringLiteral("locked")
+                                         : QStringLiteral("searching"))
+                : QString::asprintf(
+                      "Stage 2 — ticks: timing sync %s, delay %.0f ms",
+                      d.phaseLocked ? "locked" : "searching",
+                      double(d.delayEstMs)));
+    }
+    if (m_stageCells[2]) {
+        m_stageCells[2]->setText(
+            (d.anchored && m_lastSecondOfFrame >= 0)
+                ? QStringLiteral("Frm :%1")
+                      .arg(m_lastSecondOfFrame, 2, 10, QLatin1Char('0'))
+                : QStringLiteral("Frm"));
+        m_stageCells[2]->setToolTip(
+            QStringLiteral("Stage 3 — frame: %1 (bad-frame streak %2)")
+                .arg(d.anchored ? QStringLiteral("anchored")
+                                : QStringLiteral("marker search"))
+                .arg(d.badFrameStreak));
+    }
+    if (m_stageCells[3]) {
+        m_stageCells[3]->setText(QStringLiteral("Dec %1%").arg(d.classifiedPct));
+        m_stageCells[3]->setToolTip(
+            QStringLiteral("Stage 4 — decode: %1% of the last 60 s classified")
+                .arg(d.classifiedPct));
+    }
+    if (m_stageCells[4]) {
+        m_stageCells[4]->setText(QStringLiteral("Vote %1/%2")
+                                     .arg(d.framesInWindow)
+                                     .arg(d.windowSize > 0 ? d.windowSize : 8));
+        m_stageCells[4]->setToolTip(
+            QString::asprintf("Stage 5 — vote: %d/%d frames, q %.3f (floor "
+                              "%.2f), refusal %s",
+                              d.framesInWindow, d.windowSize,
+                              double(d.voteQuality),
+                              double(kVerdictQualityFloor),
+                              qPrintable(m->refusalName())));
+    }
+
+    if (m_verdictLine) {
+        m_verdictLine->setText(verdictText(d));
+        // Terse technical tooltip (Ozy §8: plain line, numbers on hover).
+        m_verdictLine->setToolTip(QString::asprintf(
+            "SNR %.1f dB · contrast %.1f · %d%% classified · %d/%d frames · "
+            "q %.3f/%.2f · refusal %s",
+            double(d.toneSnrDb), double(d.pwmContrast), d.classifiedPct,
+            d.framesInWindow, d.windowSize, double(d.voteQuality),
+            double(kVerdictQualityFloor), qPrintable(m->refusalName())));
+    }
+
+    // Debug pane VOTE/GATE lines — on change only, not every second.
+    if (d.framesInWindow != m_lastLoggedFrames
+        || d.refusalReason != m_lastLoggedRefusal) {
+        appendDebugLine(QStringLiteral("VOTE"),
+                        QString::asprintf("frames=%d/%d q=%.3f refusal=%s",
+                                          d.framesInWindow, d.windowSize,
+                                          double(d.voteQuality),
+                                          qPrintable(m->refusalName())));
+        if (d.refusalReason != m_lastLoggedRefusal)
+            appendDebugLine(QStringLiteral("GATE"),
+                            QStringLiteral("refusal=%1").arg(m->refusalName()));
+        m_lastLoggedFrames = d.framesInWindow;
+        m_lastLoggedRefusal = d.refusalReason;
+    }
+}
+
+QString AetherClockApplet::verdictText(const ClockDiagnostics& d) const
+{
+    // PRD-C §6: evaluated top-down, first match wins; every condition is a
+    // measured stage or a real gate verdict — no fabricated probabilities.
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (!d.toneDetected && m_stage1FailSinceMs
+        && now - m_stage1FailSinceMs >= 60000) {
+        return QStringLiteral("No carrier — check antenna / band / preset dial");
+    }
+    const bool wwvb = !m_engine.isNull()
+                      && m_engine->configuredStation() == ClockStation::Wwvb;
+    if (wwvb && !m_boundSlice.isNull()
+        && m_boundSlice->agcMode().compare(QStringLiteral("off"),
+                                           Qt::CaseInsensitive) != 0) {
+        return QStringLiteral(
+            "WWVB needs AGC OFF — AGC pumping flattens the PWM");
+    }
+    if (d.toneDetected && !d.phaseLocked && m_stage2FailSinceMs
+        && now - m_stage2FailSinceMs >= 90000) {
+        return wwvb ? QStringLiteral("Carrier present, timing not syncing — "
+                                     "very weak signal")
+                    : QStringLiteral("Carrier present, timing not syncing — "
+                                     "very weak; try another WWV frequency");
+    }
+    if (d.phaseLocked && !d.anchored)
+        return QStringLiteral("Syncing frame… (marker search, up to ~2 min)");
+    if (d.anchored && d.classifiedPct < kVerdictCorruptPct) {
+        return QStringLiteral(
+                   "Decoding %1% of seconds — too corrupt to vote; borderline band")
+            .arg(d.classifiedPct);
+    }
+    if (d.anchored && d.framesInWindow < kVerdictMinFrames) {
+        QString s = QStringLiteral("Collecting frames — %1/%2")
+                        .arg(d.framesInWindow)
+                        .arg(kVerdictMinFrames);
+        if (m_lastSecondOfFrame >= 0)
+            s += QStringLiteral(", next completes in %1 s")
+                     .arg(59 - m_lastSecondOfFrame);
+        return s;
+    }
+    if (d.anchored && d.voteQuality < kVerdictQualityFloor) {
+        const bool climbing =
+            m_qualityTrend.size() >= 3
+            && m_qualityTrend.last() > m_qualityTrend.first() + 0.005;
+        return QString::asprintf("Voting — q %.3f/%.2f, %s — keep waiting",
+                                 double(d.voteQuality),
+                                 double(kVerdictQualityFloor),
+                                 climbing ? "climbing" : "flat");
+    }
+    const auto refusal = ClockLockRefusal(d.refusalReason);
+    if (refusal == ClockLockRefusal::Plausibility
+        || refusal == ClockLockRefusal::Staleness
+        || refusal == ClockLockRefusal::Contested) {
+        return QStringLiteral("Decode refused: %1 — waiting for cleaner frames")
+            .arg(m_model ? m_model->refusalName()
+                         : QString::number(d.refusalReason));
+    }
+    return QStringLiteral("Listening — measuring signal…");
+}
+
 void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* model)
 {
     if (!m_engine.isNull())
@@ -612,6 +985,27 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
         // Quality feeds the trust line and the LED tooltip.
         connect(m_model, &AetherClockModel::lockQualityChanged, this,
                 &AetherClockApplet::refreshTrustAndTime);
+        // WS-7: each ~1 Hz diagnostics snapshot redraws the funnel + verdict;
+        // per-frame decodes and state edges feed the debug pane.
+        connect(m_model, &AetherClockModel::diagnosticsChanged, this,
+                &AetherClockApplet::refreshFunnel);
+        connect(m_model, &AetherClockModel::stateChanged, this, [this](int) {
+            appendDebugLine(QStringLiteral("STATE"),
+                            m_model ? m_model->stateName() : QString());
+            refreshFunnel();  // a Locked edge collapses the funnel immediately
+        });
+        connect(m_model, &AetherClockModel::frameDecoded, this,
+                [this](const ClockFrameInfo& f) {
+            appendDebugLine(
+                QStringLiteral("FRAME"),
+                QString::asprintf(
+                    "min=%02d hr=%02d doy=%03d yr=%02d conf=%.2f dut1=%+.1f"
+                    " dst=%d%d lsw=%d lyi=%d",
+                    f.minute, f.hour, f.doy, f.year2,
+                    double(f.frameConfidence), f.dut1Tenths / 10.0,
+                    f.dst1 ? 1 : 0, f.dst2 ? 1 : 0,
+                    f.leapPending ? 1 : 0, f.leapYear ? 1 : 0));
+        });
     }
 
     if (!m_engine.isNull()) {
@@ -619,10 +1013,39 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
                 [this](const ClockAlignmentFrame& frame) {
             if (m_scope)
                 m_scope->appendFrame(frame);
+            // WS-7: the funnel's frame-stage countdown + the per-second debug
+            // feed (SEC lines only while the pane is visible — zero cost when
+            // hidden, per PRD-C).
+            m_lastSecondOfFrame = frame.secondOfFrame;
+            if (m_debugLog && m_debugLog->isVisible()) {
+                appendDebugLine(
+                    QStringLiteral("SEC"),
+                    QString::asprintf("sof=%d sym=%d conf=%.2f edge=%+dms",
+                                      frame.secondOfFrame, frame.symbol,
+                                      double(frame.confidence),
+                                      frame.edgeOffsetMs));
+            }
+        });
+        connect(m_engine, &AetherClockEngine::timeDecoded, this,
+                [this](const QDateTime& utc, double offsetMs, int quality) {
+            appendDebugLine(QStringLiteral("DECODE"),
+                            QStringLiteral("%1 offset=%2ms q=%3")
+                                .arg(utc.toUTC().toString(Qt::ISODate))
+                                .arg(offsetMs, 0, 'f', 0)
+                                .arg(quality));
         });
         connect(m_engine, &AetherClockEngine::runningChanged, this,
                 [this](bool running) {
             updateStartStopUi();
+            if (running) {
+                // Fresh acquisition: reset the funnel's verdict clocks/trend.
+                m_lastSecondOfFrame = -1;
+                m_stage1FailSinceMs = 0;
+                m_stage2FailSinceMs = 0;
+                m_qualityTrend.clear();
+                m_lastLoggedFrames = -1;
+                m_lastLoggedRefusal = 0;
+            }
             if (!running) {
                 // A real stop unbinds the slice; drop its DAX + frequency
                 // watches so a later channel/dial edit can't revive a
@@ -643,6 +1066,7 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
             updateTickTimer();
             refreshTrustAndTime();
             refreshTuneWarning();
+            refreshFunnel();
             // History is useful across a NoSignal dropout; only a real stop
             // clears the scope.
             if (!running && m_scope)
@@ -654,6 +1078,7 @@ void AetherClockApplet::attach(AetherClockEngine* engine, AetherClockModel* mode
     updateStartStopUi();
     refreshDaxUi();
     refreshTuneWarning();
+    refreshFunnel();
     updateDecodeAnchor();  // seed the anchor if the model already has a decode
 }
 
