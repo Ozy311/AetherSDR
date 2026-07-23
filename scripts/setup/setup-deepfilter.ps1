@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Build DeepFilterNet3 libdf library for Windows x64.
 

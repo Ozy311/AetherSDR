@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Download ONNX Runtime prebuilt binaries for Windows x64.
 
