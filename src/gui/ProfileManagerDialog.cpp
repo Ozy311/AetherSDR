@@ -188,11 +188,13 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
     // silently no-op against an existing name: explain the autosave model so
     // the user knows their updates aren't being captured.
     connect(saveBtn, &QPushButton::clicked, this, [this, type, nameEdit, list] {
-        QString name = nameEdit->text().trimmed();
-        if (name.isEmpty()) {
-            auto* item = list->currentItem();
-            if (item) name = item->text();
-        }
+        // No fallback to the highlighted row (#4396).  That fallback predates
+        // #177's select->auto-fill, when it was the only way to re-save an
+        // existing profile; now selection always fills the field, so it could
+        // only ever fire after the user deliberately cleared it — overwriting
+        // whichever row happened to be highlighted, silently.  A blank field
+        // means no target.
+        const QString name = nameEdit->text().trimmed();
         if (name.isEmpty()) return;
 
         if (type == "global") {
