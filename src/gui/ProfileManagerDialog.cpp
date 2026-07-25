@@ -32,6 +32,11 @@ static const QString kDialogStyle =
     "QPushButton { background: #1a2a3a; border: 1px solid #203040;"
     "  border-radius: 3px; padding: 4px 12px; color: #c8d8e8; }"
     "QPushButton:hover { background: #2a3a4a; }"
+    // Without this the dialog's explicit QPushButton color/background defeats
+    // Qt's default disabled rendering, so a disabled button is pixel-identical
+    // to an enabled one — the "no target" state (#4396) would be invisible.
+    "QPushButton:disabled { background: #141c26; border: 1px solid #1a2632;"
+    "  color: #5a6a78; }"
     "QCheckBox { color: #c8d8e8; }"
     "QCheckBox::indicator { width: 16px; height: 16px;"
     "  border: 1px solid #406080; border-radius: 3px; background: #0a0a18; }"
@@ -131,6 +136,9 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
 
     loadBtn->setEnabled(false);
     deleteBtn->setEnabled(false);
+    // An empty name field means "no target" (#4396).  Disabling up front says so
+    // before the click, instead of letting Save look armed and then do nothing.
+    saveBtn->setEnabled(!nameEdit->text().trimmed().isEmpty());
 
     btnRow->addWidget(loadBtn);
     btnRow->addWidget(saveBtn);
@@ -177,6 +185,19 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
             nameEdit->setText(current->text());
     });
 
+    // Two signals, deliberately: textChanged also fires for the programmatic
+    // fills (#177 select->auto-fill, refreshTab's setCurrentItem, the post-save
+    // clear), which is exactly what the enable gate must track.  textEdited
+    // fires only for a human keystroke — so retyping a name drops a stale
+    // result line, while the radio's own status push cannot wipe a result the
+    // user has not seen yet.
+    connect(nameEdit, &QLineEdit::textChanged, saveBtn, [saveBtn](const QString& t) {
+        saveBtn->setEnabled(!t.trimmed().isEmpty());
+    });
+    connect(nameEdit, &QLineEdit::textEdited, this, [this, type] {
+        setTabStatus(type, QString(), false);
+    });
+
     // Double-click loads
     connect(list, &QListWidget::itemDoubleClicked, this,
             [this, type](QListWidgetItem* item) {
@@ -213,7 +234,8 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
         // existing profile; now selection always fills the field, so it could
         // only ever fire after the user deliberately cleared it — overwriting
         // whichever row happened to be highlighted, silently.  A blank field
-        // means no target.
+        // means no target.  (The button is disabled in that state; this is the
+        // backstop.)
         const QString name = nameEdit->text().trimmed();
         if (name.isEmpty()) return;
 
