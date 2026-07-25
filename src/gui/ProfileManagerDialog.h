@@ -4,6 +4,7 @@
 
 #include <QMap>
 
+class QLabel;
 class QLineEdit;
 class QListWidget;
 class QPushButton;
@@ -26,6 +27,10 @@ private:
     QWidget* buildAutoSaveTab();
     void refreshTab(const QString& type);
 
+    // Post-action result line for a tab (#4362).  Empty text hides the label so
+    // it costs no layout height until there is something to say.
+    void setTabStatus(const QString& type, const QString& text, bool error);
+
     RadioModel* m_model;
     QTabWidget* m_tabs;
 
@@ -36,6 +41,7 @@ private:
         QPushButton* loadBtn;
         QPushButton* saveBtn;
         QPushButton* deleteBtn;
+        QLabel*      status;
     };
     QMap<QString, TabWidgets> m_tabWidgets;
 

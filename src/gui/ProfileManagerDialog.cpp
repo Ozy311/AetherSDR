@@ -12,6 +12,7 @@
 #include <QCheckBox>
 #include <QLabel>
 #include <QMessageBox>
+#include <QPointer>
 #include <QSignalBlocker>
 
 namespace AetherSDR {
@@ -35,6 +36,13 @@ static const QString kDialogStyle =
     "QCheckBox::indicator { width: 16px; height: 16px;"
     "  border: 1px solid #406080; border-radius: 3px; background: #0a0a18; }"
     "QCheckBox::indicator:checked { background: #00b4d8; }";
+
+// Result-line styling, matching ConnectionPanel's manual-connect result label
+// (ConnectionPanel.cpp:38-41) so the two read as the same kind of message.
+static const char* kResultInfoStyle =
+    "QLabel { color: #9bd1ff; font-size: 11px; background: transparent; border: none; }";
+static const char* kResultErrorStyle =
+    "QLabel { color: #ff8f8f; font-size: 11px; background: transparent; border: none; }";
 
 ProfileManagerDialog::ProfileManagerDialog(RadioModel* model, QWidget* parent)
     : PersistentDialog("Profile Manager", "ProfileManagerDialogGeometry", parent),
@@ -101,9 +109,12 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
     auto* page = new QWidget;
     auto* vbox = new QVBoxLayout(page);
 
-    // New profile name entry
+    // New profile name entry.  The three tabs build identical widget classes,
+    // so object names are what let an assertion (or the automation bridge) name
+    // *which* tab's field it means.
     auto* nameEdit = new QLineEdit;
     nameEdit->setPlaceholderText("New Profile Name");
+    nameEdit->setObjectName(QString("profileNameEdit_%1").arg(type));
     vbox->addWidget(nameEdit);
 
     // Buttons: Load, Save/Create, Delete.
@@ -116,6 +127,7 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
     const bool isGlobal = (type == "global");
     auto* saveBtn = new QPushButton(isGlobal ? "Save" : "Create");
     auto* deleteBtn = new QPushButton("Delete");
+    saveBtn->setObjectName(QString("profileSaveBtn_%1").arg(type));
 
     loadBtn->setEnabled(false);
     deleteBtn->setEnabled(false);
@@ -124,6 +136,14 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
     btnRow->addWidget(saveBtn);
     btnRow->addWidget(deleteBtn);
     vbox->addLayout(btnRow);
+
+    // Result line for the last Save/Create on this tab (#4362).  Hidden until
+    // there is something to report, so it adds no height to the resting dialog.
+    auto* status = new QLabel;
+    status->setObjectName(QString("profileStatus_%1").arg(type));
+    status->setWordWrap(true);
+    status->setVisible(false);
+    vbox->addWidget(status);
 
     if (!isGlobal) {
         auto* note = new QLabel(
@@ -146,7 +166,7 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
     vbox->addWidget(list, 1);
 
     // Store refs
-    m_tabWidgets[type] = {nameEdit, list, loadBtn, saveBtn, deleteBtn};
+    m_tabWidgets[type] = {nameEdit, list, loadBtn, saveBtn, deleteBtn, status};
 
     // Selection enables Load/Delete and populates the name field
     connect(list, &QListWidget::currentItemChanged, this,
@@ -198,7 +218,40 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
         if (name.isEmpty()) return;
 
         if (type == "global") {
-            m_model->sendCommand(QString("profile global save \"%1\"").arg(name));
+            // The R-line result code is the only thing that distinguishes a
+            // completed overwrite from a refused one (#4362) — the list refresh
+            // is a visual no-op when the name already exists.  QPointer-guarded
+            // because a pending callback is only erased by its matching
+            // response: if the dialog goes away first, the reply must find a
+            // null guard rather than freed widgets.
+            const QPointer<ProfileManagerDialog> self(this);
+            setTabStatus(type, QString("Saving \"%1\"...").arg(name), false);
+            m_model->sendCmdPublic(
+                QString("profile global save \"%1\"").arg(name),
+                [self, type, name](int code, const QString& body) {
+                    if (!self) return;
+                    if (code == 0) {
+                        // Clear first: the clear is programmatic, so it moves
+                        // the enable gate without touching the result line.
+                        if (self->m_tabWidgets.contains(type))
+                            self->m_tabWidgets[type].nameEdit->clear();
+                        self->setTabStatus(
+                            type, QString("Saved profile \"%1\".").arg(name), false);
+                    } else {
+                        // Keep the name field: the user's target survives for a
+                        // retry instead of being cleared as if it had worked.
+                        const QString detail = body.trimmed();
+                        self->setTabStatus(
+                            type,
+                            detail.isEmpty()
+                                ? QString("Radio refused save of \"%1\" (code 0x%2).")
+                                      .arg(name).arg(code, 0, 16)
+                                : QString("Radio refused save of \"%1\" (code 0x%2): %3")
+                                      .arg(name).arg(code, 0, 16).arg(detail),
+                            true);
+                    }
+                });
+            return;
         } else {
             bool exists = false;
             for (int i = 0; i < list->count(); ++i) {
@@ -248,6 +301,8 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
                 m_model->sendCommand(QString("profile mic create \"%1\"").arg(name));
         }
 
+        // TX/Mic only — the Global path clears inside its success callback, so
+        // a refused save keeps the user's target.
         nameEdit->clear();
         // Radio will push updated list via status
     });
@@ -311,6 +366,23 @@ QWidget* ProfileManagerDialog::buildAutoSaveTab()
     vbox->addStretch();
 
     return page;
+}
+
+void ProfileManagerDialog::setTabStatus(const QString& type, const QString& text,
+                                        bool error)
+{
+    if (!m_tabWidgets.contains(type)) return;
+    QLabel* status = m_tabWidgets[type].status;
+    if (!status) return;
+
+    if (text.isEmpty()) {
+        status->clear();
+        status->setVisible(false);
+        return;
+    }
+    status->setText(text);
+    status->setStyleSheet(error ? kResultErrorStyle : kResultInfoStyle);
+    status->setVisible(true);
 }
 
 void ProfileManagerDialog::refreshTab(const QString& type)
