@@ -14,6 +14,7 @@
 #include <QMessageBox>
 #include <QPointer>
 #include <QSignalBlocker>
+#include <QTimer>
 
 namespace AetherSDR {
 
@@ -48,6 +49,13 @@ static const char* kResultInfoStyle =
     "QLabel { color: #9bd1ff; font-size: 11px; background: transparent; border: none; }";
 static const char* kResultErrorStyle =
     "QLabel { color: #ff8f8f; font-size: 11px; background: transparent; border: none; }";
+
+// How long a Global save may sit unanswered before the result line stops
+// claiming it is still in flight. A profile save is a radio-side flash write,
+// so it is slower than a routine command; this is generous enough not to fire
+// on a merely slow radio, short enough that a dead session does not leave the
+// dialog lying about its state indefinitely.
+static constexpr int kSaveResponseTimeoutMs = 15000;
 
 ProfileManagerDialog::ProfileManagerDialog(RadioModel* model, QWidget* parent)
     : PersistentDialog("Profile Manager", "ProfileManagerDialogGeometry", parent),
@@ -203,6 +211,7 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
             [this, type](QListWidgetItem* item) {
         if (!item) return;
         const QString name = item->text();
+        setTabStatus(type, QString(), false);   // same staleness as Load (#4362)
         if (type == "global")
             m_model->loadGlobalProfile(name);
         else if (type == "transmit")
@@ -216,6 +225,10 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
         auto* item = list->currentItem();
         if (!item) return;
         const QString name = item->text();
+        // The result line describes the last Save on this tab; a Load makes it
+        // stale (and after a Delete it would name a profile that no longer
+        // exists). Only a human keystroke clears it otherwise (#4362).
+        setTabStatus(type, QString(), false);
         if (type == "global")
             m_model->loadGlobalProfile(name);
         else if (type == "transmit")
@@ -240,6 +253,22 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
         if (name.isEmpty()) return;
 
         if (type == "global") {
+            // A dropped command never produces an R-line, so "Saving..." would
+            // otherwise sit there forever claiming a save is in progress. There
+            // is no menu guard on opening this dialog, so the disconnected case
+            // is reachable directly: sendCmd() still allocates a seq and stores
+            // the callback, but RadioConnection::writeCommand() early-returns on
+            // !isConnected() and nothing ever resolves it (WanConnection::
+            // sendCommand() likewise returns 0 without invoking the callback).
+            // Say so up front instead of sending into the void.
+            if (!m_model || !m_model->isConnected()) {
+                setTabStatus(
+                    type,
+                    QString("Not connected — cannot save \"%1\".").arg(name),
+                    true);
+                return;
+            }
+
             // The R-line result code is the only thing that distinguishes a
             // completed overwrite from a refused one (#4362) — the list refresh
             // is a visual no-op when the name already exists.  QPointer-guarded
@@ -247,16 +276,28 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
             // response: if the dialog goes away first, the reply must find a
             // null guard rather than freed widgets.
             const QPointer<ProfileManagerDialog> self(this);
+            const quint64 token = ++m_saveSeq;
+            m_pendingSaveToken[type] = token;
             setTabStatus(type, QString("Saving \"%1\"...").arg(name), false);
             m_model->sendCmdPublic(
                 QString("profile global save \"%1\"").arg(name),
-                [self, type, name](int code, const QString& body) {
+                [self, type, name, token](int code, const QString& body) {
                     if (!self) return;
+                    // Superseded by a newer save on this tab, or already
+                    // resolved by the timeout — either way, stay quiet.
+                    if (self->m_pendingSaveToken.value(type) != token) return;
+                    self->m_pendingSaveToken[type] = 0;
                     if (code == 0) {
-                        // Clear first: the clear is programmatic, so it moves
-                        // the enable gate without touching the result line.
-                        if (self->m_tabWidgets.contains(type))
-                            self->m_tabWidgets[type].nameEdit->clear();
+                        // Clear only if the field still holds what we saved: a
+                        // reply that lands after the user started typing the
+                        // next name must not erase that half-typed entry. The
+                        // clear is programmatic, so it moves the enable gate
+                        // without touching the result line.
+                        if (self->m_tabWidgets.contains(type)) {
+                            QLineEdit* edit = self->m_tabWidgets[type].nameEdit;
+                            if (edit && edit->text().trimmed() == name)
+                                edit->clear();
+                        }
                         self->setTabStatus(
                             type, QString("Saved profile \"%1\".").arg(name), false);
                     } else {
@@ -273,6 +314,22 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
                             true);
                     }
                 });
+
+            // Backstop for a command that reaches the wire but is never
+            // answered — the radio drops, or a SmartLink session ends, between
+            // the send and the R-line. Without this the dialog keeps claiming
+            // the save is in flight for the life of the window.
+            QTimer::singleShot(kSaveResponseTimeoutMs, this,
+                               [self, type, name, token] {
+                if (!self) return;
+                if (self->m_pendingSaveToken.value(type) != token) return;
+                self->m_pendingSaveToken[type] = 0;
+                self->setTabStatus(
+                    type,
+                    QString("No response from the radio for \"%1\" — the save "
+                            "may not have been applied.").arg(name),
+                    true);
+            });
             return;
         } else {
             bool exists = false;
@@ -339,6 +396,10 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
             QString("Delete profile \"%1\"?").arg(name),
             QMessageBox::Yes | QMessageBox::No);
         if (reply != QMessageBox::Yes) return;
+
+        // Drop the last Save result: leaving it up would keep reporting
+        // 'Saved profile "X".' for the profile just deleted (#4362).
+        setTabStatus(type, QString(), false);
 
         if (type == "global")
             m_model->sendCommand(QString("profile global delete \"%1\"").arg(name));

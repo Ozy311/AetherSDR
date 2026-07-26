@@ -31,6 +31,15 @@ private:
     // it costs no layout height until there is something to say.
     void setTabStatus(const QString& type, const QString& text, bool error);
 
+    // In-flight Global save, per tab.  A save is resolved by exactly one of its
+    // response callback or its timeout, whichever arrives first; both carry the
+    // token they were issued with and no-op unless it is still the pending one.
+    // That makes a superseded save (the user hit Save again) silent instead of
+    // letting its late reply overwrite the newer one's result line.
+    // m_saveSeq only ever increments, so a token is never reused.
+    quint64 m_saveSeq{0};
+    QMap<QString, quint64> m_pendingSaveToken;   // type -> token, 0 = idle
+
     RadioModel* m_model;
     QTabWidget* m_tabs;
 
