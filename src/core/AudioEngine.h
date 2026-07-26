@@ -53,6 +53,7 @@ class ClientReverb;
 class ClientFinalLimiter;
 class ClientTxTestTone;
 class ClientQuindarTone;
+class WsprBeacon;
 class QuindarLocalSink;
 class CwSidetoneGenerator;
 #ifdef __APPLE__
@@ -119,6 +120,16 @@ public:
 
     // TX (microphone) – capture audio and send VITA-49 packets to radio
     Q_INVOKABLE bool startTxStream(const QHostAddress& radioAddress, quint16 radioPort);
+
+    // Host-modulating backend (HL2): run the TX audio chain even though no Flex
+    // stream id will ever be assigned.
+    //
+    // onTxAudioReady() gates on a stream id because for Flex that id IS the
+    // destination — no id means nowhere to send. A backend that modulates
+    // locally has a destination regardless, and the gate silently disabled the
+    // test tone as well, since the tone is injected inside that callback.
+    Q_INVOKABLE void setHostModulation(bool on) { m_hostModulation = on; }
+    bool hostModulation() const { return m_hostModulation; }
     Q_INVOKABLE void stopTxStream();
 
     // Set the DAX TX stream ID (from radio's response to "stream create type=dax_tx")
@@ -315,6 +326,13 @@ public:
     // overrides mic input with a sine before the user's DSP chain
     // runs — useful for setup / calibration.
     ClientTxTestTone* clientTxTestTone() { return m_clientTxTestTone.get(); }
+
+    // Sample-accurate WSPR source. It replaces the post-voice-chain signal
+    // on its own paced DAX/VITA-49 path, so speech processing and microphone
+    // callback rates cannot distort or shorten the four-tone frame.
+    WsprBeacon* wsprBeacon() { return m_wsprBeacon.get(); }
+    Q_INVOKABLE void startWsprPump();
+    Q_INVOKABLE void stopWsprPump();
 
     // Quindar tone generator (#2262).  Sits AFTER the user DSP chain
     // and PC mic gain but BEFORE the final brickwall limiter, so the
@@ -814,6 +832,10 @@ private:
     qint64 txCaptureBufferCapacityBytes() const;
     qint64 txCaptureNowMs() const;
     bool tciAudioFresh() const;
+    void pumpWsprBeacon();
+    void feedDaxTxAudioInternal(const QByteArray& float32pcm,
+                                bool markExternalSource,
+                                bool forceRadioDaxRoute);
     void observeTxCaptureState(QAudio::State state);
     void recordTxCaptureLocalTxAttempt();
     void logTxCaptureHealthEvent(TxCaptureHealthTracker::Event event);
@@ -849,6 +871,10 @@ private:
     quint16       m_txPort{0};
     quint32       m_txStreamId{0};         // DAX TX stream
     quint32       m_remoteTxStreamId{0};  // remote_audio_tx (voice/VOX)
+    // Host-modulating backend (HL2): no Flex stream id will ever be assigned,
+    // so the TX gate keys off this instead. setHostModulation() is the single
+    // write path.
+    bool          m_hostModulation{false};
     quint8        m_txPacketCount{0};    // 4-bit, mod 16
     QByteArray    m_txAccumulator;       // accumulate PCM until 128 stereo pairs
     QByteArray    m_voxAccumulator;     // accumulate PCM for VOX/met_in_rx stream
@@ -1026,6 +1052,7 @@ private:
     std::unique_ptr<ClientReverb> m_clientReverbTx;
     std::unique_ptr<ClientFinalLimiter> m_clientFinalLimiterTx;
     std::unique_ptr<ClientTxTestTone>   m_clientTxTestTone;
+    std::unique_ptr<WsprBeacon>         m_wsprBeacon;
     std::unique_ptr<ClientQuindarTone>  m_clientQuindarTone;
     // Audio-thread-loaded pointer for the post-final-limiter monitor
     // (final-output recording).  Same lock-free atomic pointer pattern
@@ -1121,6 +1148,17 @@ private:
     // webcam mic that produces continuous ambient packets.
     QElapsedTimer m_tciAudioTimer;
     static constexpr qint64 kTciAudioActiveWindowMs = 200;
+    QTimer* m_wsprPumpTimer{nullptr};
+    QElapsedTimer m_wsprPumpClock;
+    qint64 m_wsprPumpedFrames{0};
+    QByteArray m_wsprInt16Scratch;
+    QByteArray m_wsprFloatScratch;
+    // DAX TX mode borrowed for the duration of a WSPR frame so the mic path
+    // cannot produce a second packet stream against the same m_txPacketCount.
+    // m_wsprSavedDaxTxMode makes start/stop idempotent — stopWsprPump() has
+    // several early-return callers.
+    bool m_wsprPreviousDaxTxMode{false};
+    bool m_wsprSavedDaxTxMode{false};
 
     // Stale session watchdog: detects when audio data is being written but
     // processedUSecs() hasn't advanced, indicating the WASAPI session is

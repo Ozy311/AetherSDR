@@ -8,6 +8,7 @@
 //     Map + decision guide: docs/architecture/mainwindow-decomposition.md
 // ─────────────────────────────────────────────────────────────────────────────
 
+#include "core/backends/hl2/Hl2Discovery.h"
 #include "models/RadioModel.h"
 #include "models/BandSettings.h"
 #include "models/AntennaGeniusModel.h"
@@ -211,6 +212,7 @@ public:
     static constexpr int ShortcutFireUnknownId       = 1;
     static constexpr int ShortcutFireNoDirectHandler = 2;  // event-filter action (ptt_hold, CW keys)
     static constexpr int ShortcutFireTxBlocked       = 3;  // keysTx action, allowTx false
+    static constexpr int ShortcutFireTxOk            = 4;  // keysTx handler ran
     // Fire a registered ShortcutManager action by id — the exact path a MIDI
     // controller mapping takes (see fireShortcut in MainWindow_Controllers.cpp).
     // Used by the automation bridge (#3646) to reach MIDI/shortcut-only actions
@@ -248,7 +250,7 @@ public:
     // immediately.
     void setAutomationBridgeToken(const QString& token);
     // Persist the TX-via-MCP opt-in and push it live (Radio Setup → Network).
-    // Enabling arms the force-unkey watchdog; disabling force-unkeys the radio.
+    // Enabling grants permission; accepted TX actions arm the watchdog lease.
     void setAutomationTxAllowed(bool allowed);
     // Persist the observe-only opt-in and push it live (Radio Setup → Network).
     // When set, the bridge refuses every mutating verb (#4188 area 6).
@@ -393,6 +395,17 @@ private:
     void wirePanLifecycle();
     void wireCatPorts();            // MainWindow_Session.cpp
     void wireDaxIq();               // MainWindow_Session.cpp
+    // Re-establish the connections bound to the backend's PanadapterStream after
+    // RadioModel swapped backends for a different radio family.
+    void rewirePanStreamAfterBackendSwap();   // MainWindow_Session.cpp
+    // PanadapterStream-bound connect groups, each shared by its buildUI-time
+    // site and the post-backend-swap rebind so the two can never drift (#4448).
+    // Every stream-bound sink lives in one of these; a new one added here is
+    // automatically re-bound after a Flex->HL2->Flex swap.
+    void wirePanStreamRxAudioSinks();         // MainWindow_Session.cpp
+    void wirePanStreamTxSink();               // MainWindow_Session.cpp
+    void wirePanStreamTciSinks();             // MainWindow_Session.cpp
+    void wirePanStreamDaxIqSink();            // MainWindow_Session.cpp
     void wirePooDooTiles();         // MainWindow_DspApplets.cpp
     void wireDspApplets();          // MainWindow_DspApplets.cpp
     void wireExternalControllers(); // MainWindow_Controllers.cpp
@@ -739,6 +752,9 @@ private:
 
     // Core objects
     RadioDiscovery    m_discovery;
+    // HPSDR/Metis discovery for Hermes-Lite 2 radios. Feeds the same
+    // ConnectionPanel slots as m_discovery, tagged family="hl2".
+    hl2::Hl2Discovery m_hl2Discovery;
     // Radio sessions (#3445 Camp B / #3351). Each session owns the full
     // per-radio aggregate; today there is exactly one. The vector sits at
     // the old `RadioModel m_radioModel` member position so destruction
@@ -1400,6 +1416,7 @@ private:
     QString centerLockRadioKey() const;
     void syncCenterLockUi(const QString& panId);
     bool snapCenterLockForSlice(SliceModel* slice, double mhz, bool sendCommand);
+    void resyncPanGeometryToView(const QString& panId);
     void snapCenterLocksForTuningSlice(SliceModel* slice, double mhz,
                                        bool sendCommand);
     void holdCenterLockTuneTarget(SliceModel* slice, double mhz);
