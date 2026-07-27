@@ -1180,6 +1180,10 @@ private:
     // Menus
     QMenu*           m_profilesMenu{nullptr};
     QAction*         m_txBandAction{nullptr};
+    // Settings ▸ "Autostart DAX with AetherSDR". Held so
+    // applyCapabilitiesToUi() can hide it on a radio with no DAX streams.
+    // Null on platforms without a DAX bridge, where the entry is never created.
+    QAction*         m_autoDaxAction{nullptr};
 
     // Audio stream re-creation flag (after profile load)
     bool             m_needAudioStream{false};

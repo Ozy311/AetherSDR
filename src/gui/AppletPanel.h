@@ -180,6 +180,12 @@ public:
     // disconnected session keeps both, which is what the operator saw before.
     void setProfilesVisible(bool visible);
 
+    // Show/hide the DAX and DAX-IQ buttons and applets based on whether the
+    // connected radio produces per-slice audio / per-pan IQ streams
+    // (RadioCapabilities::hasDaxStreams). Same not-markHardwareConditional
+    // reasoning as setProfilesVisible above.
+    void setDaxStreamsVisible(bool visible);
+
     // Reset applet order to default
     void resetOrder();
 

@@ -150,6 +150,9 @@ RadioCapabilities FlexBackend::capabilities() const
     caps.canReboot = true;   // SmartSDR "radio reboot" (#4448 F3)
     // Global / TX / mic profiles are a SmartSDR feature on every current model.
     caps.hasProfiles = true;
+    // DAX audio + DAX IQ ride PanadapterStream's VITA-49 plane, which only this
+    // backend owns.
+    caps.hasDaxStreams = true;
 
     // Advertise the "flex" extension namespace: the amp/tuner operate/bypass/
     // autotune verbs are now routed through invokeExtension() (#4092/#4094), and

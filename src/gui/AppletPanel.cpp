@@ -1431,6 +1431,17 @@ void AppletPanel::setProfilesVisible(bool visible)
                               QStringLiteral("Applet_PROF"), visible);
 }
 
+void AppletPanel::setDaxStreamsVisible(bool visible)
+{
+    // Both tiles are the same capability: "DAX" is per-slice receive audio,
+    // "IQ" is per-panadapter IQ, and a radio produces both stream kinds or
+    // neither.
+    applyCapabilityVisibility(QStringLiteral("DAX"),
+                              QStringLiteral("Applet_DAX"), visible);
+    applyCapabilityVisibility(QStringLiteral("IQ"),
+                              QStringLiteral("Applet_IQ"), visible);
+}
+
 void AppletPanel::setTunerVisible(bool visible)
 {
     updateHardwareAvailability("TUN", "Applet_TUN", visible);

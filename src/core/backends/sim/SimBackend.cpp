@@ -296,6 +296,8 @@ RadioCapabilities SimBackend::capabilities() const
     caps.hasExtendedDsp = false;
     // The simulator has no profile store to list, load or save into.
     caps.hasProfiles = false;
+    // Synthetic audio only; nothing to route to a virtual device.
+    caps.hasDaxStreams = false;
     return caps;
 }
 

@@ -74,6 +74,20 @@ struct RadioCapabilities {
     // rather than offering an empty list the operator cannot populate.
     bool hasProfiles = false;
 
+    // The radio can deliver per-slice receive audio and per-panadapter IQ as
+    // separate streams, which this host routes to virtual audio devices for
+    // external decoders (WSJT-X, fldigi, CW Skimmer).
+    //
+    // Named for the CONCEPT, not the brand: "DAX" is FlexRadio's name for it,
+    // but nothing about routing RX audio to a virtual device is inherently
+    // Flex-specific, and a future backend that grows the ability should be able
+    // to say so without the field reading as a vendor special case.
+    //
+    // UI VISIBILITY ONLY. The runtime guard that stops a non-Flex session
+    // reaching the bridge is a separate null-check on panStream() in
+    // MainWindow::startDax() — a crash guard, deliberately not merged with this.
+    bool hasDaxStreams = false;
+
     // Vendor-specific capabilities, keyed by extension namespace. Clients that
     // don't understand a namespace ignore it; a backend never puts core-profile
     // fields here. Example: {"flex": {"multiFlex": true, "guiClientId": "…"}}.

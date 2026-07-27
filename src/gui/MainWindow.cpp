@@ -6100,6 +6100,20 @@ void MainWindow::applyCapabilitiesToUi(bool connected, const RadioCapabilities& 
             m_profileImportExportDialog->close();
         }
     }
+
+    // ── DAX: the DAX and DAX-IQ applets, and the autostart toggle ──────────
+    //
+    // VISIBILITY ONLY. startDax()'s null-check on panStream() is a separate
+    // crash guard and stays exactly where it is — the two are not merged. This
+    // stops the operator being offered the controls; that stops a session that
+    // somehow reaches the bridge anyway from segfaulting on a null stream.
+    const bool dax = !connected || caps.hasDaxStreams;
+    if (m_appletPanel) {
+        m_appletPanel->setDaxStreamsVisible(dax);
+    }
+    if (m_autoDaxAction) {
+        m_autoDaxAction->setVisible(dax);
+    }
 }
 
 SliceModel* MainWindow::activeSlice() const

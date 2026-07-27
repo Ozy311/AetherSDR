@@ -412,6 +412,9 @@ RadioCapabilities Hl2Backend::capabilities() const
     // connection beyond its registers — everything the operator can change
     // lives in this application, so there is nothing for a profile to name.
     c.hasProfiles = false;
+    // No per-slice audio or per-pan IQ stream plane: the HL2 sends one raw IQ
+    // feed and this host demodulates it.
+    c.hasDaxStreams = false;
     // No extension namespaces (no invokeExtension verbs yet), matching FlexBackend.
     return c;
 }

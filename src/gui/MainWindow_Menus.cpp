@@ -674,6 +674,8 @@ void MainWindow::buildMenuBar()
     }
 #else
     auto* autoDaxAction = settingsMenu->addAction("Autostart DAX with AetherSDR");
+    m_autoDaxAction = autoDaxAction;   // hidden by applyCapabilitiesToUi() on a
+                                       // radio that reports no DAX streams
     autoDaxAction->setCheckable(true);
     autoDaxAction->setChecked(
         AppSettings::instance().value("AutoStartDAX", "False").toString() == "True");
