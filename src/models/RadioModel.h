@@ -230,13 +230,22 @@ public:
     // firmware DSP filters (NRL, NRS, RNN, NRF).  6000-series radios don't
     // expose these filters and the UI hides them when this returns false. (#2177)
     //
-    // Delegates to the FlexLib-sourced ModelCapabilities platform table
-    // (Principle I) instead of ad-hoc substring checks — the old prefix form
-    // silently missed the "S" server variants (MLS-9601 doesn't contain "ML-";
-    // CLS-9301 doesn't contain "CL-") and was case-sensitive.
-    bool hasExtendedDspFilters() const {
-        return capabilitiesFor(m_model).hasExtendedDsp();
-    }
+    // Reads the CONNECTED BACKEND's declared RadioCapabilities::hasExtendedDsp,
+    // falling back to the FlexLib-sourced ModelCapabilities platform table
+    // (Principle I) only when no radio is connected.
+    //
+    // The backend is the authority here and the table is the guess. FlexBackend
+    // already populated caps.hasExtendedDsp — from that same table — but nothing
+    // read it: all three GUI call sites came through this method, which went
+    // straight to capabilitiesFor(m_model) and bypassed the seam entirely. A
+    // non-Flex backend declaring the capability honestly had no way to be heard,
+    // and a Flex refining the value from live radio status (as touchpoints
+    // convert) would have been ignored.
+    //
+    // Deliberately NOT ad-hoc substring checks, which the table replaced: the
+    // old prefix form silently missed the "S" server variants (MLS-9601 doesn't
+    // contain "ML-"; CLS-9301 doesn't contain "CL-") and was case-sensitive.
+    bool hasExtendedDspFilters() const;
 
     // True for 2-SCU radios that support diversity RX, from the FlexLib-sourced
     // ModelCapabilities table (Principle I).  Replaces the hand-maintained
