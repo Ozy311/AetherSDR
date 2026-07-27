@@ -161,7 +161,7 @@ bool MetisClient::start(const Params& params)
     m_params = params;
     m_host = params.host;
     m_port = params.port;
-    m_ccConfig = ccConfig(m_params.sampleRate, effectiveNumRx());
+    m_ccConfig = ccConfig(m_params.sampleRate, effectiveNumRx(), m_params.ocFilterByte);
     m_ccGain = ccRxGain(m_params.lnaGainDb);
     m_ccFreq = ccRx1Freq(m_params.rxFrequencyHz);
     m_txSeq = 0;
@@ -276,13 +276,31 @@ void MetisClient::setSampleRate(SampleRate rate)
     // Was hardcoded to 1: changing sample rate silently reset the receiver
     // count, so any multi-receiver configuration would have collapsed to a
     // single receiver the first time the operator changed bandwidth.
-    m_ccConfig = ccConfig(rate, effectiveNumRx());
+    //
+    // The filter byte is here for the SAME reason. Everything that shares this
+    // register has to be carried through every rebuild of it; anything a
+    // rebuild re-defaults gets silently dropped the next time an unrelated
+    // control changes — a zoom would have released the band relays.
+    m_ccConfig = ccConfig(rate, effectiveNumRx(), m_params.ocFilterByte);
 }
 
 void MetisClient::setLnaGainDb(int db)
 {
     m_params.lnaGainDb = db;
     m_ccGain = ccRxGain(db);
+}
+
+void MetisClient::setBandFilter(int ocFilterByte)
+{
+    const std::uint8_t oc = static_cast<std::uint8_t>(ocFilterByte & 0x7F);
+    if (oc == m_params.ocFilterByte)
+        return;                       // relays already where they belong
+    m_params.ocFilterByte = oc;
+    m_ccConfig = ccConfig(m_params.sampleRate, effectiveNumRx(), oc);
+    // Ahead of the rotation: a band change moves the NCO and the filter in the
+    // same gesture, and waiting for the round robin would leave the relays on
+    // the old band for up to three EP2 frames.
+    m_oneShot.push_back(m_ccConfig);
 }
 
 void MetisClient::requestPipelineReset()

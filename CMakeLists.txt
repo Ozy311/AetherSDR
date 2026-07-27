@@ -930,6 +930,7 @@ set(GUI_SOURCES
     src/gui/TitleBar.cpp
     src/gui/SupportDialog.cpp
     src/gui/SliceTroubleshootingDialog.cpp
+    src/gui/RadioHealthDialog.cpp
     src/gui/KeyboardMapWidget.cpp
     src/gui/ShortcutDialog.cpp
     src/gui/MultiFlexDialog.cpp
@@ -2622,6 +2623,15 @@ add_executable(hl2_metis_protocol_test
     src/core/backends/hl2/MetisProtocol.cpp)
 target_include_directories(hl2_metis_protocol_test PRIVATE src)
 add_test(NAME hl2_metis_protocol_test COMMAND hl2_metis_protocol_test)
+
+# HL2 live band-filter probe — REQUIRES REAL HARDWARE, so deliberately NOT
+# registered with add_test(). Build it and run it by hand against a radio:
+#   cmake --build build --target hl2_live_band_filter_probe
+#   ./build/hl2_live_band_filter_probe 192.168.1.21
+add_executable(hl2_live_band_filter_probe EXCLUDE_FROM_ALL
+    tests/hl2_live_band_filter_probe.cpp)
+target_include_directories(hl2_live_band_filter_probe PRIVATE src)
+target_link_libraries(hl2_live_band_filter_probe PRIVATE aethercore Qt6::Core Qt6::Network)
 
 # HL2 MetisClient loopback test — drives the UDP wire against a fake HL2.
 add_executable(hl2_metis_client_test tests/hl2_metis_client_test.cpp)
