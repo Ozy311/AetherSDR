@@ -1636,7 +1636,76 @@ capability for it would have been duplicate machinery for a path that already
 behaved. **Verify before you add a flag**; a second source of truth for the
 same fact is how the two-callers-one-widget bug gets built.
 
-### 18.7 Testing the capability, not the family
+### 18.7 Radio-side DSP, and why it is not one flag
+
+The second round covered five more surfaces: NR/NB/ANF/NRL/ANFL/ANFT in the
+slice VFO, the APD row, the WNB row in the ANT panel, `File ▸ Waveforms`, and
+`Settings ▸ multiFLEX`. The obvious move is one flag called `hasFlexDsp`. Two
+reasons it is three flags instead:
+
+- **The name.** A field in this struct is what a *future* backend implements. A
+  non-Flex radio with firmware NR should not have to set something called
+  `hasFlexDsp` to say so, and §18.1 forbids the vendor name anyway.
+- **The grouping.** Waveforms is plugin management and multiFLEX is session
+  multiplicity. Neither is DSP. One flag covering all five would under-describe
+  what it does at three of its five call sites.
+
+So: `hasRadioSideDsp`, `hasWaveforms`, `hasMultiClientSessions`.
+
+**`hasRadioSideDsp` is not `hasExtendedDsp`.** The latter is narrower — the extra
+8000-series firmware filters (NRS/RNN/NRF) on a radio that already has the base
+set. A radio with `hasRadioSideDsp=false` has neither. The test asserts they are
+independent (Flex reports base-true, extended-false for an unknown model string)
+so a later change cannot quietly collapse them.
+
+Neither flag says anything about the **client-side** modules — NR2, NR4, MNR,
+BNR, DFNR, RN2. Those run on this host, work on any family, and stay available on
+the HL2. The proof is visual: on an HL2 the VFO's DSP tab keeps `ADSP` and
+`AetherVoice` and loses every radio-side toggle.
+
+### 18.8 Two setVisible sites that disagreed, and the fix that does NOT unify them
+
+The six VFO buttons had **two independent `setVisible()` sites** — the slice
+`modeChanged` handler and `syncFromSlice()` — which is §18.2's last trap in the
+wild. The fix is one owner, `applyRadioSideDspVisibility()`.
+
+The interesting part is what it does *not* do. `updateExtendedDspVisibility()`
+(the #2177 precedent three lines away) derives mode itself, which is safe because
+its callers were unified once and agreed afterwards. These six have **no agreed
+rule**: the `modeChanged` handler's `isVoice` carries a `!isFdv` term, so
+ANF/ANFL/ANFT hide for FreeDV on that path; `syncFromSlice`'s ANF expression does
+not, so they stay. Same class of drift #2177 found on DFM, still live.
+
+Deriving mode in the new owner would have silently picked a winner. Instead each
+site caches its own answer into `m_*ModeOk` and the owner only ANDs the
+capability. Behaviour preserved exactly, including the inconsistency — resolving
+*that* is a separate change with its own decision to make.
+
+**The WNB row was a bare layout.** Hiding `m_wnbBtn` alone would have left its
+level slider and readout floating with nothing to label them, so the row is now
+wrapped in a container and hidden as a unit. It is seeded at all four
+overlay-menu build sites, because those menus are created lazily as pans appear —
+the same reason `applyTuningRangeToOverlayMenu()` is called from four places.
+
+### 18.9 APD gets a second input, not a second truth
+
+`apdConfigurable` stays the authority on whether a Flex reports the predistorter
+configurable. `hasRadioSideDsp` is ANDed with it in one `updateApdVisibility()`.
+
+This looks like it contradicts §18.6, which said APD needed nothing. It does not,
+and the difference is worth stating: §18.6's check was that APD is never wrongly
+*shown* on an HL2, and that held. What did not hold is *why* it held. `m_apdRow`
+is constructed **visible**, and `apdConfigurable` arrives only in Flex
+`TransmitDelta` status — so on a backend that never sends it, the row's state
+comes from whatever the previous session left behind, not from the connected
+radio. Correct by history is not correct.
+
+Two inputs, one method, per §18.2. Note the consequence for testing: on HL2
+hardware APD is hidden in **both** the connected and disconnected states, because
+`apdConfigurable` is false either way. There is no A/B to photograph — the unit
+test carries that one.
+
+### 18.10 Testing the capability, not the family
 
 `tests/radio_capability_gating_test.cpp` asserts capabilities only — never
 `caps.family`, never a backend type. A test that asserted the family would pass
