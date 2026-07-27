@@ -1,4 +1,5 @@
 #include "core/backends/hl2/MetisClient.h"
+#include "core/backends/hl2/Hl2EmergencyStop.h"
 
 #include <QElapsedTimer>
 #include <QThread>
@@ -184,6 +185,16 @@ bool MetisClient::start(const Params& params)
     // again so nothing is lost to the start transition. Starting before any C&C
     // has landed makes the firmware stream ADC-idle samples (Q pinned to zero).
     m_running = true;
+
+    // Arm the signal-handler stop BEFORE the first start datagram goes out.
+    //
+    // Ordering matters and it is one-sided: armed-but-not-streaming costs a
+    // stray 64-byte datagram to a radio that is not listening for it, while
+    // streaming-but-not-armed is a radio that has to be power-cycled. Arm
+    // early, on the pessimistic side.
+    armEmergencyStop(m_socket->socketDescriptor(), m_host, m_port,
+                     metisStop(m_watchdogEnabled));
+
     sendPrimingBurst(3);
     sendTo(*m_socket, metisStart(m_watchdogEnabled), m_host, m_port);
     sendPrimingBurst(3);
@@ -248,6 +259,11 @@ void MetisClient::stop()
     if (m_connectWatchdog) m_connectWatchdog->stop();
     if (m_socket) {
         sendTo(*m_socket, metisStop(m_watchdogEnabled), m_host, m_port);
+        // Disarm only AFTER the normal stop has gone out, and before the
+        // descriptor is closed. Disarming earlier would leave a window where a
+        // signal arriving mid-teardown released nothing; later would leave a
+        // closed — or worse, recycled — descriptor armed.
+        disarmEmergencyStop();
         m_socket->close();
         m_socket->deleteLater();
         m_socket = nullptr;
