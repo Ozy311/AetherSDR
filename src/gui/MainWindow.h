@@ -351,6 +351,19 @@ private:
     // range leaves every band enabled (the Flex behaviour).
     void applyTuningRangeToOverlayMenu(SpectrumOverlayMenu* menu) const;
 
+    // The one place a declared RadioCapabilities flag turns into UI visibility.
+    //
+    // Bound to RadioModel::capabilitiesChanged, so it runs on every connect and
+    // disconnect edge and on any mid-session revision. Each surface gets exactly
+    // one owning call here rather than its own connect-time lambda: with several
+    // flags in play, scattered lambdas are how two callers end up both driving
+    // one widget's setVisible() and whichever fires last wins.
+    //
+    // Every flag reads `!connected || caps.x`. With no radio attached there is
+    // nothing to be honest about, and a control that stays hidden after
+    // unplugging reads as a fault rather than as an accurate report.
+    void applyCapabilitiesToUi(bool connected, const RadioCapabilities& caps);
+
     // AppSettings key for a pan's persisted RF gain, scoped by radio FAMILY.
     //
     // RF gain is the one "display" setting that is really a hardware register,

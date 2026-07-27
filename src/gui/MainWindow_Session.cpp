@@ -431,6 +431,15 @@ void MainWindow::wireRadioModel()
     // ── Wire up radio model ────────────────────────────────────────────────
     connect(&m_radioModel, &RadioModel::connectionStateChanged,
             this, &MainWindow::onConnectionStateChanged);
+
+    // Capability-driven UI visibility, all of it, through one slot. RadioModel
+    // fires this on every connect/disconnect edge and on any mid-session
+    // revision by the backend, so applyCapabilitiesToUi() is the only place a
+    // declared capability turns into a widget being shown or hidden — no
+    // per-flag connect-time lambdas, and no widget with two callers racing to
+    // set its visibility.
+    connect(&m_radioModel, &RadioModel::capabilitiesChanged,
+            this, &MainWindow::applyCapabilitiesToUi);
     // Slice Link: disconnect teardown never emits sliceRemoved (stale slices
     // are staged for reconnect reclaim), so dissolve the link explicitly.
     // Both transitions dissolve — a link never crosses a session boundary

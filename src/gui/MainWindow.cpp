@@ -6072,6 +6072,14 @@ void MainWindow::applyTuningRangeToOverlayMenu(SpectrumOverlayMenu* menu) const
     menu->setTuningRangeMhz(caps.tuningMinHz / 1.0e6, caps.tuningMaxHz / 1.0e6);
 }
 
+void MainWindow::applyCapabilitiesToUi(bool connected, const RadioCapabilities& caps)
+{
+    // See the header for why every flag is `!connected || caps.x` and why each
+    // surface gets exactly one owning call.
+    (void)connected;
+    (void)caps;
+}
+
 SliceModel* MainWindow::activeSlice() const
 {
     SliceModel* cached = nullptr;

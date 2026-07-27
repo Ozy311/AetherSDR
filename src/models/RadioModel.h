@@ -628,6 +628,17 @@ signals:
     void infoChanged();
     void licenseFeaturesChanged();
     void connectionStateChanged(bool connected);
+    // The connected backend's self-declared RadioCapabilities changed, or a
+    // connect/disconnect changed which backend is answering. Relays
+    // IRadioBackend::capabilitiesChanged and also fires on every
+    // connectionStateChanged edge, so a consumer that wants "the capability
+    // picture is now different, re-read it" needs exactly this one connection.
+    //
+    // `connected` is passed rather than left for the slot to query, because
+    // every capability-driven surface has to distinguish "the radio says it
+    // lacks this" from "there is no radio" — the latter restores the permissive
+    // value (see MainWindow::applyCapabilitiesToUi).
+    void capabilitiesChanged(bool connected, const RadioCapabilities& caps);
     // Emitted whenever the backend instance is (re)built — including the
     // connect-time swap between FlexBackend and SimBackend (RFC #4288). The old
     // m_backend is already destroyed and m_backend now points at the new one.
@@ -1013,6 +1024,10 @@ private:
     // run again on a family change — not just at construction.
     void setupBackend(const QString& family);
     void teardownBackend();
+    // Push the backend's RadioCapabilities into the models that own each flag,
+    // then emit capabilitiesChanged. Called on every connect/disconnect edge and
+    // whenever the backend revises its own capabilities.
+    void publishCapabilities(bool connected);
 
     // aetherd RFC step 2 (§5.5): the radio-facing seam. Held via std::unique_ptr
     // (owned via unique_ptr below). As of 2.2b it OWNS the RadioConnection +
