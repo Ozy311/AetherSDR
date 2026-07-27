@@ -1705,6 +1705,28 @@ hardware APD is hidden in **both** the connected and disconnected states, becaus
 `apdConfigurable` is false either way. There is no A/B to photograph — the unit
 test carries that one.
 
+**Be honest about what the capability buys here: today, nothing observable.**
+Under the AND, `apdConfigurable=false` already hides the row in every reachable
+state, and no backend reports `apd configurable=1` while declaring
+`hasRadioSideDsp=false` — that combination would be self-contradictory. So the
+second input is an assertion against a future backend, not a fix for a live bug.
+Recording that is the point: a capability wired in "for symmetry" that changes no
+behaviour is worth *saying so* rather than letting a reader assume it closed
+something.
+
+What WAS a live bug, found by asking that question: `m_apdRow` is a QWidget and so
+constructed **visible**, and neither input had fired at startup — nothing called
+`updateApdVisibility()` until a connect edge or an `apdStateChanged`. A cold
+launch therefore showed a live-looking APD button and Active/Cal/Avail indicators
+with no radio at all, and cold start disagreed with post-disconnect, where
+`resetState()` clears `apdConfigurable` and the row correctly goes away. One
+`updateApdVisibility()` call at the end of the row's construction fixes it.
+
+The general lesson: **the default visibility of a widget is a decision, and a
+`QWidget` gives you `true` whether you meant it or not.** Every gated surface in
+this section needs a defined state at t=0, not just a rule for what happens when
+a signal arrives.
+
 ### 18.10 Testing the capability, not the family
 
 `tests/radio_capability_gating_test.cpp` asserts capabilities only — never
