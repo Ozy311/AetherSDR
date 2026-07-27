@@ -247,6 +247,20 @@ public:
     // contain "ML-"; CLS-9301 doesn't contain "CL-") and was case-sensitive.
     bool hasExtendedDspFilters() const;
 
+    // Whether the RADIO runs its own noise reduction / blanking / auto-notch
+    // (RadioCapabilities::hasRadioSideDsp) — NR, NB, ANF, NRL, ANFL, ANFT, the
+    // APD predistorter and the wideband noise blanker.
+    //
+    // Permissive when no radio is connected, like every other capability-gated
+    // surface: there is nothing to be honest about with nothing attached, and
+    // controls that stayed hidden after unplugging would read as a fault. Unlike
+    // hasExtendedDspFilters() there is no model-name table to fall back to, so
+    // the fallback is simply "assume present".
+    //
+    // Says nothing about the CLIENT-side modules (NR2/NR4/MNR/BNR/DFNR/RN2),
+    // which run on this host and work on any family.
+    bool hasRadioSideDsp() const;
+
     // True for 2-SCU radios that support diversity RX, from the FlexLib-sourced
     // ModelCapabilities table (Principle I).  Replaces the hand-maintained
     // contains("6500")|... checks, which wrongly enabled diversity on the

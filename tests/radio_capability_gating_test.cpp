@@ -20,6 +20,10 @@
 //                 radio attached there is nothing to be honest about, and a
 //                 PROF applet that stayed hidden after unplugging reads as a
 //                 fault. Evaluated here exactly as the GUI evaluates it.
+//   radio DSP     hasRadioSideDsp gates the radio's own NR/NB/ANF/NRL/ANFL/
+//                 ANFT, the APD row and the WNB row. Asserted independent of
+//                 hasExtendedDsp — the base set and the extra 8000-series
+//                 filters are two different statements about a radio.
 //   extended DSP  hasExtendedDspFilters() resolves through the BACKEND while
 //                 connected and falls back to the model-name table when not,
 //                 with Flex's answer unchanged on both routes.
@@ -111,6 +115,18 @@ int main(int argc, char** argv)
               "Flex declares hasProfiles (global/TX/mic profiles are SmartSDR)");
         check(caps.hasDaxStreams,
               "Flex declares hasDaxStreams (DAX audio + DAX IQ)");
+        check(caps.hasRadioSideDsp,
+              "Flex declares hasRadioSideDsp (firmware NR/NB/ANF, APD, WNB)");
+        check(caps.hasWaveforms,
+              "Flex declares hasWaveforms (installable SmartSDR waveforms)");
+        check(caps.hasMultiClientSessions,
+              "Flex declares hasMultiClientSessions (multiFLEX)");
+        // The two DSP flags are independent statements, not synonyms: the base
+        // set and the extra 8000-series filters. A default Flex model string is
+        // unknown to the platform table, so the narrower one is false here while
+        // the base one is true — which is exactly why they cannot be merged.
+        check(caps.hasRadioSideDsp && !caps.hasExtendedDsp,
+              "hasRadioSideDsp and hasExtendedDsp are independent");
     }
 
     // ---- HL2 declares none of them ---------------------------------------
@@ -127,6 +143,12 @@ int main(int argc, char** argv)
               "HL2 declares hasDaxStreams=false (one raw IQ feed, no stream plane)");
         check(!caps.hasExtendedDsp,
               "HL2 declares hasExtendedDsp=false");
+        check(!caps.hasRadioSideDsp,
+              "HL2 declares hasRadioSideDsp=false (host runs every noise module)");
+        check(!caps.hasWaveforms,
+              "HL2 declares hasWaveforms=false");
+        check(!caps.hasMultiClientSessions,
+              "HL2 declares hasMultiClientSessions=false (one client owns it)");
     }
 
     // ---- Sim declares none of them, and is genuinely CONNECTED -----------
@@ -161,6 +183,10 @@ int main(int argc, char** argv)
         check(!caps.hasProfiles,   "Sim declares hasProfiles=false");
         check(!caps.hasDaxStreams, "Sim declares hasDaxStreams=false");
         check(!caps.hasExtendedDsp, "Sim declares hasExtendedDsp=false");
+        check(!caps.hasRadioSideDsp, "Sim declares hasRadioSideDsp=false");
+        check(!caps.hasWaveforms, "Sim declares hasWaveforms=false");
+        check(!caps.hasMultiClientSessions,
+              "Sim declares hasMultiClientSessions=false");
 
         // The surfaces the GUI drives off those flags, evaluated the way the
         // GUI evaluates them. A CONNECTED radio that says no means hidden.
@@ -168,6 +194,18 @@ int main(int argc, char** argv)
               "connected + hasProfiles=false hides PROF and the Profiles menu");
         check(!uiWouldShow(model.isConnected(), caps.hasDaxStreams),
               "connected + hasDaxStreams=false hides DAX, DAX-IQ and autostart");
+        check(!uiWouldShow(model.isConnected(), caps.hasWaveforms),
+              "connected + hasWaveforms=false hides File > Waveforms");
+        check(!uiWouldShow(model.isConnected(), caps.hasMultiClientSessions),
+              "connected + hasMultiClientSessions=false hides Settings > multiFLEX");
+
+        // hasRadioSideDsp reaches the UI through its own accessor, which applies
+        // the permissive rule itself (there is no model-name table to fall back
+        // to, so the fallback is "assume present"). Connected and declared false
+        // is the one combination that hides NR/NB/ANF/NRL/ANFL/ANFT, the APD row
+        // and the WNB row.
+        check(!model.hasRadioSideDsp(),
+              "connected Sim: hasRadioSideDsp() is false, radio DSP hidden");
 
         // The reconciliation, on the branch that only exists while connected:
         // the answer now comes from the backend's declaration rather than from
@@ -197,6 +235,12 @@ int main(int argc, char** argv)
               "disconnected: PROF is restored even though the last radio said no");
         check(uiWouldShow(model.isConnected(), caps.hasDaxStreams),
               "disconnected: DAX is restored even though the last radio said no");
+        check(uiWouldShow(model.isConnected(), caps.hasWaveforms),
+              "disconnected: File > Waveforms is restored");
+        check(uiWouldShow(model.isConnected(), caps.hasMultiClientSessions),
+              "disconnected: Settings > multiFLEX is restored");
+        check(model.hasRadioSideDsp(),
+              "disconnected: hasRadioSideDsp() goes permissive, radio DSP back");
     }
 
     // ---- Round-trip back to Flex ------------------------------------------
@@ -210,6 +254,12 @@ int main(int argc, char** argv)
               "round-trip: Flex regains hasProfiles after sim -> Flex");
         check(caps.hasDaxStreams,
               "round-trip: Flex regains hasDaxStreams after sim -> Flex");
+        check(caps.hasRadioSideDsp,
+              "round-trip: Flex regains hasRadioSideDsp after sim -> Flex");
+        check(caps.hasWaveforms,
+              "round-trip: Flex regains hasWaveforms after sim -> Flex");
+        check(caps.hasMultiClientSessions,
+              "round-trip: Flex regains hasMultiClientSessions after sim -> Flex");
     }
 
     // ---- Flex extended DSP is unchanged by the reconciliation -------------

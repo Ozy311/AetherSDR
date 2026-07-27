@@ -5293,6 +5293,7 @@ void MainWindow::onConnectionStateChanged(bool connected)
                 menu->setDeclaredBands(declaredBands);
                 menu->setXvtrBands(xvtrBands);
                 applyTuningRangeToOverlayMenu(menu);
+                applyRadioSideDspToOverlayMenu(menu);
             }
         };
         QTimer::singleShot(2000, this, refreshXvtr);
@@ -6129,6 +6130,13 @@ void MainWindow::applyCapabilitiesToUi(bool connected, const RadioCapabilities& 
     // cover a VFO built after this ran. This one covers the reverse: a backend
     // revising the capability while the VFOs already exist.
     const bool extendedDsp = m_radioModel.hasExtendedDspFilters();
+
+    // ── Radio-side DSP: NR / NB / ANF / NRL / ANFL / ANFT in every slice VFO ──
+    //
+    // Both accessors apply their own permissive rule for the disconnected case,
+    // which is why neither reads off `caps` here.
+    const bool radioSideDsp = m_radioModel.hasRadioSideDsp();
+
     if (m_panStack) {
         for (auto* applet : m_panStack->allApplets()) {
             auto* sw = applet->spectrumWidget();
@@ -6137,9 +6145,39 @@ void MainWindow::applyCapabilitiesToUi(bool connected, const RadioCapabilities& 
             }
             for (auto* vfo : sw->findChildren<VfoWidget*>()) {
                 vfo->setHasExtendedDsp(extendedDsp);
+                vfo->setHasRadioSideDsp(radioSideDsp);
             }
+            // WNB lives in the pan's overlay menu, not the VFO.
+            applyRadioSideDspToOverlayMenu(sw->overlayMenu());
         }
     }
+
+    // ── APD: one owning method in TxApplet ANDs this with apdConfigurable ────
+    //
+    // NOT a replacement for apdConfigurable, which stays the authority on
+    // whether a Flex reports the predistorter as configurable. This is the
+    // second input: apdConfigurable only ever arrives from Flex status, so on a
+    // backend that never sends it the row's state would otherwise depend on
+    // session history rather than on the connected radio.
+    if (m_appletPanel && m_appletPanel->txApplet()) {
+        m_appletPanel->txApplet()->setRadioSideDspAvailable(radioSideDsp);
+    }
+
+    // ── Flex platform features that are not DSP ─────────────────────────────
+    if (m_waveformsAction) {
+        m_waveformsAction->setVisible(!connected || caps.hasWaveforms);
+    }
+    if (m_multiFlexAction) {
+        m_multiFlexAction->setVisible(!connected || caps.hasMultiClientSessions);
+    }
+}
+
+void MainWindow::applyRadioSideDspToOverlayMenu(SpectrumOverlayMenu* menu) const
+{
+    if (!menu) {
+        return;
+    }
+    menu->setRadioSideDspAvailable(m_radioModel.hasRadioSideDsp());
 }
 
 SliceModel* MainWindow::activeSlice() const

@@ -88,6 +88,30 @@ struct RadioCapabilities {
     // MainWindow::startDax() — a crash guard, deliberately not merged with this.
     bool hasDaxStreams = false;
 
+    // Noise reduction, noise blanking and auto-notch run INSIDE the radio, driven
+    // by command-plane verbs rather than by host DSP. True for a Flex, whose
+    // firmware owns NR/NB/ANF/NRL/ANFL/ANFT, the APD predistorter and the
+    // wideband noise blanker; false for a direct-sampling backend like the HL2,
+    // where the host runs every noise module it has.
+    //
+    // NOT about the client-side modules (NR2/NR4/MNR/BNR/DFNR/RN2). Those live in
+    // this application, work on any family, and must never be gated on this.
+    //
+    // Distinct from hasExtendedDsp, which is a narrower statement about the
+    // extra 8000-series firmware filters (NRS/RNN/NRF) on a radio that already
+    // has the base set. A radio with hasRadioSideDsp=false has neither.
+    bool hasRadioSideDsp = false;
+
+    // The radio accepts installable waveform/mode plugins (SmartSDR waveforms),
+    // so a client can offer to manage them.
+    bool hasWaveforms = false;
+
+    // Several GUI clients can hold independent sessions on the radio at once,
+    // each with its own slices and audio streams (SmartSDR multiFLEX). A backend
+    // that serves exactly one client reports false and the multi-client
+    // configuration UI goes away.
+    bool hasMultiClientSessions = false;
+
     // Vendor-specific capabilities, keyed by extension namespace. Clients that
     // don't understand a namespace ignore it; a backend never puts core-profile
     // fields here. Example: {"flex": {"multiFlex": true, "guiClientId": "…"}}.

@@ -415,6 +415,13 @@ RadioCapabilities Hl2Backend::capabilities() const
     // No per-slice audio or per-pan IQ stream plane: the HL2 sends one raw IQ
     // feed and this host demodulates it.
     c.hasDaxStreams = false;
+    // Every noise module for this radio runs on THIS host — the HL2 sends raw
+    // IQ and has no firmware DSP to switch on. Gating the radio-side toggles
+    // off is what stops them from looking operable; the client-side modules
+    // (NR2/NR4/MNR/BNR/DFNR/RN2) are unaffected and remain available.
+    c.hasRadioSideDsp = false;
+    c.hasWaveforms = false;             // no installable plugin surface
+    c.hasMultiClientSessions = false;   // one client owns the radio
     // No extension namespaces (no invokeExtension verbs yet), matching FlexBackend.
     return c;
 }

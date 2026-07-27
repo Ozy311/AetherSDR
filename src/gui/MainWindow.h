@@ -364,6 +364,12 @@ private:
     // unplugging reads as a fault rather than as an accurate report.
     void applyCapabilitiesToUi(bool connected, const RadioCapabilities& caps);
 
+    // Push radio-side-DSP availability into one overlay menu's WNB row. Separate
+    // from applyCapabilitiesToUi() because overlay menus are also built lazily
+    // as pans appear, and those sites must seed a new menu with the current
+    // value — the same reason applyTuningRangeToOverlayMenu() exists.
+    void applyRadioSideDspToOverlayMenu(SpectrumOverlayMenu* menu) const;
+
     // AppSettings key for a pan's persisted RF gain, scoped by radio FAMILY.
     //
     // RF gain is the one "display" setting that is really a hardware register,
@@ -1184,6 +1190,11 @@ private:
     // applyCapabilitiesToUi() can hide it on a radio with no DAX streams.
     // Null on platforms without a DAX bridge, where the entry is never created.
     QAction*         m_autoDaxAction{nullptr};
+    // File ▸ Waveforms... and Settings ▸ multiFLEX... — held so
+    // applyCapabilitiesToUi() can hide them on a radio with no installable
+    // waveforms / no multi-client sessions.
+    QAction*         m_waveformsAction{nullptr};
+    QAction*         m_multiFlexAction{nullptr};
 
     // Audio stream re-creation flag (after profile load)
     bool             m_needAudioStream{false};

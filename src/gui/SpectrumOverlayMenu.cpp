@@ -652,7 +652,13 @@ void SpectrumOverlayMenu::buildAntPanel()
     m_wnbLabel->setFixedWidth(kValueW);
     m_wnbLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     wnbRow->addWidget(m_wnbLabel);
-    vbox->addLayout(wnbRow);
+    // Wrapped in a container rather than added as a bare layout, so the whole
+    // row can be hidden as one unit when the radio has no wideband noise
+    // blanker. Hiding the button alone would strand its level slider.
+    m_wnbRow = new QWidget;
+    wnbRow->setContentsMargins(0, 0, 0, 0);
+    m_wnbRow->setLayout(wnbRow);
+    vbox->addWidget(m_wnbRow);
 
     connect(m_wnbBtn, &QPushButton::toggled, this, &SpectrumOverlayMenu::wnbToggled);
     connect(m_wnbSlider, &QSlider::valueChanged, this, [this](int v) {
@@ -2410,6 +2416,16 @@ void SpectrumOverlayMenu::layoutDisplayPanel()
     const int panelY = constrainedDisplayPanelTop(
         menuBottom, panelSize.height(), hostHeight);
     m_displayPanel->move(x() + width(), panelY);
+}
+
+// WNB is a RADIO-side noise blanker: the toggle and level go to the radio's own
+// wideband blanker, so on a backend that has none the row would be a control
+// with nothing behind it. Hidden as a unit, button and slider together.
+void SpectrumOverlayMenu::setRadioSideDspAvailable(bool available)
+{
+    if (m_wnbRow) {
+        m_wnbRow->setVisible(available);
+    }
 }
 
 void SpectrumOverlayMenu::setWnbState(bool on, int level)

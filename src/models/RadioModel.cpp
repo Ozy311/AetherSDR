@@ -2625,6 +2625,14 @@ bool RadioModel::hasExtendedDspFilters() const
     return capabilitiesFor(m_model).hasExtendedDsp();
 }
 
+bool RadioModel::hasRadioSideDsp() const
+{
+    if (!m_backend || !isConnected()) {
+        return true;   // nothing attached — assume present, see the header
+    }
+    return backendCapabilities().hasRadioSideDsp;
+}
+
 // The single fan-out point for "what this radio says it can do".
 //
 // Everything capability-driven — model-side flags pushed into TransmitModel, and

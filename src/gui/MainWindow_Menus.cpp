@@ -80,6 +80,8 @@ void MainWindow::buildMenuBar()
     auto* fileMenu = menuBar()->addMenu("&File");
 
     auto* waveformsAct = fileMenu->addAction("Waveforms...");
+    m_waveformsAction = waveformsAct;   // hidden by applyCapabilitiesToUi()
+                                       // on a radio with no installable waveforms
     waveformsAct->setMenuRole(QAction::NoRole);
     connect(waveformsAct, &QAction::triggered, this, [this] {
         showOrRaisePersistent(m_waveformsDialog, &m_radioModel);
@@ -499,6 +501,8 @@ void MainWindow::buildMenuBar()
         connect(dlg, &QDialog::finished, this, refreshSpots);  // refresh on close
     });
     auto* multiFlexAction = settingsMenu->addAction("multiFLEX...");
+    m_multiFlexAction = multiFlexAction;   // hidden by applyCapabilitiesToUi()
+                                           // on a single-client backend
     connect(multiFlexAction, &QAction::triggered,
             this, &MainWindow::showMultiFlexDialog);
     // m_titleBar connect deferred — see after TitleBar creation (~line 2530)

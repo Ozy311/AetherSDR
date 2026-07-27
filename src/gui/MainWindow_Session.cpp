@@ -1290,6 +1290,7 @@ void MainWindow::wirePanLifecycle()
                 menu->setRadioCapabilities(m_radioModel.capabilities());
                 menu->setDeclaredBands(m_radioModel.declaredBands());
                 applyTuningRangeToOverlayMenu(menu);
+                applyRadioSideDspToOverlayMenu(menu);
                 connect(pan, &PanadapterModel::infoChanged,
                         sw, &SpectrumWidget::setFrequencyRange);
                 // Re-push authoritative geometry when a gesture that was
