@@ -1388,6 +1388,49 @@ void AppletPanel::updateHardwareAvailability(const QString& id,
     }
 }
 
+void AppletPanel::applyCapabilityVisibility(const QString& id,
+                                            const QString& appletKey,
+                                            bool available)
+{
+    // updateHardwareAvailability() alone is not enough for a capability-driven
+    // applet. It unchecks the bar button with the signal BLOCKED — deliberately,
+    // so Applet_<id> keeps the operator's preference for the next reconnect —
+    // and the blocked signal means the toggled handler never runs and the
+    // container the button owns is never hidden. For TUN/AMP that gap is
+    // invisible because those applets default closed and their hardware rarely
+    // disappears mid-session. For PROF and DAX, which the operator routinely has
+    // open, the tile would stay on screen after its button vanished.
+    //
+    // So hide the container explicitly. That fires
+    // ContainerWidget::visibilityChanged, whose handler persists
+    // Applet_<id>=False — which would erase the very preference the blocked
+    // signal exists to protect. Capture the stored value first and put it back.
+    auto& s = AppSettings::instance();
+    const bool hadKey = s.contains(appletKey);
+    const QVariant saved = hadKey ? s.value(appletKey) : QVariant{};
+
+    updateHardwareAvailability(id, appletKey, available);
+    if (!available) {
+        setAppletVisible(id, false);
+        if (hadKey) {
+            s.setValue(appletKey, saved);
+        } else {
+            // No stored preference before this call, so leave none behind: a
+            // fabricated "False" would read as an explicit operator choice and
+            // keep the applet closed after reconnecting to a radio that has it.
+            s.remove(appletKey);
+        }
+        s.save();
+    }
+    applyBarLayout();
+}
+
+void AppletPanel::setProfilesVisible(bool visible)
+{
+    applyCapabilityVisibility(QStringLiteral("PROF"),
+                              QStringLiteral("Applet_PROF"), visible);
+}
+
 void AppletPanel::setTunerVisible(bool visible)
 {
     updateHardwareAvailability("TUN", "Applet_TUN", visible);

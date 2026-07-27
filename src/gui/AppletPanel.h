@@ -170,6 +170,16 @@ public:
     // Show/hide the ShackSwitch applet based on device presence.
     void setShackSwitchVisible(bool visible);
 
+    // Show/hide the PROF button and applet based on whether the connected radio
+    // has an on-radio profile store (RadioCapabilities::hasProfiles).
+    //
+    // Unlike TUN/AMP/AG these are NOT markHardwareConditional() at
+    // construction: PROF and DAX have always been in defaultButtonOrder() and
+    // users have them in saved layouts, so the button starts available and only
+    // a connected radio that reports the capability false takes it away. A
+    // disconnected session keeps both, which is what the operator saw before.
+    void setProfilesVisible(bool visible);
+
     // Reset applet order to default
     void resetOrder();
 
@@ -268,6 +278,12 @@ private:
     void updateHardwareAvailability(const QString& id,
                                     const QString& appletKey,
                                     bool hardwareVisible);
+    // updateHardwareAvailability() plus the container hide it deliberately
+    // omits, with the operator's persisted open/closed preference preserved
+    // across the round trip. Backs the capability-driven setXVisible() methods.
+    void applyCapabilityVisibility(const QString& id,
+                                   const QString& appletKey,
+                                   bool available);
     void markHardwareConditional(const QString& id);
     void persistVuMeterSettings() const;
     void showStandardMeterContextMenu(QWidget* source, const QPoint& position);

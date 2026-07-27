@@ -294,6 +294,8 @@ RadioCapabilities SimBackend::capabilities() const
     caps.hasTuner = false;
     caps.hasAmplifier = false;
     caps.hasExtendedDsp = false;
+    // The simulator has no profile store to list, load or save into.
+    caps.hasProfiles = false;
     return caps;
 }
 

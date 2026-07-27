@@ -65,6 +65,15 @@ struct RadioCapabilities {
     bool hasAmplifier = false;     // integrated or controllable PA
     bool hasExtendedDsp = false;   // extended firmware DSP filters (NRS/RNN/NRF)
 
+    // The RADIO stores named configuration profiles (global / TX / mic) that a
+    // client can list, load and save. The seam already carries ProfileDelta and
+    // profileChanged in both directions; this is the flag that says whether the
+    // radio has any such thing to carry. A backend whose hardware has no
+    // on-radio profile store reports false and every profile surface — the PROF
+    // applet, the Profile Manager, import/export, the Profiles menu — goes away,
+    // rather than offering an empty list the operator cannot populate.
+    bool hasProfiles = false;
+
     // Vendor-specific capabilities, keyed by extension namespace. Clients that
     // don't understand a namespace ignore it; a backend never puts core-profile
     // fields here. Example: {"flex": {"multiFlex": true, "guiClientId": "…"}}.

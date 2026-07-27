@@ -148,6 +148,8 @@ RadioCapabilities FlexBackend::capabilities() const
     caps.canTransmit = true;
     caps.hasTuner = true;
     caps.canReboot = true;   // SmartSDR "radio reboot" (#4448 F3)
+    // Global / TX / mic profiles are a SmartSDR feature on every current model.
+    caps.hasProfiles = true;
 
     // Advertise the "flex" extension namespace: the amp/tuner operate/bypass/
     // autotune verbs are now routed through invokeExtension() (#4092/#4094), and

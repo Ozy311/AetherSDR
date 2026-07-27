@@ -6076,8 +6076,30 @@ void MainWindow::applyCapabilitiesToUi(bool connected, const RadioCapabilities& 
 {
     // See the header for why every flag is `!connected || caps.x` and why each
     // surface gets exactly one owning call.
-    (void)connected;
-    (void)caps;
+
+    // ── Profiles: the PROF applet, the Profiles menu, and both dialogs ──────
+    const bool profiles = !connected || caps.hasProfiles;
+    if (m_appletPanel) {
+        m_appletPanel->setProfilesVisible(profiles);
+    }
+    if (m_profilesMenu) {
+        // Hide the whole menu, not just its two dialog entries: the rest of it
+        // is the radio's global-profile list, which on a radio without profiles
+        // is permanently empty. A "Profiles" menu containing nothing but two
+        // dialogs that can only report emptiness is worse than no menu.
+        m_profilesMenu->menuAction()->setVisible(profiles);
+    }
+    // Close a dialog already open when the capability goes away — leaving the
+    // Profile Manager on screen listing a store the connected radio does not
+    // have is the same lie the menu entry would be.
+    if (!profiles) {
+        if (m_profileManagerDialog) {
+            m_profileManagerDialog->close();
+        }
+        if (m_profileImportExportDialog) {
+            m_profileImportExportDialog->close();
+        }
+    }
 }
 
 SliceModel* MainWindow::activeSlice() const

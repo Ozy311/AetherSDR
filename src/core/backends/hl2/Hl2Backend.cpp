@@ -408,6 +408,10 @@ RadioCapabilities Hl2Backend::capabilities() const
     c.hasTuner = false;
     c.hasAmplifier = false;
     c.hasExtendedDsp = false;
+    // No on-radio configuration store. The HL2 holds no state across a
+    // connection beyond its registers — everything the operator can change
+    // lives in this application, so there is nothing for a profile to name.
+    c.hasProfiles = false;
     // No extension namespaces (no invokeExtension verbs yet), matching FlexBackend.
     return c;
 }
