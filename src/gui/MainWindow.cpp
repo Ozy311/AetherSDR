@@ -177,6 +177,7 @@
 #include <QBuffer>
 #include <QFont>
 #include <QFontMetrics>
+#include <QRegularExpression>
 #include <QWidgetAction>
 #include <QPainter>
 #include <QVBoxLayout>
@@ -321,15 +322,109 @@ void reserveStatusBarStackWidth(QWidget* stack, const QStringList& samples, int 
     stack->setMinimumWidth(qMax(minimumWidth, statusBarCompactTextWidth(samples, 16)));
 }
 
+// The station label's resting type size. Single-token values keep it.
+constexpr int kStationFontPx = 21;
+
+// Property carrying the size the label is currently styled at, so the
+// stylesheet is only re-applied when it actually changes.
+constexpr char kStationFontPxProperty[] = "aetherStationFontPx";
+
+QString statusBarStationLabelStyle(int fontPx)
+{
+    return QStringLiteral(
+        "QLabel { color: {{color.text.primary}}; font-size: %1px; "
+        "background: {{color.background.0}}; "
+        "border: 1px solid rgba(255,255,255,128); padding: 2px 12px; }")
+        .arg(fontPx);
+}
+
+// The largest size at which TWO stacked lines still fit inside the height a
+// single kStationFontPx line occupies. Derived from the live font metrics
+// rather than hard-coded, because the same constant would be wrong across
+// the three platforms this ships on. The consequence is the load-bearing
+// one: wrapping can never make the status bar taller, so no other row moves.
+int stationWrappedFontPx()
+{
+    QFont probe = QApplication::font();
+    probe.setPixelSize(kStationFontPx);
+    const int singleLineHeight = QFontMetrics(probe).height();
+
+    for (int px = kStationFontPx - 1; px >= 8; --px) {
+        QFont candidate = QApplication::font();
+        candidate.setPixelSize(px);
+        if (2 * QFontMetrics(candidate).height() <= singleLineHeight) {
+            return px;
+        }
+    }
+    return 8;
+}
+
+// Split on the whitespace run that leaves the two lines closest in width, so
+// "Hermes-Lite 2" breaks at its only space rather than mid-token. The break
+// is an explicit newline instead of setWordWrap: a wrapped QLabel picks its
+// break from whatever width the layout happens to hand it, which is not a
+// property this status bar can promise.
+QString stationTwoLineText(const QString& text, int fontPx)
+{
+    const QStringList words =
+        text.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+    if (words.size() < 2) {
+        return text;
+    }
+
+    QFont font = QApplication::font();
+    font.setPixelSize(fontPx);
+    const QFontMetrics metrics(font);
+
+    int bestSplit = 1;
+    int bestWidth = std::numeric_limits<int>::max();
+    for (int i = 1; i < words.size(); ++i) {
+        const int widest = qMax(
+            metrics.horizontalAdvance(words.mid(0, i).join(QLatin1Char(' '))),
+            metrics.horizontalAdvance(words.mid(i).join(QLatin1Char(' '))));
+        if (widest < bestWidth) {
+            bestWidth = widest;
+            bestSplit = i;
+        }
+    }
+    return words.mid(0, bestSplit).join(QLatin1Char(' ')) + QLatin1Char('\n')
+         + words.mid(bestSplit).join(QLatin1Char(' '));
+}
+
+// A callsign or a radio nickname. Single-token values (N0CALL, ANT1-AV640,
+// 70CM-RXA-XVTR) render on one line at kStationFontPx, byte-identical to
+// before. A value containing whitespace is split onto two centred lines at a
+// size that preserves the label's height.
+//
+// WHITESPACE IS THE TRIGGER, NOT WIDTH, and that is not a detail: measured on
+// real radios, the widest nickname in the lab is a FLEX one — "ANT1-AV640"
+// occupies 174px against the HL2's "Hermes-Lite 2" at 170px. A width
+// threshold would therefore wrap the Flex and leave the HL2 on one line,
+// which is backwards. What actually distinguishes them is that the HL2 has no
+// operator-set nickname, so Hl2Discovery::effectiveNickname() substitutes the
+// model string — two words — while every real callsign and Flex nickname is a
+// single token.
 bool setStatusBarStationText(QLabel* label, const QString& text)
 {
     if (!label) {
         return false;
     }
 
+    const QString trimmed = text.trimmed();
+    const bool wrap =
+        trimmed.contains(QRegularExpression(QStringLiteral("\\s")));
+    const int fontPx = wrap ? stationWrappedFontPx() : kStationFontPx;
+    const QString rendered = wrap ? stationTwoLineText(trimmed, fontPx) : text;
+
     bool changed = false;
-    if (label->text() != text) {
-        label->setText(text);
+    if (label->property(kStationFontPxProperty).toInt() != fontPx) {
+        label->setProperty(kStationFontPxProperty, fontPx);
+        AetherSDR::ThemeManager::instance().applyStyleSheet(
+            label, statusBarStationLabelStyle(fontPx));
+        changed = true;
+    }
+    if (label->text() != rendered) {
+        label->setText(rendered);
         changed = true;
     }
     label->ensurePolished();
@@ -4610,8 +4705,9 @@ void MainWindow::buildUI()
     hbox->addStretch(1);
 
     m_stationNickLabel = new QLabel("N0CALL");
-    AetherSDR::ThemeManager::instance().applyStyleSheet(m_stationNickLabel, "QLabel { color: {{color.text.primary}}; font-size: 21px; background: {{color.background.0}}; "
-        "border: 1px solid rgba(255,255,255,128); padding: 2px 12px; }");
+    AetherSDR::ThemeManager::instance().applyStyleSheet(
+        m_stationNickLabel, statusBarStationLabelStyle(kStationFontPx));
+    m_stationNickLabel->setProperty(kStationFontPxProperty, kStationFontPx);
     m_stationNickLabel->setAlignment(Qt::AlignCenter);
     m_stationNickLabel->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
     setStatusBarStationText(m_stationNickLabel, m_stationNickLabel->text());
