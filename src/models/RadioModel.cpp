@@ -2314,6 +2314,7 @@ void RadioModel::connectToRadio(const RadioInfo& info)
     m_name    = info.name;
     m_model   = info.model;
     m_version = info.version;
+    m_versionLabel = info.versionLabel;
     // Seed nickname/callsign from the discovery packet so the status-bar station
     // label is correct the instant onConnectionStateChanged(true) reads it. These
     // were previously only set later from the async "info" reply, so on connect
