@@ -124,6 +124,12 @@ public:
 
     // Convenience: supply voltage (Volts, from "+13.8A" meter — measurement point A, before fuse).
     float supplyVolts() const { return m_supplyVolts; }
+    // Whether the radio has DECLARED that meter at all. Until it does,
+    // supplyVolts() is the 0.0f initialiser rather than a measurement, and
+    // hwTelemetryChanged still carries it on every PA-temperature tick because
+    // one signal reports both halves. Callers that render the value need this
+    // to tell "the rail reads zero" from "the radio never mentioned a rail".
+    bool hasSupplyVoltage() const { return m_supplyIdx >= 0; }
 
 signals:
     // Emitted when the S-meter value changes (dBm).
