@@ -1934,7 +1934,25 @@ MainWindow::MainWindow(QWidget* parent)
         m_lastPaTempC = paTemp;
         m_hasPaTempTelemetry = true;
         updatePaTempLabel();
-        m_supplyVoltLabel->setText(QString("%1 V").arg(supplyVolts, 0, 'f', 2));
+        // A bare dash, never a zero, for a rail the radio has not reported —
+        // the rule the Radio Health dialog already applies to its registers.
+        // No unit either: the unit belongs to the value, and there is no
+        // value, so "— V" would still be asserting a reading in volts. This
+        // signal fires when EITHER half of the hardware telemetry changes, so
+        // on a radio that reports PA temperature and no supply rail (HL2:
+        // PATEMP, no "+13.8A") every temperature tick used to repaint the
+        // 0.0f initialiser formatted to two decimals — indistinguishable from
+        // a measurement.
+        //
+        // Independent of hasSupplyVoltageTelemetry on purpose: that capability
+        // decides whether the OPERATOR IS OFFERED the readout, this decides
+        // what the readout may claim. A backend that declares the rail but has
+        // not yet received a meter definition is still not entitled to print a
+        // number. Same separation as the DAX capability and its crash guard.
+        m_supplyVoltLabel->setText(
+            m_radioModel.meterModel().hasSupplyVoltage()
+                ? QString("%1 V").arg(supplyVolts, 0, 'f', 2)
+                : QStringLiteral("—"));
 
         // Update station label (nickname arrives via status after connect)
         const QString nick = m_radioModel.nickname();
