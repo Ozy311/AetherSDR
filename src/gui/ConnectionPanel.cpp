@@ -1673,6 +1673,10 @@ void ConnectionPanel::probeRadio(const QString& ip)
                     info.nickname = info.model;
                     info.serial   = mac.join(QLatin1Char(':'));
                     info.version  = QString::number(quint8(d.at(9)));
+                    // Same label Hl2Discovery sets on the broadcast path — this
+                    // is the SECOND place an HL2 RadioInfo is built, and a field
+                    // set in only one of them is not set at all.
+                    info.versionLabel = QStringLiteral("Gateware");
                     // Status byte: 0x02 idle/available, 0x03 already streaming to
                     // a client. Reflect it rather than hard-coding Available.
                     const bool busy = quint8(d.at(2)) == 0x03;
