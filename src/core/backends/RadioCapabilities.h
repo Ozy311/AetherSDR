@@ -22,6 +22,12 @@ namespace AetherSDR {
 // this is the radio's *reported* self-description produced by a backend and
 // surfaced to clients. A FlexBackend may seed this FROM ModelCapabilities, but
 // the two are distinct concepts (derived-from-name vs reported-by-backend).
+// ADDING A FIELD: every field below defaults to false/0/empty, so a backend
+// that omits one silently declares the feature ABSENT — set it explicitly in
+// FlexBackend, Hl2Backend AND SimBackend. Then record it in
+// docs/architecture/radio-capabilities-map.md, which maps every field to the
+// code that reads it (and lists the ones nothing reads yet). A capability no
+// consumer reads looks identical, from here, to one that works.
 struct RadioCapabilities {
     // Identity
     QString family;   // backend id: "flex", "kiwi", … (stable, lowercase)

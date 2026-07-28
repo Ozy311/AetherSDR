@@ -1529,6 +1529,10 @@ a Flex, and should not be on screen at all on an HL2. The PROF applet listed a
 profile store that does not exist. DAX offered to route streams this radio
 never sends. Both were reachable, both were honest-looking, and both were lies.
 
+> Field-by-field reference — what every backend declares and where each value
+> is read — lives in `docs/architecture/radio-capabilities-map.md`. This
+> section is the narrative; that table is the one to keep current.
+
 ### 18.1 The rule, and why the obvious fix is the wrong one
 
 The obvious fix is `if (family == "flex")`, or a `dynamic_cast<FlexBackend*>`.
