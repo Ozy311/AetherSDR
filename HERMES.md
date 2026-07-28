@@ -1663,9 +1663,21 @@ independent (Flex reports base-true, extended-false for an unknown model string)
 so a later change cannot quietly collapse them.
 
 Neither flag says anything about the **client-side** modules — NR2, NR4, MNR,
-BNR, DFNR, RN2. Those run on this host, work on any family, and stay available on
-the HL2. The proof is visual: on an HL2 the VFO's DSP tab keeps `ADSP` and
-`AetherVoice` and loses every radio-side toggle.
+BNR, DFNR, RN2, and the Aetherial RX/TX EQ. Those run on this host, work on any
+family, and stay available on the HL2. The proof is visual: on an HL2 the VFO's
+DSP tab keeps `ADSP` and `AetherVoice` and loses every radio-side toggle, and the
+`VUDU` container keeps its Aetherial EQ tiles while the `EQ` applet goes away.
+
+**The radio's 8-band hardware EQ rides this flag too.** `EqualizerModel` emits
+`eq RXsc` / `eq TXsc` — command-plane verbs, so on an HL2 the sliders moved, the
+setting persisted, and the audio never changed. §17's failure shape exactly. The
+`EQ` applet is hidden; the Aetherial EQ is what an HL2 uses instead, which is
+also why gating the two together would have been the worst possible outcome:
+the operator would lose every equalizer they have.
+
+That is the general test for this flag — **does the control's only effect is to
+emit a verb the radio's firmware executes?** If the work happens in this
+application, it is not behind `hasRadioSideDsp`.
 
 ### 18.8 Two setVisible sites that disagreed, and the fix that does NOT unify them
 
