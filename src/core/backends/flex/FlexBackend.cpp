@@ -158,6 +158,9 @@ RadioCapabilities FlexBackend::capabilities() const
     caps.hasRadioSideDsp = true;
     caps.hasWaveforms = true;            // installable SmartSDR waveforms
     caps.hasMultiClientSessions = true;  // multiFLEX
+    // The "+13.8A" meter carries the PA supply rail (measurement point A,
+    // before the fuse), which the status bar renders under the PA temperature.
+    caps.hasSupplyVoltageTelemetry = true;
 
     // Advertise the "flex" extension namespace: the amp/tuner operate/bypass/
     // autotune verbs are now routed through invokeExtension() (#4092/#4094), and

@@ -301,6 +301,7 @@ RadioCapabilities SimBackend::capabilities() const
     caps.hasRadioSideDsp = false;        // synthetic scene; no firmware DSP
     caps.hasWaveforms = false;
     caps.hasMultiClientSessions = false;
+    caps.hasSupplyVoltageTelemetry = false;   // synthetic scene; no PA rail
     return caps;
 }
 

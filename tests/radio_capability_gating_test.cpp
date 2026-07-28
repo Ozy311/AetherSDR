@@ -1,4 +1,5 @@
-// Capability-gated UI surfaces: hasProfiles, hasDaxStreams, hasExtendedDsp.
+// Capability-gated UI surfaces: hasProfiles, hasDaxStreams, hasExtendedDsp,
+// hasSupplyVoltageTelemetry.
 //
 // The rule these guard (RadioCapabilities.h header comment, aetherd RFC §1) is
 // that no call site asks "is this a Flex". A surface is gated on a DECLARED
@@ -20,6 +21,13 @@
 //                 radio attached there is nothing to be honest about, and a
 //                 PROF applet that stayed hidden after unplugging reads as a
 //                 fault. Evaluated here exactly as the GUI evaluates it.
+//   supply volts  hasSupplyVoltageTelemetry gates the status bar's PA supply
+//                 voltage readout. The label it hides is fed from the
+//                 Flex-named "+13.8A" meter but repainted whenever PA
+//                 TEMPERATURE changes, so a radio reporting only PA temp
+//                 renders the 0.0f initialiser as a two-decimal measurement.
+//                 Asserted on the CAPABILITY, so this stays true of any future
+//                 family that reports no supply rail.
 //   radio DSP     hasRadioSideDsp gates the radio's own NR/NB/ANF/NRL/ANFL/
 //                 ANFT, the APD row and the WNB row. Asserted independent of
 //                 hasExtendedDsp — the base set and the extra 8000-series
@@ -121,6 +129,11 @@ int main(int argc, char** argv)
               "Flex declares hasWaveforms (installable SmartSDR waveforms)");
         check(caps.hasMultiClientSessions,
               "Flex declares hasMultiClientSessions (multiFLEX)");
+        // The one this field exists to protect: the struct default is false, so
+        // adding the field without touching FlexBackend would silently delete a
+        // readout that ships and works today.
+        check(caps.hasSupplyVoltageTelemetry,
+              "Flex declares hasSupplyVoltageTelemetry (the \"+13.8A\" meter)");
         // The two DSP flags are independent statements, not synonyms: the base
         // set and the extra 8000-series filters. A default Flex model string is
         // unknown to the platform table, so the narrower one is false here while
@@ -149,6 +162,11 @@ int main(int argc, char** argv)
               "HL2 declares hasWaveforms=false");
         check(!caps.hasMultiClientSessions,
               "HL2 declares hasMultiClientSessions=false (one client owns it)");
+        // PATEMP yes, "+13.8A" no. The temperature above the volts row is a
+        // genuine HL2 reading and must keep working — this flag hides one label,
+        // not the stack.
+        check(!caps.hasSupplyVoltageTelemetry,
+              "HL2 declares hasSupplyVoltageTelemetry=false (PATEMP, no +13.8A)");
     }
 
     // ---- Sim declares none of them, and is genuinely CONNECTED -----------
@@ -187,6 +205,8 @@ int main(int argc, char** argv)
         check(!caps.hasWaveforms, "Sim declares hasWaveforms=false");
         check(!caps.hasMultiClientSessions,
               "Sim declares hasMultiClientSessions=false");
+        check(!caps.hasSupplyVoltageTelemetry,
+              "Sim declares hasSupplyVoltageTelemetry=false");
 
         // The surfaces the GUI drives off those flags, evaluated the way the
         // GUI evaluates them. A CONNECTED radio that says no means hidden.
@@ -198,6 +218,8 @@ int main(int argc, char** argv)
               "connected + hasWaveforms=false hides File > Waveforms");
         check(!uiWouldShow(model.isConnected(), caps.hasMultiClientSessions),
               "connected + hasMultiClientSessions=false hides Settings > multiFLEX");
+        check(!uiWouldShow(model.isConnected(), caps.hasSupplyVoltageTelemetry),
+              "connected + hasSupplyVoltageTelemetry=false hides the volts readout");
 
         // hasRadioSideDsp reaches the UI through its own accessor, which applies
         // the permissive rule itself (there is no model-name table to fall back
@@ -239,6 +261,8 @@ int main(int argc, char** argv)
               "disconnected: File > Waveforms is restored");
         check(uiWouldShow(model.isConnected(), caps.hasMultiClientSessions),
               "disconnected: Settings > multiFLEX is restored");
+        check(uiWouldShow(model.isConnected(), caps.hasSupplyVoltageTelemetry),
+              "disconnected: the supply-voltage readout is restored");
         check(model.hasRadioSideDsp(),
               "disconnected: hasRadioSideDsp() goes permissive, radio DSP back");
     }
@@ -260,6 +284,10 @@ int main(int argc, char** argv)
               "round-trip: Flex regains hasWaveforms after sim -> Flex");
         check(caps.hasMultiClientSessions,
               "round-trip: Flex regains hasMultiClientSessions after sim -> Flex");
+        // Flex -> HL2/Sim -> Flex must leave the status bar identical to
+        // baseline. A cached flag would show up right here.
+        check(caps.hasSupplyVoltageTelemetry,
+              "round-trip: Flex regains hasSupplyVoltageTelemetry after sim -> Flex");
     }
 
     // ---- Flex extended DSP is unchanged by the reconciliation -------------
