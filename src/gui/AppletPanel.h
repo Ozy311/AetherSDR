@@ -186,6 +186,12 @@ public:
     // reasoning as setProfilesVisible above.
     void setDaxStreamsVisible(bool visible);
 
+    // Show/hide the EQ button and applet — the radio's own 8-band hardware
+    // equalizer (RadioCapabilities::hasRadioSideDsp). Deliberately does NOT
+    // touch the Aetherial RX/TX EQ tiles ("ceq" / "ceq-rx"), which are
+    // host-side and are what a radio without a hardware EQ uses instead.
+    void setHardwareEqVisible(bool visible);
+
     // Reset applet order to default
     void resetOrder();
 

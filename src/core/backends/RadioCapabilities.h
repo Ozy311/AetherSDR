@@ -22,6 +22,7 @@ namespace AetherSDR {
 // this is the radio's *reported* self-description produced by a backend and
 // surfaced to clients. A FlexBackend may seed this FROM ModelCapabilities, but
 // the two are distinct concepts (derived-from-name vs reported-by-backend).
+//
 // ADDING A FIELD: every field below defaults to false/0/empty, so a backend
 // that omits one silently declares the feature ABSENT — set it explicitly in
 // FlexBackend, Hl2Backend AND SimBackend. Then record it in
@@ -94,14 +95,23 @@ struct RadioCapabilities {
     // MainWindow::startDax() — a crash guard, deliberately not merged with this.
     bool hasDaxStreams = false;
 
-    // Noise reduction, noise blanking and auto-notch run INSIDE the radio, driven
-    // by command-plane verbs rather than by host DSP. True for a Flex, whose
-    // firmware owns NR/NB/ANF/NRL/ANFL/ANFT, the APD predistorter and the
-    // wideband noise blanker; false for a direct-sampling backend like the HL2,
-    // where the host runs every noise module it has.
+    // Audio DSP runs INSIDE the radio, driven by command-plane verbs, rather than
+    // on this host. True for a Flex, whose firmware owns NR/NB/ANF/NRL/ANFL/ANFT,
+    // the APD predistorter, the wideband noise blanker and the 8-band hardware
+    // equalizer; false for a direct-sampling backend like the HL2, where the host
+    // runs every one of those it has.
     //
-    // NOT about the client-side modules (NR2/NR4/MNR/BNR/DFNR/RN2). Those live in
-    // this application, work on any family, and must never be gated on this.
+    // The test for "does this belong here" is whether the control's only effect is
+    // to emit a verb the radio's firmware executes. The hardware EQ qualifies:
+    // EqualizerModel emits `eq RXsc`/`eq TXsc`, which reach nothing on a backend
+    // with no Flex command plane — the widget moves, the setting persists, and the
+    // audio is unchanged (HERMES §17's failure shape).
+    //
+    // NOT about the client-side equivalents — the AetherDSP noise modules
+    // (NR2/NR4/MNR/BNR/DFNR/RN2) and the Aetherial RX/TX EQ. Those run in this
+    // application, work on any family, and must never be gated on this. On a
+    // radio reporting false they are the ONLY audio DSP the operator has, so
+    // hiding them would leave nothing.
     //
     // Distinct from hasExtendedDsp, which is a narrower statement about the
     // extra 8000-series firmware filters (NRS/RNN/NRF) on a radio that already

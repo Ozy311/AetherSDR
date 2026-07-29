@@ -1442,6 +1442,17 @@ void AppletPanel::setDaxStreamsVisible(bool visible)
                               QStringLiteral("Applet_IQ"), visible);
 }
 
+void AppletPanel::setHardwareEqVisible(bool visible)
+{
+    // Note this applet defaults OPEN (makeEntry's defaultOn=true), unlike PROF
+    // and DAX. That makes the preference round-trip in
+    // applyCapabilityVisibility() load-bearing rather than merely tidy: hiding
+    // the container would otherwise persist Applet_EQ=False, and the operator
+    // would reconnect a Flex to find the EQ closed for the first time ever.
+    applyCapabilityVisibility(QStringLiteral("EQ"),
+                              QStringLiteral("Applet_EQ"), visible);
+}
+
 void AppletPanel::setTunerVisible(bool visible)
 {
     updateHardwareAvailability("TUN", "Applet_TUN", visible);

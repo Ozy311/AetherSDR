@@ -45,7 +45,7 @@ traps and why the DAX crash guard is deliberately *not* the DAX capability.
 | `hasExtendedDsp` | from table | ❌ | ❌ | `RadioModel::hasExtendedDspFilters()` | NRS / RNN / NRF buttons |
 | `hasProfiles` | ✅ | ❌ | ❌ | `MainWindow::applyCapabilitiesToUi` | PROF applet, Profiles menu, Profile Manager, Import/Export |
 | `hasDaxStreams` | ✅ | ❌ | ❌ | `MainWindow::applyCapabilitiesToUi` | DAX + DAX-IQ applets, Autostart DAX |
-| `hasRadioSideDsp` | ✅ | ❌ | ❌ | `RadioModel::hasRadioSideDsp()` | NR/NB/ANF/NRL/ANFL/ANFT, the APD row, the WNB row |
+| `hasRadioSideDsp` | ✅ | ❌ | ❌ | `RadioModel::hasRadioSideDsp()` | NR/NB/ANF/NRL/ANFL/ANFT, the APD row, the WNB row, the 8-band hardware EQ applet |
 | `hasWaveforms` | ✅ | ❌ | ❌ | `MainWindow::applyCapabilitiesToUi` | File ▸ Waveforms… |
 | `hasMultiClientSessions` | ✅ | ❌ | ❌ | `MainWindow::applyCapabilitiesToUi` | Settings ▸ multiFLEX… |
 | `extensionNamespaces` | `["flex"]` | — | — | `invokeExtension` pre-check | Amp / tuner operate/bypass/autotune verbs |
@@ -56,6 +56,18 @@ edges and on any mid-session revision by the backend. Add a capability by adding
 one owning call there — not another connect-time lambda. With several flags in
 play, scattered lambdas are how two callers end up both driving one widget's
 `setVisible()` and whichever fires last wins.
+
+### What `hasRadioSideDsp` must never hide
+
+The host-side equivalents are *not* gated on it, and must not be: the AetherDSP
+noise modules (NR2/NR4/MNR/BNR/DFNR/RN2) and the Aetherial RX/TX EQ tiles
+(`ceq` / `ceq-rx`, distinct from the `EQ` applet). On a radio reporting
+`hasRadioSideDsp = false` those are the **only** audio DSP the operator has —
+an HL2 uses the Aetherial EQ in place of the radio's hardware EQ — so gating
+them would leave nothing at all.
+
+The test for whether a control belongs behind this flag is whether its only
+effect is to emit a verb the radio's firmware executes.
 
 ## Declared, but the consumer bypasses the seam
 
