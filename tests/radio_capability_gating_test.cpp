@@ -29,7 +29,11 @@
 //                 Asserted on the CAPABILITY, so this stays true of any future
 //                 family that reports no supply rail.
 //   radio DSP     hasRadioSideDsp gates the radio's own NR/NB/ANF/NRL/ANFL/
-//                 ANFT, the APD row and the WNB row. Asserted independent of
+//                 ANFT, the APD row, the WNB row and the 8-band hardware EQ
+//                 applet. It must NOT gate the host-side equivalents — the
+//                 AetherDSP modules and the Aetherial RX/TX EQ — which are the
+//                 only audio DSP an operator has on a radio reporting false.
+//                 Asserted independent of
 //                 hasExtendedDsp — the base set and the extra 8000-series
 //                 filters are two different statements about a radio.
 //   extended DSP  hasExtendedDspFilters() resolves through the BACKEND while
@@ -228,6 +232,11 @@ int main(int argc, char** argv)
         // and the WNB row.
         check(!model.hasRadioSideDsp(),
               "connected Sim: hasRadioSideDsp() is false, radio DSP hidden");
+        // The hardware EQ rides the same flag: EqualizerModel emits `eq RXsc`/
+        // `eq TXsc`, command-plane verbs that reach nothing here. The Aetherial
+        // RX/TX EQ is host-side and deliberately not covered by any capability.
+        check(!uiWouldShow(model.isConnected(), caps.hasRadioSideDsp),
+              "connected + hasRadioSideDsp=false hides the hardware EQ applet");
 
         // The reconciliation, on the branch that only exists while connected:
         // the answer now comes from the backend's declaration rather than from

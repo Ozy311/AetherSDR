@@ -6181,6 +6181,16 @@ void MainWindow::applyCapabilitiesToUi(bool connected, const RadioCapabilities& 
         m_appletPanel->txApplet()->setRadioSideDspAvailable(radioSideDsp);
     }
 
+    // ── The radio's 8-band hardware EQ ──────────────────────────────────────
+    //
+    // Same capability, same reasoning: EqualizerModel emits `eq RXsc`/`eq TXsc`,
+    // which reach nothing without a Flex command plane. The Aetherial RX/TX EQ
+    // tiles are untouched — on a radio with no hardware EQ they are the only
+    // equalizer the operator has.
+    if (m_appletPanel) {
+        m_appletPanel->setHardwareEqVisible(radioSideDsp);
+    }
+
     // ── PA supply voltage: the lower row of the status bar's PA stack ───────
     //
     // m_supplyVoltLabel ONLY. m_paTempLabel and the paVbox around them are left
