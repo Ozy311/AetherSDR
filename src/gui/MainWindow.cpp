@@ -6242,10 +6242,28 @@ void MainWindow::applyCapabilitiesToUi(bool connected, const RadioCapabilities& 
     // arrives as its 0.0f initialiser on every tick.
     if (m_supplyVoltLabel) {
         m_supplyVoltLabel->setVisible(!connected || caps.hasSupplyVoltageTelemetry);
-        // Republish the status bar's minimum width. It is computed from
-        // m_statusBarContainer->minimumSizeHint() (updateStatusBarMinimumWidth),
-        // which a hidden child changes; a stale minimum leaves a gap or clips
-        // the size grip.
+        if (!connected) {
+            // Drop the previous session's readings instead of leaving them on
+            // screen with no radio attached — the same "do not assert what the
+            // radio did not report" rule this gate exists for. MeterModel::clear()
+            // resets the underlying sentinels, but no further hwTelemetryChanged
+            // arrives after a disconnect to repaint either label, so the text has
+            // to be dropped here or a Flex's last rail voltage survives its own
+            // disconnect. Each row reuses its own established no-value rendering:
+            // a bare dash for the rail, "PA --" for the temperature.
+            m_supplyVoltLabel->setText(QStringLiteral("—"));
+            m_hasPaTempTelemetry = false;
+            updatePaTempLabel();
+        }
+        // Republishing the minimum width cannot currently matter here, and the
+        // call is kept only so the gate stays correct if that stops being true:
+        // paStack's minimum is PINNED by reserveTelemetryStack() with a
+        // "99.99 V" sample, so hiding one of its children leaves
+        // m_statusBarContainer->minimumSizeHint() unchanged, and
+        // updateStatusBarMinimumWidth() only ever READS that hint. So no stale
+        // minimum, gap or clipped size grip is reachable today — and the HL2
+        // reclaims no width from the hidden row either, nor would it:
+        // "PA 248.0°F" is the wider sample.
         updateStatusBarMinimumWidth();
     }
 
