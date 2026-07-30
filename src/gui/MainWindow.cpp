@@ -177,7 +177,6 @@
 #include <QBuffer>
 #include <QFont>
 #include <QFontMetrics>
-#include <QRegularExpression>
 #include <QWidgetAction>
 #include <QPainter>
 #include <QVBoxLayout>
@@ -383,14 +382,10 @@ QString stationFittedText(const QString& text, int fontPx)
 // containing whitespace is shrunk to fit on ONE line instead of widening the
 // status bar, down to kStationMinFontPx, eliding below that.
 //
-// WHITESPACE IS THE TRIGGER, NOT WIDTH, and that is not a detail: measured on
-// real radios, the widest nickname in the lab is a FLEX one — "ANT1-AV640"
-// occupies 174px against the HL2's "Hermes-Lite 2" at 170px. A width
-// threshold would therefore wrap the Flex and leave the HL2 on one line,
-// which is backwards. What actually distinguishes them is that the HL2 has no
-// operator-set nickname, so Hl2Discovery::effectiveNickname() substitutes the
-// model string — two words — while every real callsign and Flex nickname is a
-// single token.
+// WHITESPACE IS THE TRIGGER, NOT WIDTH, and that is not a detail: what
+// distinguishes the two is that the HL2 has no operator-set nickname, so
+// Hl2Discovery::effectiveNickname() substitutes the model string — two words
+// — while every real callsign and Flex nickname is a single token.
 //
 // A width threshold cannot be used in its place: measured at kStationFontPx on
 // real radios, "ANT1-AV640" occupies 157px against "Hermes-Lite 2" at 170px.
@@ -403,8 +398,11 @@ bool setStatusBarStationText(QLabel* label, const QString& text)
     }
 
     const QString trimmed = text.trimmed();
-    const bool multiWord =
-        trimmed.contains(QRegularExpression(QStringLiteral("\\s")));
+    // std::any_of over QChar::isSpace rather than a QRegularExpression: this is
+    // reached from the MeterModel::hwTelemetryChanged handler, so a per-call
+    // pattern compile would land on every PA-temperature delta.
+    const bool multiWord = std::any_of(trimmed.cbegin(), trimmed.cend(),
+                                       [](QChar c) { return c.isSpace(); });
     const int fontPx = multiWord ? stationFittedFontPx(trimmed) : kStationFontPx;
     const QString rendered =
         multiWord ? stationFittedText(trimmed, fontPx) : text;

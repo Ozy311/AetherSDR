@@ -5211,6 +5211,11 @@ void RadioModel::onDisconnected()
     m_maxSlices = 4;
     m_model.clear();
     m_version.clear();
+    // Cleared beside m_version rather than relying on the next connect to
+    // reassign it: this block's contract is that everything here is re-derived
+    // from the new radio's status, and a path that reaches a Flex without
+    // going through connectToRadio() would otherwise inherit an HL2's word.
+    m_versionLabel.clear();
     // Remember which radio the surviving pan/slice models belong to so the
     // next connect can refuse to reclaim them against a different radio.
     // Keep the previous value if this disconnect never learned a serial
