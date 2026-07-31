@@ -1167,19 +1167,6 @@ SliceModel* TciServer::sliceForTrx(int trx) const
     return m_trxMap.sliceForTrx(m_model, trx);
 }
 
-// The slice that actually holds transmit right now, straight from the live
-// endpoint list - the value a cached route is supposed to agree with.
-// -1 when no slice is currently TX.
-int TciServer::liveTxSlice(const QVector<TciSliceEndpoint>& endpoints)
-{
-    for (const TciSliceEndpoint& endpoint : endpoints) {
-        if (endpoint.isTx) {
-            return endpoint.sliceId;
-        }
-    }
-    return -1;
-}
-
 const char* TciServer::txRouteOwnerName(TciRoutingState::TxRouteOwner owner)
 {
     switch (owner) {
@@ -1882,7 +1869,14 @@ void TciServer::handleTrxRequest(QWebSocket* client, const TciProtocol::TrxReque
         return;
     }
     const QVector<TciSliceEndpoint> endpoints = routingEndpoints();
-    const int liveTx = liveTxSlice(endpoints);
+    const int liveTx = TciRoutingState::currentTxSlice(endpoints);
+    // Sample the cached route BEFORE resolving. resolvePttSlice() writes the
+    // live TX assignment through to the cache on the external-TX branch, so
+    // reading these afterwards would always show the cache agreeing with
+    // liveTx - erasing exactly the disagreement this line exists to catch.
+    const int cachedTx = m_routingState.txSliceId();
+    const int cachedRx = m_routingState.rxSliceId();
+    const char* const cachedOwner = txRouteOwnerName(m_routingState.owner());
     const int txSliceId = m_routingState.resolvePttSlice(rxSlice->sliceId(), endpoints);
 
     // Why did transmit land where it did?  Every TCI routing fault reported so
@@ -1891,22 +1885,17 @@ void TciServer::handleTrxRequest(QWebSocket* client, const TciProtocol::TrxReque
     // live TX assignment, or two clients addressing the same trx.  Log the
     // whole decision - request, live state, cached state, result - so a report
     // can be diagnosed from a log instead of a reproduction.
-    qCInfo(lcCat).nospace()
+    qCInfo(lcCat).nospace().noquote()
         << "TCI PTT route: trx=" << request.trx
         << " rxSlice=" << rxSlice->sliceId()
         << " -> txSlice=" << txSliceId
         << (txSliceId == rxSlice->sliceId() ? " (requested)" : " (NOT the requested slice)")
         << " | liveTx=" << liveTx
-        << " cachedTx=" << m_routingState.txSliceId()
-        << " cachedRx=" << m_routingState.rxSliceId()
-        << " owner=" << txRouteOwnerName(m_routingState.owner())
+        << " cachedTx=" << cachedTx
+        << " cachedRx=" << cachedRx
+        << " owner=" << cachedOwner
         << " split=" << (m_routingState.splitRequested() ? "true" : "false")
         << " source=" << (request.source.isEmpty() ? QStringLiteral("(none)") : request.source);
-
-    if (liveTx >= 0 && txSliceId != liveTx) {
-        qCInfo(lcCat) << "TCI PTT: transmit moves from slice" << liveTx
-                      << "to slice" << txSliceId;
-    }
 
     SliceModel* txSlice = m_model->slice(txSliceId);
     if (!txSlice) {
@@ -1919,6 +1908,14 @@ void TciServer::handleTrxRequest(QWebSocket* client, const TciProtocol::TrxReque
         qCWarning(lcCat) << "TCI PTT: slice" << txSliceId
                          << "is transmit-inhibited -" << inhibitReason;
         return;
+    }
+
+    // Stated as intent, and only once the drop paths above are behind us: the
+    // promote below is asynchronous and can still come back unselected, so
+    // this is the request that survived every guard, not a completed move.
+    if (liveTx >= 0 && txSliceId != liveTx) {
+        qCInfo(lcCat) << "TCI PTT: transmit will move from slice" << liveTx
+                      << "to slice" << txSliceId;
     }
 
     const QString mode = txSlice->mode().trimmed().toUpper();

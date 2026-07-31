@@ -180,8 +180,7 @@ private:
     void broadcastBinary(const QByteArray& data);
     SliceModel* sliceForTrx(int trx) const;
     QVector<TciSliceEndpoint> routingEndpoints() const;
-    // Diagnostics helpers for the PTT routing decision log.
-    static int liveTxSlice(const QVector<TciSliceEndpoint>& endpoints);
+    // Diagnostics helper for the PTT routing decision log.
     static const char* txRouteOwnerName(TciRoutingState::TxRouteOwner owner);
     void handleVfoRequest(QWebSocket* client, const TciProtocol::VfoRequest& request);
     void handleSplitRequest(QWebSocket* client, const TciProtocol::SplitRequest& request);
