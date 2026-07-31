@@ -1167,6 +1167,32 @@ SliceModel* TciServer::sliceForTrx(int trx) const
     return m_trxMap.sliceForTrx(m_model, trx);
 }
 
+// The slice that actually holds transmit right now, straight from the live
+// endpoint list - the value a cached route is supposed to agree with.
+// -1 when no slice is currently TX.
+int TciServer::liveTxSlice(const QVector<TciSliceEndpoint>& endpoints)
+{
+    for (const TciSliceEndpoint& endpoint : endpoints) {
+        if (endpoint.isTx) {
+            return endpoint.sliceId;
+        }
+    }
+    return -1;
+}
+
+const char* TciServer::txRouteOwnerName(TciRoutingState::TxRouteOwner owner)
+{
+    switch (owner) {
+    case TciRoutingState::TxRouteOwner::None:
+        return "none";
+    case TciRoutingState::TxRouteOwner::External:
+        return "external";
+    case TciRoutingState::TxRouteOwner::TciCreated:
+        return "tci-created";
+    }
+    return "unknown";
+}
+
 QVector<TciSliceEndpoint> TciServer::routingEndpoints() const
 {
     QVector<TciSliceEndpoint> endpoints;
@@ -1851,11 +1877,47 @@ void TciServer::handleTrxRequest(QWebSocket* client, const TciProtocol::TrxReque
 
     SliceModel* rxSlice = sliceForTrx(request.trx);
     if (!rxSlice) {
+        qCWarning(lcCat) << "TCI PTT: trx" << request.trx
+                         << "resolves to no owned slice - request dropped";
         return;
     }
-    const int txSliceId = m_routingState.resolvePttSlice(rxSlice->sliceId(), routingEndpoints());
+    const QVector<TciSliceEndpoint> endpoints = routingEndpoints();
+    const int liveTx = liveTxSlice(endpoints);
+    const int txSliceId = m_routingState.resolvePttSlice(rxSlice->sliceId(), endpoints);
+
+    // Why did transmit land where it did?  Every TCI routing fault reported so
+    // far reduces to one of three things, and all three are invisible without
+    // this line: the requested trx resolved away, a cached route outliving the
+    // live TX assignment, or two clients addressing the same trx.  Log the
+    // whole decision - request, live state, cached state, result - so a report
+    // can be diagnosed from a log instead of a reproduction.
+    qCInfo(lcCat).nospace()
+        << "TCI PTT route: trx=" << request.trx
+        << " rxSlice=" << rxSlice->sliceId()
+        << " -> txSlice=" << txSliceId
+        << (txSliceId == rxSlice->sliceId() ? " (requested)" : " (NOT the requested slice)")
+        << " | liveTx=" << liveTx
+        << " cachedTx=" << m_routingState.txSliceId()
+        << " cachedRx=" << m_routingState.rxSliceId()
+        << " owner=" << txRouteOwnerName(m_routingState.owner())
+        << " split=" << (m_routingState.splitRequested() ? "true" : "false")
+        << " source=" << (request.source.isEmpty() ? QStringLiteral("(none)") : request.source);
+
+    if (liveTx >= 0 && txSliceId != liveTx) {
+        qCInfo(lcCat) << "TCI PTT: transmit moves from slice" << liveTx
+                      << "to slice" << txSliceId;
+    }
+
     SliceModel* txSlice = m_model->slice(txSliceId);
-    if (!txSlice || !m_model->panTransmitInhibitReason(txSlice->panId()).isEmpty()) {
+    if (!txSlice) {
+        qCWarning(lcCat) << "TCI PTT: resolved tx slice" << txSliceId
+                         << "does not exist - request dropped";
+        return;
+    }
+    const QString inhibitReason = m_model->panTransmitInhibitReason(txSlice->panId());
+    if (!inhibitReason.isEmpty()) {
+        qCWarning(lcCat) << "TCI PTT: slice" << txSliceId
+                         << "is transmit-inhibited -" << inhibitReason;
         return;
     }
 
