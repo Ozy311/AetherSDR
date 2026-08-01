@@ -973,7 +973,9 @@ signals:
     // Emitted at most once per transmission when the TX filter is measurably
     // removing the operator's transmit audio (#4649). Carries a ready-to-show
     // operator-facing message naming the offending passband.
-    void txFilterBlockingAudio(const QString& message);
+    void txFilterBlockingAudio(const QString& title,
+                               const QString& detail,
+                               const QString& panId);
     // Emitted when global profile list or active profile changes.
     void globalProfilesChanged();
     void profileDatabaseImportingChanged(bool importing);

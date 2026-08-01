@@ -1224,11 +1224,10 @@ void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt1, float scF
     // CW never routes operator audio through the TX filter, so a low SC_FILT_2
     // there carries no information. Excluded explicitly rather than trusting
     // SC_MIC to sit at the floor during CW -- that has not been measured.
-    if (const SliceModel* tx = txSlice()) {
-        if (tx->mode().trimmed().toUpper().startsWith(QStringLiteral("CW"))) {
-            m_txFilterKillSamples = 0;
-            return;
-        }
+    const SliceModel* tx = txSlice();
+    if (tx && tx->mode().trimmed().toUpper().startsWith(QStringLiteral("CW"))) {
+        m_txFilterKillSamples = 0;
+        return;
     }
 
     // Measure ACROSS THE FILTER STAGES, not from the microphone tap.
@@ -1261,12 +1260,13 @@ void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt1, float scF
     // comparison is built from, so it is settled by construction and cannot
     // contradict the reason the message appeared.
     emit txFilterBlockingAudio(
-        tr("TX filter is removing your transmit audio - passband %1-%2 Hz "
-           "is cutting it by %3 dB, so almost no RF is leaving the radio. "
-           "Check TX Low/High Cut.")
+        tr("TX filter is removing your transmit audio"),
+        tr("Passband %1-%2 Hz is cutting it by %3 dB, so almost no RF is "
+           "leaving the radio. Check TX Low/High Cut.")
             .arg(m_transmitModel.txFilterLow())
             .arg(m_transmitModel.txFilterHigh())
-            .arg(qRound(scFilt1 - scFilt2)));
+            .arg(qRound(scFilt1 - scFilt2)),
+        tx ? tx->panId() : QString());
 }
 
 RadioModel::RadioModel(QObject* parent)
