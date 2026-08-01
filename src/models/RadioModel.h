@@ -1542,7 +1542,7 @@ private:
     QString localPttInterlockMessage(TransmitModel::PttSource source) const;
     QString txFilterFrequencyLimitMessage(int lowHz, int highHz) const;
     QString radioInterlockNotificationMessage(const QMap<QString, QString>& kvs) const;
-    void evaluateTxFilterAudioLoss(float scMic, float scFilt1, float scFilt2);
+    void evaluateTxFilterAudioLoss(float scFilt1, float scFilt2);
     void armInterlockNotification(TransmitModel::PttSource source = TransmitModel::PttSource::Mox);
     // Recompute the operator-transmit predicate and emit operatorTransmitChanged
     // on a rising/falling edge. Cheap; safe to call from every TX-state path.

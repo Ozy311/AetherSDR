@@ -1199,6 +1199,11 @@ constexpr float kTxFilterKillDeltaDb = 40.0f;
 // key-down -- SC_MIC rises before SC_FILT_2 settles -- so a single sample is
 // not evidence. Meters arrive at roughly 10-20 Hz, so this is ~0.3 s.
 constexpr int kTxFilterKillConfirmSamples = 5;
+// The two filter taps publish at 20 fps and 10 fps. Emission is tied to the
+// slower one, so in steady state the partner is ~50 ms old; anything much
+// beyond that means one tap has stalled and the pair no longer describes the
+// same moment.
+constexpr qint64 kTxFilterMaxTapSkewMs = 150;
 }  // namespace
 
 // A TX low/high cut that excludes the transmit audio produces no RF, and nothing
@@ -1206,7 +1211,7 @@ constexpr int kTxFilterKillConfirmSamples = 5;
 // The radio publishes both sides of the filter, so this MEASURES the loss rather
 // than inferring it from the cut values -- which is what makes it safe to state
 // plainly to the operator instead of as a guess.
-void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt1, float scFilt2)
+void RadioModel::evaluateTxFilterAudioLoss(float scFilt1, float scFilt2)
 {
     // Our own transmission only. isOperatorTransmitting() is deliberately NOT
     // used here: it is false for DAX transmits, which is exactly the digital
@@ -1217,9 +1222,16 @@ void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt1, float scF
         m_txFilterKillReported = false;
         return;
     }
-    // Both taps must have produced a real sample; see hasTxFilterLevels().
+    // Both filter taps must have produced a real sample; see
+    // hasTxFilterLevels(). They also publish at different rates, so only
+    // compare them while the pair is close in time.
     if (!m_meterModel.hasTxFilterLevels())
         return;
+    const qint64 skewMs = m_meterModel.txFilterLevelSkewMs();
+    if (skewMs < 0 || skewMs > kTxFilterMaxTapSkewMs) {
+        m_txFilterKillSamples = 0;
+        return;
+    }
 
     // CW never routes operator audio through the TX filter, so a low SC_FILT_2
     // there carries no information. Excluded explicitly rather than trusting
@@ -1227,6 +1239,7 @@ void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt1, float scF
     const SliceModel* tx = txSlice();
     if (tx && tx->mode().trimmed().toUpper().startsWith(QStringLiteral("CW"))) {
         m_txFilterKillSamples = 0;
+        m_txFilterKillReported = false;
         return;
     }
 
@@ -1240,8 +1253,14 @@ void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt1, float scF
     // audio inside the passband ran -7.73 -> -5.23 dBFS across the two
     // filter taps, audio outside it -9.79 -> -68.18 -- a wider separation
     // than the mic-referenced comparison, and immune to everything before.
-    const bool audioReachedFilter = scMic   > kTxAudioPresentFloorDbfs
-                                 && scFilt1 > kTxAudioPresentFloorDbfs;
+    // Gate on SC_FILT_1 ALONE, never SC_MIC. SC_MIC is the PC/remote-audio
+    // entry point only: a hardware mic (BAL/LINE/ACC) joins the chain later,
+    // through the CODEC ADC, and never registers there
+    // (docs/architecture/tx-audio-signal-path.md). Requiring SC_MIC would
+    // silently switch this whole check off for every operator on a real
+    // microphone -- the people running tight voice filters in the first
+    // place. SC_FILT_1 proves audio reached the filter whatever path it took.
+    const bool audioReachedFilter = scFilt1 > kTxAudioPresentFloorDbfs;
     const bool filterRemoved      = scFilt2 < scFilt1 - kTxFilterKillDeltaDb;
     if (!audioReachedFilter || !filterRemoved) {
         m_txFilterKillSamples = 0;
@@ -1295,6 +1314,15 @@ RadioModel::RadioModel(QObject* parent)
     // audio can be reported to the operator instead of failing silently (#4649).
     connect(&m_meterModel, &MeterModel::txFilterLevelsChanged,
             this, &RadioModel::evaluateTxFilterAudioLoss);
+    // Arm/disarm on the TX edge, NOT from the meter path. A radio with
+    // met_in_rx off publishes no TX- meters between transmissions, so a latch
+    // cleared only inside the meter handler would never clear at all -- the
+    // card would appear on the first bad transmission of a session and never
+    // again.
+    connect(this, &RadioModel::radioTransmittingChanged, this, [this](bool) {
+        m_txFilterKillSamples = 0;
+        m_txFilterKillReported = false;
+    });
     qRegisterMetaType<ProfileDelta>();
     qRegisterMetaType<AmpDelta>();
     qRegisterMetaType<TunerDelta>();
