@@ -144,6 +144,8 @@ void MeterModel::defineMeter(const MeterDef& def)
         m_swAlcIdx = def.index;
     else if (isTxWaveformMeter(def) && def.name == "SC_MIC")
         m_scMicIdx = def.index;
+    else if (isTxWaveformMeter(def) && def.name == "SC_FILT_1")
+        m_scFilt1Idx = def.index;
     else if (isTxWaveformMeter(def) && def.name == "SC_FILT_2")
         m_scFilt2Idx = def.index;
     else if (def.source != "AMP" && def.name == "PATEMP")
@@ -225,6 +227,7 @@ void MeterModel::removeMeter(int index)
     if (index == m_hwAlcIdx)     m_hwAlcIdx = -1;
     if (index == m_swAlcIdx)     m_swAlcIdx = -1;
     if (index == m_scMicIdx)   { m_scMicIdx = -1;   m_hasScMicValue = false; }
+    if (index == m_scFilt1Idx) { m_scFilt1Idx = -1; m_hasScFilt1Value = false; }
     if (index == m_scFilt2Idx) { m_scFilt2Idx = -1; m_hasScFilt2Value = false; }
     if (index == m_paTempIdx)    m_paTempIdx = -1;
     if (index == m_supplyIdx) {
@@ -319,8 +322,10 @@ void MeterModel::clear()
     m_swAlcIdx = -1;
     m_paTempIdx = -1;
     m_scMicIdx = -1;
+    m_scFilt1Idx = -1;
     m_scFilt2Idx = -1;
     m_hasScMicValue = false;
+    m_hasScFilt1Value = false;
     m_hasScFilt2Value = false;
     m_supplyIdx = -1;
     m_hasSupplyVoltsValue = false;
@@ -655,6 +660,10 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
             m_scMic = v;
             m_hasScMicValue = true;
             txFilterLevelsChangedFlag = true;
+        } else if (idx == m_scFilt1Idx) {
+            m_scFilt1 = v;
+            m_hasScFilt1Value = true;
+            txFilterLevelsChangedFlag = true;
         } else if (idx == m_scFilt2Idx) {
             m_scFilt2 = v;
             m_hasScFilt2Value = true;
@@ -750,7 +759,7 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
     if (swAlcChangedFlag)
         emit this->swAlcChanged(m_swAlc);
     if (txFilterLevelsChangedFlag)
-        emit txFilterLevelsChanged(m_scMic, m_scFilt2);
+        emit txFilterLevelsChanged(m_scMic, m_scFilt1, m_scFilt2);
     if (hwChanged)
         emit hwTelemetryChanged(m_paTemp, m_supplyVolts);
     if (ampChanged)

@@ -1173,17 +1173,28 @@ void RadioModel::teardownBackend()
 }
 
 namespace {
-// Audio must actually be entering the TX chain before a low post-filter level
+// Audio must actually be reaching the filter before a low post-filter level
 // means anything. Silence reads the meter floor (-150 dBFS on a FLEX-6700);
-// a live tone measured -12 dBFS. -60 sits far above the floor and far below
-// any real transmit audio.
+// a live tone measured -12 dBFS at SC_MIC and -9.8 at SC_FILT_1. -60 sits
+// far above the floor and far below any real transmit audio.
 constexpr float kTxAudioPresentFloorDbfs = -60.0f;
-// How far SC_FILT_2 must sit below SC_MIC before we call the audio "removed".
-// Measured on a FLEX-6700 (#4649): audio INSIDE the passband left filter 2
-// ABOVE its own input (-12.32 -> -5.23 dBFS; there are gain stages between the
-// taps), while audio OUTSIDE it collapsed to -68.16 dBFS -- a 56 dB drop with
-// forward power falling 43.75 W -> 2.0 W. 30 dB sits clearly inside that cliff.
-constexpr float kTxFilterKillDeltaDb = 30.0f;
+// How far SC_FILT_2 must sit below SC_FILT_1 before we call the audio
+// "removed". Chosen from a tone sweep across the filter skirt on a FLEX-6700
+// with a 100-2900 Hz passband (#4649), because the corner is soft and a
+// too-eager threshold produces a confidently wrong message:
+//
+//   tone   SC_FILT_1 -> SC_FILT_2   delta    forward power
+//   2800     -7.76      -5.56       -2.2 dB    43.66 W   (in band)
+//   2900     -7.70     -11.31        3.6 dB    38.9  W   (at the cut, still fine)
+//   3000     -8.30     -38.95       30.7 dB    17.73 W   (attenuated, NOT dead)
+//   3100     -8.88     -64.98       56.1 dB     5.82 W   (effectively dead)
+//   3300     -9.16     -55.85       46.7 dB     3.08 W
+//
+// At 30 dB this fires while the radio is still making 17.7 W -- 40% of full
+// output -- which would be reported to the operator as a dead transmitter.
+// 40 dB sits between the 30.7 dB case we must NOT flag and the 46.7 dB case we
+// must, and only fires once output has collapsed to a few percent.
+constexpr float kTxFilterKillDeltaDb = 40.0f;
 // Consecutive qualifying meter packets before we speak. The chain ramps at
 // key-down -- SC_MIC rises before SC_FILT_2 settles -- so a single sample is
 // not evidence. Meters arrive at roughly 10-20 Hz, so this is ~0.3 s.
@@ -1195,7 +1206,7 @@ constexpr int kTxFilterKillConfirmSamples = 5;
 // The radio publishes both sides of the filter, so this MEASURES the loss rather
 // than inferring it from the cut values -- which is what makes it safe to state
 // plainly to the operator instead of as a guess.
-void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt2)
+void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt1, float scFilt2)
 {
     // Our own transmission only. isOperatorTransmitting() is deliberately NOT
     // used here: it is false for DAX transmits, which is exactly the digital
@@ -1220,9 +1231,20 @@ void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt2)
         }
     }
 
-    const bool audioPresent   = scMic > kTxAudioPresentFloorDbfs;
-    const bool filterRemoved  = scFilt2 < scMic - kTxFilterKillDeltaDb;
-    if (!audioPresent || !filterRemoved) {
+    // Measure ACROSS THE FILTER STAGES, not from the microphone tap.
+    // SC_MIC -> SC_FILT_2 spans mic gain, the equaliser, the speech
+    // processor and ALC, so anything upstream collapsing -- a closed DEXP
+    // gate, mic gain at zero, a processor fault -- would be reported to the
+    // operator as a TX-filter problem, which is a confident wrong answer.
+    // SC_FILT_1 sits immediately before the stage the operator's low/high
+    // cut actually controls, so this pair isolates it. Measured (#4649):
+    // audio inside the passband ran -7.73 -> -5.23 dBFS across the two
+    // filter taps, audio outside it -9.79 -> -68.18 -- a wider separation
+    // than the mic-referenced comparison, and immune to everything before.
+    const bool audioReachedFilter = scMic   > kTxAudioPresentFloorDbfs
+                                 && scFilt1 > kTxAudioPresentFloorDbfs;
+    const bool filterRemoved      = scFilt2 < scFilt1 - kTxFilterKillDeltaDb;
+    if (!audioReachedFilter || !filterRemoved) {
         m_txFilterKillSamples = 0;
         return;
     }
@@ -1232,13 +1254,19 @@ void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt2)
         return;   // once per transmission, not once per meter packet
     m_txFilterKillReported = true;
 
-    // Name the actual cut values: the whole complaint is that the operator
-    // cannot tell this apart from a dead DAX stream or a hardware fault.
+    // Name the actual cut values and the measured attenuation. Deliberately
+    // NOT the forward-power reading: this fires ~0.3 s after key-down, before
+    // the smoothed power meter has settled, so it reported "0.0 W" on a
+    // transmission actually making 2.3 W. The attenuation is the quantity the
+    // comparison is built from, so it is settled by construction and cannot
+    // contradict the reason the message appeared.
     emit txFilterBlockingAudio(
-        tr("TX filter is removing your transmit audio - passband %1-%2 Hz, "
-           "no RF is being produced. Check TX Low/High Cut.")
+        tr("TX filter is removing your transmit audio - passband %1-%2 Hz "
+           "is cutting it by %3 dB, so almost no RF is leaving the radio. "
+           "Check TX Low/High Cut.")
             .arg(m_transmitModel.txFilterLow())
-            .arg(m_transmitModel.txFilterHigh()));
+            .arg(m_transmitModel.txFilterHigh())
+            .arg(qRound(scFilt1 - scFilt2)));
 }
 
 RadioModel::RadioModel(QObject* parent)

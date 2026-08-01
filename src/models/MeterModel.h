@@ -162,6 +162,7 @@ public:
     // operator's low/high cut can silence.  Comparing the two is what makes
     // "the TX filter removed the audio" measurable instead of inferred (#4649).
     float scMic() const { return m_scMic; }
+    float scFilt1() const { return m_scFilt1; }
     float scFilt2() const { return m_scFilt2; }
     // Whether a SAMPLE has landed for BOTH -- the same distinction
     // hasSupplyVoltage() draws above, and load-bearing for the same reason: the
@@ -169,7 +170,8 @@ public:
     // 0.0f initialiser until a VALUE packet lands.  0 dBFS is a very loud
     // signal, so a comparison keyed on the index alone would read the
     // initialiser as full-scale transmit audio.
-    bool hasTxFilterLevels() const { return m_hasScMicValue && m_hasScFilt2Value; }
+    bool hasTxFilterLevels() const
+    { return m_hasScMicValue && m_hasScFilt1Value && m_hasScFilt2Value; }
 
     // Convenience: PA heatsink temperature (°C).
     float paTemp() const { return m_paTemp; }
@@ -238,7 +240,7 @@ signals:
     void swAlcChanged(float dbfs);
 
     // Emitted when either side of the TX-filter pair changes (dBFS in, dBFS out).
-    void txFilterLevelsChanged(float scMic, float scFilt2);
+    void txFilterLevelsChanged(float scMic, float scFilt1, float scFilt2);
 
     // Emitted when hardware telemetry meters change (PA temp, supply voltage).
     void hwTelemetryChanged(float paTemp, float supplyVolts);
@@ -288,6 +290,7 @@ private:
     int m_hwAlcIdx{-1};      // "TX" / "HWALC" — external RCA jack voltage
     int m_swAlcIdx{-1};      // "TX" / "ALC"   — post-software-ALC SSB peak
     int m_scMicIdx{-1};      // "TX" / "SC_MIC"    — PC/remote audio entering TX
+    int m_scFilt1Idx{-1};    // "TX" / "SC_FILT_1" — after the first TX filter
     int m_scFilt2Idx{-1};    // "TX" / "SC_FILT_2" — after the second TX filter
     int m_paTempIdx{-1};     // "RAD" / "PATEMP"
     int m_supplyIdx{-1};     // "RAD" / "+13.8A" (supply voltage, point A = before fuse)
@@ -325,10 +328,12 @@ private:
     float m_hwAlc{0.0f};
     float m_swAlc{0.0f};
     float m_scMic{0.0f};
+    float m_scFilt1{0.0f};
     float m_scFilt2{0.0f};
     // Cleared wherever the matching index is, so a level can never
     // outlive the meter it describes. See hasTxFilterLevels().
     bool m_hasScMicValue{false};
+    bool m_hasScFilt1Value{false};
     bool m_hasScFilt2Value{false};
     float m_paTemp{0.0f};
     float m_supplyVolts{0.0f};
