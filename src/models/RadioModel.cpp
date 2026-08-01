@@ -1172,6 +1172,75 @@ void RadioModel::teardownBackend()
     m_backendPanBandwidthMhz.clear();
 }
 
+namespace {
+// Audio must actually be entering the TX chain before a low post-filter level
+// means anything. Silence reads the meter floor (-150 dBFS on a FLEX-6700);
+// a live tone measured -12 dBFS. -60 sits far above the floor and far below
+// any real transmit audio.
+constexpr float kTxAudioPresentFloorDbfs = -60.0f;
+// How far SC_FILT_2 must sit below SC_MIC before we call the audio "removed".
+// Measured on a FLEX-6700 (#4649): audio INSIDE the passband left filter 2
+// ABOVE its own input (-12.32 -> -5.23 dBFS; there are gain stages between the
+// taps), while audio OUTSIDE it collapsed to -68.16 dBFS -- a 56 dB drop with
+// forward power falling 43.75 W -> 2.0 W. 30 dB sits clearly inside that cliff.
+constexpr float kTxFilterKillDeltaDb = 30.0f;
+// Consecutive qualifying meter packets before we speak. The chain ramps at
+// key-down -- SC_MIC rises before SC_FILT_2 settles -- so a single sample is
+// not evidence. Meters arrive at roughly 10-20 Hz, so this is ~0.3 s.
+constexpr int kTxFilterKillConfirmSamples = 5;
+}  // namespace
+
+// A TX low/high cut that excludes the transmit audio produces no RF, and nothing
+// else in the client can tell the operator their filter is the cause (#4649).
+// The radio publishes both sides of the filter, so this MEASURES the loss rather
+// than inferring it from the cut values -- which is what makes it safe to state
+// plainly to the operator instead of as a guess.
+void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt2)
+{
+    // Our own transmission only. isOperatorTransmitting() is deliberately NOT
+    // used here: it is false for DAX transmits, which is exactly the digital
+    // path this defect is reported on. txOwnedByUs() is derived from the
+    // interlock's tx_client_handle, so it covers DAX and TCI alike.
+    if (!m_radioTransmitting || !m_txOwnedByUs) {
+        m_txFilterKillSamples = 0;
+        m_txFilterKillReported = false;
+        return;
+    }
+    // Both taps must have produced a real sample; see hasTxFilterLevels().
+    if (!m_meterModel.hasTxFilterLevels())
+        return;
+
+    // CW never routes operator audio through the TX filter, so a low SC_FILT_2
+    // there carries no information. Excluded explicitly rather than trusting
+    // SC_MIC to sit at the floor during CW -- that has not been measured.
+    if (const SliceModel* tx = txSlice()) {
+        if (tx->mode().trimmed().toUpper().startsWith(QStringLiteral("CW"))) {
+            m_txFilterKillSamples = 0;
+            return;
+        }
+    }
+
+    const bool audioPresent   = scMic > kTxAudioPresentFloorDbfs;
+    const bool filterRemoved  = scFilt2 < scMic - kTxFilterKillDeltaDb;
+    if (!audioPresent || !filterRemoved) {
+        m_txFilterKillSamples = 0;
+        return;
+    }
+    if (++m_txFilterKillSamples < kTxFilterKillConfirmSamples)
+        return;
+    if (m_txFilterKillReported)
+        return;   // once per transmission, not once per meter packet
+    m_txFilterKillReported = true;
+
+    // Name the actual cut values: the whole complaint is that the operator
+    // cannot tell this apart from a dead DAX stream or a hardware fault.
+    emit txFilterBlockingAudio(
+        tr("TX filter is removing your transmit audio - passband %1-%2 Hz, "
+           "no RF is being produced. Check TX Low/High Cut.")
+            .arg(m_transmitModel.txFilterLow())
+            .arg(m_transmitModel.txFilterHigh()));
+}
+
 RadioModel::RadioModel(QObject* parent)
     : QObject(parent)
 {
@@ -1187,6 +1256,11 @@ RadioModel::RadioModel(QObject* parent)
     qRegisterMetaType<RadioDelta>();
     qRegisterMetaType<GpsDelta>();
     qRegisterMetaType<MemoryDelta>();
+
+    // Watch both sides of the TX filter so a cut that silences the transmit
+    // audio can be reported to the operator instead of failing silently (#4649).
+    connect(&m_meterModel, &MeterModel::txFilterLevelsChanged,
+            this, &RadioModel::evaluateTxFilterAudioLoss);
     qRegisterMetaType<ProfileDelta>();
     qRegisterMetaType<AmpDelta>();
     qRegisterMetaType<TunerDelta>();

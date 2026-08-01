@@ -1252,6 +1252,13 @@ MainWindow::MainWindow(QWidget* parent)
     });
     connect(&m_radioModel, &RadioModel::interlockNotificationRequested,
             this, &MainWindow::showPanadapterInterlockNotification);
+    // Surfaced in the status bar rather than the panadapter overlay: this is
+    // a settings problem the operator has to go and fix, not a transient
+    // interlock event (#4649).
+    connect(&m_radioModel, &RadioModel::txFilterBlockingAudio,
+            this, [this](const QString& message) {
+                statusBar()->showMessage(message, 10000);
+            });
 
     m_networkDiagnosticsHistory = new NetworkDiagnosticsHistory(&m_radioModel, m_audio, this);
     connect(&m_radioModel, &RadioModel::digitalVoiceWaveformDegradationStarted,

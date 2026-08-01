@@ -142,6 +142,10 @@ void MeterModel::defineMeter(const MeterDef& def)
         m_hwAlcIdx = def.index;
     else if (def.name == "ALC")
         m_swAlcIdx = def.index;
+    else if (isTxWaveformMeter(def) && def.name == "SC_MIC")
+        m_scMicIdx = def.index;
+    else if (isTxWaveformMeter(def) && def.name == "SC_FILT_2")
+        m_scFilt2Idx = def.index;
     else if (def.source != "AMP" && def.name == "PATEMP")
         m_paTempIdx = def.index;
     else if (def.name == "+13.8A")
@@ -220,6 +224,8 @@ void MeterModel::removeMeter(int index)
     if (index == m_compLevelIdx) m_compLevelIdx = -1;
     if (index == m_hwAlcIdx)     m_hwAlcIdx = -1;
     if (index == m_swAlcIdx)     m_swAlcIdx = -1;
+    if (index == m_scMicIdx)   { m_scMicIdx = -1;   m_hasScMicValue = false; }
+    if (index == m_scFilt2Idx) { m_scFilt2Idx = -1; m_hasScFilt2Value = false; }
     if (index == m_paTempIdx)    m_paTempIdx = -1;
     if (index == m_supplyIdx) {
         m_supplyIdx = -1;
@@ -312,6 +318,10 @@ void MeterModel::clear()
     m_hwAlcIdx = -1;
     m_swAlcIdx = -1;
     m_paTempIdx = -1;
+    m_scMicIdx = -1;
+    m_scFilt2Idx = -1;
+    m_hasScMicValue = false;
+    m_hasScFilt2Value = false;
     m_supplyIdx = -1;
     m_hasSupplyVoltsValue = false;
     m_ampFwdPwrIdx = -1;
@@ -535,6 +545,7 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
     bool micChanged = false;
     bool hwAlcChangedFlag = false;
     bool swAlcChangedFlag = false;
+    bool txFilterLevelsChangedFlag = false;
     bool hwChanged = false;
     bool ampChanged = false;
     bool tgxlChanged = false;
@@ -640,6 +651,14 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
         } else if (idx == m_swAlcIdx) {
             m_swAlc = v;
             swAlcChangedFlag = true;
+        } else if (idx == m_scMicIdx) {
+            m_scMic = v;
+            m_hasScMicValue = true;
+            txFilterLevelsChangedFlag = true;
+        } else if (idx == m_scFilt2Idx) {
+            m_scFilt2 = v;
+            m_hasScFilt2Value = true;
+            txFilterLevelsChangedFlag = true;
         } else if (idx == m_paTempIdx) {
             m_paTemp = v;
             hwChanged = true;
@@ -730,6 +749,8 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
         emit this->hwAlcChanged(m_hwAlc);
     if (swAlcChangedFlag)
         emit this->swAlcChanged(m_swAlc);
+    if (txFilterLevelsChangedFlag)
+        emit txFilterLevelsChanged(m_scMic, m_scFilt2);
     if (hwChanged)
         emit hwTelemetryChanged(m_paTemp, m_supplyVolts);
     if (ampChanged)
