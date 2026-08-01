@@ -1259,10 +1259,16 @@ void RadioModel::evaluateTxFilterAudioLoss(float scMic, float scFilt1, float scF
     // transmission actually making 2.3 W. The attenuation is the quantity the
     // comparison is built from, so it is settled by construction and cannot
     // contradict the reason the message appeared.
+    // State the OBSERVATION, not a culprit. This measures that the audio and
+    // the passband do not overlap; it cannot tell whether the cuts were moved
+    // or the audio's pitch was. Blaming the filter outright sends an operator
+    // whose cuts are fine looking in the wrong place -- which is exactly how
+    // the first screenshot of this feature was misread.
     emit txFilterBlockingAudio(
-        tr("TX filter is removing your transmit audio"),
+        tr("Almost no transmit audio is getting through the TX filter"),
         tr("Passband %1-%2 Hz is cutting it by %3 dB, so almost no RF is "
-           "leaving the radio. Check TX Low/High Cut.")
+           "leaving the radio. Check your TX Low/High Cut, and the pitch of "
+           "your transmit audio.")
             .arg(m_transmitModel.txFilterLow())
             .arg(m_transmitModel.txFilterHigh())
             .arg(qRound(scFilt1 - scFilt2)),
