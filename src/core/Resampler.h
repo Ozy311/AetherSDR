@@ -27,6 +27,11 @@ public:
     // Resample mono float32 PCM. Returns resampled mono float32.
     QByteArray process(const float* in, int numSamples);
 
+    // Reuse caller-owned storage. The returned count is mono float samples.
+    // Reserving output before the first call keeps steady-state conversion
+    // allocation-free for blocks no larger than maxBlockSamples.
+    int process(const float* in, int numSamples, QByteArray& output);
+
     // Convenience: stereo float32 → mono downsample → resampled mono float32
     QByteArray processStereoToMono(const float* stereoIn, int numStereoFrames);
 
@@ -35,6 +40,10 @@ public:
 
     // Convenience: stereo float32 → downmix to mono → resample → duplicate to stereo float32
     QByteArray processStereoToStereo(const float* stereoIn, int numStereoFrames);
+
+    // Discard streaming state and consume startup latency again. Call between
+    // independent streams, never from the realtime process callback.
+    void reset();
 
     double srcRate() const { return m_srcRate; }
     double dstRate() const { return m_dstRate; }

@@ -18,34 +18,47 @@ Resampler::~Resampler() = default;
 
 QByteArray Resampler::process(const float* in, int numSamples)
 {
-    if (numSamples <= 0) return {};
+    QByteArray result;
+    process(in, numSamples, result);
+    return result;
+}
 
-    // r8b does not bounds-check against aMaxInLen; exceeding it silently
-    // overflows internal filter buffers. Chunk so each call stays within limit.
-    if (numSamples > m_maxBlockSamples) {
-        QByteArray result;
-        for (int offset = 0; offset < numSamples; offset += m_maxBlockSamples)
-            result.append(process(in + offset, std::min(numSamples - offset, m_maxBlockSamples)));
-        return result;
+int Resampler::process(const float* in, int numSamples, QByteArray& output)
+{
+    output.clear();
+    if (!in || numSamples <= 0) {
+        return 0;
     }
 
-    // Convert float32 → double
-    m_inBuf.resize(numSamples);
-    for (int i = 0; i < numSamples; ++i)
-        m_inBuf[i] = static_cast<double>(in[i]);
+    // r8b does not bounds-check against aMaxInLen; exceeding it silently
+    // overflows internal filter buffers. Feed bounded chunks while appending
+    // directly into the caller's reusable output storage.
+    int totalOutputSamples = 0;
+    for (int offset = 0; offset < numSamples; offset += m_maxBlockSamples) {
+        const int chunkSamples = std::min(
+            numSamples - offset, m_maxBlockSamples);
+        m_inBuf.resize(chunkSamples);
+        for (int index = 0; index < chunkSamples; ++index) {
+            m_inBuf[static_cast<size_t>(index)] =
+                static_cast<double>(in[offset + index]);
+        }
 
-    // Resample
-    double* outPtr = nullptr;
-    int outLen = m_resampler->process(m_inBuf.data(), numSamples, outPtr);
+        double* outputPointer = nullptr;
+        const int outputSamples = m_resampler->process(
+            m_inBuf.data(), chunkSamples, outputPointer);
+        if (outputSamples <= 0 || !outputPointer) {
+            continue;
+        }
 
-    if (outLen <= 0 || !outPtr) return {};
-
-    // Convert double → float32
-    QByteArray result(outLen * static_cast<int>(sizeof(float)), Qt::Uninitialized);
-    auto* dst = reinterpret_cast<float*>(result.data());
-    for (int i = 0; i < outLen; ++i)
-        dst[i] = static_cast<float>(outPtr[i]);
-    return result;
+        const int oldBytes = output.size();
+        output.resize(oldBytes + outputSamples * static_cast<int>(sizeof(float)));
+        auto* destination = reinterpret_cast<float*>(output.data() + oldBytes);
+        for (int index = 0; index < outputSamples; ++index) {
+            destination[index] = static_cast<float>(outputPointer[index]);
+        }
+        totalOutputSamples += outputSamples;
+    }
+    return totalOutputSamples;
 }
 
 QByteArray Resampler::processStereoToMono(const float* stereoIn, int numStereoFrames)
@@ -140,6 +153,12 @@ QByteArray Resampler::processStereoToStereo(const float* stereoIn, int numStereo
         dst[2 * i + 1] = s;
     }
     return result;
+}
+
+void Resampler::reset()
+{
+    m_resampler->clear();
+    prewarm();
 }
 
 void Resampler::prewarm()

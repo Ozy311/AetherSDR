@@ -32,7 +32,14 @@ public:
         ProcessedMono,
     };
 
-    explicit RNNoiseFilter(OutputMode outputMode = OutputMode::PreserveRxStereo);
+    enum class RateDomain {
+        Legacy24k,
+        Native48k,
+    };
+
+    explicit RNNoiseFilter(
+        OutputMode outputMode = OutputMode::PreserveRxStereo,
+        RateDomain rateDomain = RateDomain::Legacy24k);
     ~RNNoiseFilter();
 
     // Process a block of 24kHz stereo FLOAT32 PCM (NOT int16
@@ -40,6 +47,13 @@ public:
     // pairs interleaved as L,R,L,R,... with each sample in [-1.0, 1.0]).
     // Returns the processed block in the same format and frame count.
     QByteArray process(const QByteArray& pcm24kStereo);
+
+    // Process native RNNoise-rate audio without the wrapper's 24 <-> 48 kHz
+    // resamplers. Input and output are interleaved 48 kHz stereo float32 with
+    // an identical frame count. This is the TX voice path's fixed-rate seam;
+    // the existing process() entry point remains the 24 kHz RX-compatible API.
+    QByteArray process48kStereo(const QByteArray& pcm48kStereo);
+    int process48kStereo(const QByteArray& pcm48kStereo, QByteArray& output);
 
     // Fraction of the original spectrum retained in each RX frame, clamped to
     // [0, 1]. 0 (the default) is full suppression — RN2's behavior since it
@@ -66,6 +80,7 @@ private:
     std::array<std::vector<float>, 2> m_processed48k;
     std::array<std::vector<float>, 2> m_processed48kFloat;
     OutputMode m_outputMode{OutputMode::PreserveRxStereo};
+    RateDomain m_rateDomain{RateDomain::Legacy24k};
     float m_dryMix{0.0f};
     bool m_warnedChannelLengthMismatch{false};
 };

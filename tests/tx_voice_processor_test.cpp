@@ -1,0 +1,339 @@
+#include "core/ClientTube.h"
+#include "core/ClientGate.h"
+#include "core/RNNoiseFilter.h"
+#include "core/TxVoiceProcessor.h"
+
+#include <QByteArray>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <vector>
+
+using AetherSDR::ClientTube;
+using AetherSDR::ClientGate;
+using AetherSDR::RNNoiseFilter;
+using AetherSDR::TxVoiceProcessor;
+
+namespace {
+
+int g_failed = 0;
+
+void report(const char* name, bool ok, const std::string& detail = {})
+{
+    std::printf("%s %-68s %s\n",
+                ok ? "[ OK ]" : "[FAIL]",
+                name,
+                detail.c_str());
+    if (!ok) {
+        ++g_failed;
+    }
+}
+
+QByteArray makeCanonicalTone(int frames, int sampleRate, float frequencyHz)
+{
+    QByteArray result(
+        frames * 2 * static_cast<int>(sizeof(int16_t)), Qt::Uninitialized);
+    auto* samples = reinterpret_cast<int16_t*>(result.data());
+    constexpr double kTwoPi = 6.28318530717958647692;
+    for (int frame = 0; frame < frames; ++frame) {
+        const float value = 0.25f * static_cast<float>(
+            std::sin(kTwoPi * frequencyHz * frame / sampleRate));
+        const int16_t quantized = static_cast<int16_t>(value * 32767.0f);
+        samples[frame * 2] = quantized;
+        samples[frame * 2 + 1] = quantized;
+    }
+    return result;
+}
+
+bool finiteFloatBuffer(const QByteArray& bytes)
+{
+    const auto* samples = reinterpret_cast<const float*>(bytes.constData());
+    const int count = bytes.size() / static_cast<int>(sizeof(float));
+    for (int index = 0; index < count; ++index) {
+        if (!std::isfinite(samples[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool duplicatedStereo(const QByteArray& bytes, bool floatSamples)
+{
+    const int sampleBytes = floatSamples
+        ? static_cast<int>(sizeof(float))
+        : static_cast<int>(sizeof(int16_t));
+    const int frames = bytes.size() / (2 * sampleBytes);
+    if (floatSamples) {
+        const auto* samples = reinterpret_cast<const float*>(bytes.constData());
+        for (int frame = 0; frame < frames; ++frame) {
+            if (samples[frame * 2] != samples[frame * 2 + 1]) {
+                return false;
+            }
+        }
+    } else {
+        const auto* samples = reinterpret_cast<const int16_t*>(bytes.constData());
+        for (int frame = 0; frame < frames; ++frame) {
+            if (samples[frame * 2] != samples[frame * 2 + 1]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+uint64_t packedSingleStage(TxVoiceProcessor::Stage stage)
+{
+    return static_cast<uint64_t>(stage);
+}
+
+void testFixedRateContract()
+{
+    report("DSP rate is pinned to 48 kHz", TxVoiceProcessor::kDspRate == 48000);
+    report("transport rate remains 24 kHz",
+           TxVoiceProcessor::kTransportRate == 24000);
+}
+
+void test48kBypassAndMeasurementBoundaries()
+{
+    TxVoiceProcessor processor;
+    processor.setMeasurementCaptureEnabled(true);
+    const bool prepared = processor.prepare(48000, 1024);
+    const bool processed = processor.processCapturedInt16(
+        makeCanonicalTone(480, 48000, 1000.0f));
+
+    report("48 kHz processor prepares", prepared);
+    report("48 kHz block processes", processed);
+    report("normalized measurement contains 480 stereo float frames",
+           processor.normalizedFloat48Stereo().size()
+               == 480 * 2 * static_cast<int>(sizeof(float)));
+    report("post-strip measurement contains 480 stereo float frames",
+           processor.postChannelStripFloat48Stereo().size()
+               == 480 * 2 * static_cast<int>(sizeof(float)));
+    report("egress contains 240 stereo float frames",
+           processor.transportFloat32Stereo().size()
+               == 240 * 2 * static_cast<int>(sizeof(float)));
+    report("egress contains 240 stereo int16 frames",
+           processor.transportInt16Stereo().size()
+               == 240 * 2 * static_cast<int>(sizeof(int16_t)));
+    report("bypass output remains finite",
+           finiteFloatBuffer(processor.transportFloat32Stereo()));
+    report("mono voice remains duplicated stereo through egress",
+           duplicatedStereo(processor.transportFloat32Stereo(), true)
+               && duplicatedStereo(processor.transportInt16Stereo(), false));
+}
+
+void testDeviceRateNormalization()
+{
+    TxVoiceProcessor processor;
+    processor.setMeasurementCaptureEnabled(true);
+    const bool prepared = processor.prepare(44100, 1024);
+    const bool processed = processor.processCapturedInt16(
+        makeCanonicalTone(441, 44100, 1000.0f));
+    const int normalizedFrames = processor.normalizedFloat48Stereo().size()
+        / (2 * static_cast<int>(sizeof(float)));
+    const int transportFrames = processor.transportInt16Stereo().size()
+        / (2 * static_cast<int>(sizeof(int16_t)));
+
+    report("44.1 kHz capture rate prepares", prepared);
+    report("44.1 kHz capture block processes", processed);
+    report("10 ms at 44.1 kHz normalizes to 480 frames",
+           normalizedFrames == 480,
+           "frames=" + std::to_string(normalizedFrames));
+    report("normalized 10 ms block exits as 240 transport frames",
+           transportFrames == 240,
+           "frames=" + std::to_string(transportFrames));
+}
+
+void testFloat48OfflineEntryAvoidsInputQuantization()
+{
+    std::vector<float> input(480 * 2);
+    for (int frame = 0; frame < 480; ++frame) {
+        const float sample = 1.0e-6f * static_cast<float>(frame + 1);
+        input[static_cast<size_t>(frame * 2)] = sample;
+        input[static_cast<size_t>(frame * 2 + 1)] = -sample;
+    }
+
+    TxVoiceProcessor processor;
+    processor.setMeasurementCaptureEnabled(true);
+    processor.prepare(48000, 480);
+    const bool processed = processor.processFloat48(input.data(), 480);
+
+    report("native float 48 kHz offline block processes", processed);
+    report("native float entry preserves sub-int16 input values exactly",
+           processor.normalizedFloat48Stereo().size()
+                   == static_cast<int>(input.size() * sizeof(float))
+               && std::memcmp(processor.normalizedFloat48Stereo().constData(),
+                              input.data(), input.size() * sizeof(float)) == 0);
+}
+
+void testChannelStripRunsAt48k()
+{
+    ClientTube tube;
+    tube.setEnabled(true);
+    tube.setDriveDb(12.0f);
+    tube.setDryWet(1.0f);
+
+    TxVoiceProcessor processor;
+    TxVoiceProcessor::Processors processors;
+    processors.tube = &tube;
+    processor.setProcessors(processors);
+    processor.setStageOrder(packedSingleStage(TxVoiceProcessor::Stage::Tube));
+    processor.setMeasurementCaptureEnabled(true);
+    processor.prepare(48000, 1024);
+    const bool processed = processor.processCapturedInt16(
+        makeCanonicalTone(480, 48000, 1000.0f));
+
+    report("channel-strip block processes", processed);
+    report("tube is prepared at the canonical 48 kHz rate",
+           std::fabs(tube.sampleRate() - 48000.0) < 0.1);
+    report("enabled tube changes the post-strip measurement",
+           processor.normalizedFloat48Stereo()
+               != processor.postChannelStripFloat48Stereo());
+}
+
+void testNonFiniteSamplesCannotPoisonEgressSrc()
+{
+    std::vector<float> input(480 * 2, 0.1f);
+    input[20] = std::nanf("");
+    input[51] = std::numeric_limits<float>::infinity();
+    input[92] = -std::numeric_limits<float>::infinity();
+
+    TxVoiceProcessor processor;
+    processor.prepare(48000, 480);
+    const bool processed = processor.processFloat48(input.data(), 480);
+
+    report("non-finite input block still processes", processed);
+    report("non-finite samples cannot poison float transport output",
+           finiteFloatBuffer(processor.transportFloat32Stereo()));
+}
+
+void testMeasurementCaptureCanBeDisabled()
+{
+    TxVoiceProcessor processor;
+    processor.setMeasurementCaptureEnabled(false);
+    processor.prepare(48000, 1024);
+    processor.processCapturedInt16(makeCanonicalTone(480, 48000, 1000.0f));
+
+    report("disabled normalized tap holds no copied block",
+           processor.normalizedFloat48Stereo().isEmpty());
+    report("disabled post-strip tap holds no copied block",
+           processor.postChannelStripFloat48Stereo().isEmpty());
+    report("transport output remains available with taps disabled",
+           !processor.transportInt16Stereo().isEmpty());
+}
+
+void testBlockBoundaryContinuityAndReset()
+{
+    const QByteArray input = makeCanonicalTone(4800, 48000, 997.0f);
+
+    TxVoiceProcessor whole;
+    whole.prepare(48000, 4800);
+    whole.processCapturedInt16(input);
+    const QByteArray wholeOutput = whole.transportInt16Stereo();
+
+    TxVoiceProcessor blocked;
+    blocked.prepare(48000, 480);
+    QByteArray blockedOutput;
+    constexpr int kInputBlockBytes = 480 * 2 * static_cast<int>(sizeof(int16_t));
+    for (int offset = 0; offset < input.size(); offset += kInputBlockBytes) {
+        const bool processed = blocked.processCapturedInt16(
+            input.mid(offset, kInputBlockBytes));
+        if (!processed) {
+            report("streaming blocks all produce output", false);
+            return;
+        }
+        blockedOutput.append(blocked.transportInt16Stereo());
+    }
+
+    report("48 -> 24 SRC is invariant to 10 ms block boundaries",
+           blockedOutput == wholeOutput,
+           "wholeBytes=" + std::to_string(wholeOutput.size())
+               + " blockedBytes=" + std::to_string(blockedOutput.size()));
+
+    blocked.reset();
+    QByteArray afterReset;
+    for (int offset = 0; offset < input.size(); offset += kInputBlockBytes) {
+        blocked.processCapturedInt16(input.mid(offset, kInputBlockBytes));
+        afterReset.append(blocked.transportInt16Stereo());
+    }
+    report("reset restores deterministic SRC stream state",
+           afterReset == blockedOutput);
+}
+
+void testRnnoiseNative48kIsland()
+{
+    RNNoiseFilter rnnoise(
+        RNNoiseFilter::OutputMode::ProcessedMono,
+        RNNoiseFilter::RateDomain::Native48k);
+    TxVoiceProcessor processor;
+    TxVoiceProcessor::Processors processors;
+    processors.rnnoise = &rnnoise;
+    processor.setProcessors(processors);
+    processor.setRnnoiseEnabled(true);
+    processor.prepare(48000, 480);
+
+    bool allProcessed = true;
+    bool allSized = true;
+    bool allDuplicated = true;
+    for (int block = 0; block < 12; ++block) {
+        allProcessed = processor.processCapturedInt16(
+            makeCanonicalTone(480, 48000, 700.0f)) && allProcessed;
+        allSized = processor.transportInt16Stereo().size()
+            == 240 * 2 * static_cast<int>(sizeof(int16_t)) && allSized;
+        allDuplicated = duplicatedStereo(
+            processor.transportInt16Stereo(), false) && allDuplicated;
+    }
+
+    report("RNNoise native 48 kHz island processes complete frames", allProcessed);
+    report("RNNoise path preserves 10 ms transport framing", allSized);
+    report("TX RNNoise ProcessedMono remains duplicated stereo", allDuplicated);
+}
+
+void testLatencyAccounting()
+{
+    ClientGate gate;
+    gate.setEnabled(true);
+    gate.setLookaheadMs(2.0f);
+    RNNoiseFilter rnnoise(
+        RNNoiseFilter::OutputMode::ProcessedMono,
+        RNNoiseFilter::RateDomain::Native48k);
+
+    TxVoiceProcessor processor;
+    TxVoiceProcessor::Processors processors;
+    processors.gate = &gate;
+    processors.rnnoise = &rnnoise;
+    processor.setProcessors(processors);
+    processor.setStageOrder(packedSingleStage(TxVoiceProcessor::Stage::Gate));
+    processor.setRnnoiseEnabled(true);
+    processor.prepare(48000, 480);
+
+    report("latency report includes RNNoise frame plus gate lookahead",
+           processor.latencyFrames() == 480 + 96,
+           "frames=" + std::to_string(processor.latencyFrames()));
+}
+
+} // namespace
+
+int main()
+{
+    testFixedRateContract();
+    test48kBypassAndMeasurementBoundaries();
+    testDeviceRateNormalization();
+    testFloat48OfflineEntryAvoidsInputQuantization();
+    testChannelStripRunsAt48k();
+    testNonFiniteSamplesCannotPoisonEgressSrc();
+    testMeasurementCaptureCanBeDisabled();
+    testBlockBoundaryContinuityAndReset();
+    testRnnoiseNative48kIsland();
+    testLatencyAccounting();
+
+    std::printf("\n%s (%d failure%s)\n",
+                g_failed == 0 ? "PASS" : "FAIL",
+                g_failed,
+                g_failed == 1 ? "" : "s");
+    return g_failed == 0 ? 0 : 1;
+}
