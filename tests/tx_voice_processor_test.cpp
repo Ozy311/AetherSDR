@@ -264,6 +264,98 @@ void testBlockBoundaryContinuityAndReset()
            afterReset == blockedOutput);
 }
 
+void testTransportTpdfDither()
+{
+    constexpr int kInputFrames = 48000;
+    std::vector<float> silence(kInputFrames * 2, 0.0f);
+
+    TxVoiceProcessor processor;
+    processor.prepare(48000, kInputFrames);
+    const bool processed = processor.processFloat48(
+        silence.data(), kInputFrames);
+    const QByteArray firstOutput = processor.transportInt16Stereo();
+    const QByteArray floatOutput = processor.transportFloat32Stereo();
+    const auto* quantized = reinterpret_cast<const int16_t*>(
+        firstOutput.constData());
+    const int sampleCount = firstOutput.size()
+        / static_cast<int>(sizeof(int16_t));
+
+    bool bounded = true;
+    int nonZeroSamples = 0;
+    int64_t sampleSum = 0;
+    for (int sample = 0; sample < sampleCount; ++sample) {
+        bounded = quantized[sample] >= -1 && quantized[sample] <= 1
+            && bounded;
+        nonZeroSamples += quantized[sample] != 0 ? 1 : 0;
+        sampleSum += quantized[sample];
+    }
+
+    report("silent float transport block processes with dither", processed);
+    report("dither does not alter the float transport measurement tap",
+           finiteFloatBuffer(floatOutput)
+               && std::all_of(
+                   reinterpret_cast<const float*>(floatOutput.constData()),
+                   reinterpret_cast<const float*>(floatOutput.constData())
+                       + floatOutput.size() / static_cast<int>(sizeof(float)),
+                   [](float sample) { return sample == 0.0f; }));
+    report("linked TPDF preserves duplicated mono transport channels",
+           duplicatedStereo(firstOutput, false));
+    report("silent-input TPDF quantization remains within one int16 LSB",
+           bounded);
+    report("TPDF decorrelates digital silence from the zero code",
+           nonZeroSamples > sampleCount / 10,
+           "nonZero=" + std::to_string(nonZeroSamples)
+               + " samples=" + std::to_string(sampleCount));
+    report("silent-input TPDF has near-zero DC bias",
+           std::abs(sampleSum) < sampleCount / 100,
+           "sum=" + std::to_string(sampleSum));
+
+    processor.reset();
+    processor.processFloat48(silence.data(), kInputFrames);
+    report("reset restores deterministic TPDF stream state",
+           processor.transportInt16Stereo() == firstOutput);
+}
+
+void testDitheredTransportSaturatesAtInt16Rails()
+{
+    constexpr int kInputFrames = 48000;
+    const auto verifyRail = [](float inputSample, int16_t expectedRail) {
+        std::vector<float> input(kInputFrames * 2, inputSample);
+        TxVoiceProcessor processor;
+        processor.prepare(48000, kInputFrames);
+        if (!processor.processFloat48(input.data(), kInputFrames)) {
+            return false;
+        }
+
+        const QByteArray& floatBytes = processor.transportFloat32Stereo();
+        const QByteArray& int16Bytes = processor.transportInt16Stereo();
+        const auto* floatSamples = reinterpret_cast<const float*>(
+            floatBytes.constData());
+        const auto* int16Samples = reinterpret_cast<const int16_t*>(
+            int16Bytes.constData());
+        const int sampleCount = int16Bytes.size()
+            / static_cast<int>(sizeof(int16_t));
+        bool testedOverRangeSample = false;
+        for (int sample = 0; sample < sampleCount; ++sample) {
+            const bool overRange = expectedRail > 0
+                ? floatSamples[sample] >= 1.0f
+                : floatSamples[sample] <= -1.0f;
+            if (overRange) {
+                testedOverRangeSample = true;
+                if (int16Samples[sample] != expectedRail) {
+                    return false;
+                }
+            }
+        }
+        return testedOverRangeSample;
+    };
+
+    report("dithered quantizer saturates positive over-range samples",
+           verifyRail(100.0f, std::numeric_limits<int16_t>::max()));
+    report("dithered quantizer saturates negative over-range samples",
+           verifyRail(-100.0f, std::numeric_limits<int16_t>::min()));
+}
+
 void testRnnoiseNative48kIsland()
 {
     RNNoiseFilter rnnoise(
@@ -328,6 +420,8 @@ int main()
     testNonFiniteSamplesCannotPoisonEgressSrc();
     testMeasurementCaptureCanBeDisabled();
     testBlockBoundaryContinuityAndReset();
+    testTransportTpdfDither();
+    testDitheredTransportSaturatesAtInt16Rails();
     testRnnoiseNative48kIsland();
     testLatencyAccounting();
 

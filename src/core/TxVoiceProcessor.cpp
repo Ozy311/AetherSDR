@@ -103,6 +103,7 @@ void TxVoiceProcessor::prepareProcessors()
 
 void TxVoiceProcessor::reset()
 {
+    m_ditherState = kDitherSeed;
     if (m_inputResampler) {
         m_inputResampler->reset();
     }
@@ -314,14 +315,43 @@ bool TxVoiceProcessor::processWorkBuffer(int frames48)
     for (int frame = 0; frame < outputFrames; ++frame) {
         outputFloat[frame * 2] = left[frame];
         outputFloat[frame * 2 + 1] = right[frame];
+        const float ditherLsb = nextTpdfDitherLsb();
         for (int channel = 0; channel < kChannels; ++channel) {
-            const float scaled = std::clamp(
-                outputFloat[frame * 2 + channel] * 32768.0f,
-                -32768.0f, 32767.0f);
-            outputInt16[frame * 2 + channel] = static_cast<int16_t>(scaled);
+            outputInt16[frame * 2 + channel] = quantizeTransportSample(
+                outputFloat[frame * 2 + channel], ditherLsb);
         }
     }
     return true;
+}
+
+uint32_t TxVoiceProcessor::nextDitherRandom24() noexcept
+{
+    // SplitMix64 is deterministic, allocation-free, and has no zero-state
+    // trap. The upper 24 bits provide more than enough resolution for dither
+    // applied at an int16 boundary.
+    m_ditherState += 0x9E3779B97F4A7C15ULL;
+    uint64_t mixed = m_ditherState;
+    mixed = (mixed ^ (mixed >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+    mixed = (mixed ^ (mixed >> 27U)) * 0x94D049BB133111EBULL;
+    mixed ^= mixed >> 31U;
+    return static_cast<uint32_t>(mixed >> 40U);
+}
+
+float TxVoiceProcessor::nextTpdfDitherLsb() noexcept
+{
+    constexpr float kRandom24Scale = 1.0f / 16777216.0f;
+    const int32_t first = static_cast<int32_t>(nextDitherRandom24());
+    const int32_t second = static_cast<int32_t>(nextDitherRandom24());
+    return static_cast<float>(first - second) * kRandom24Scale;
+}
+
+int16_t TxVoiceProcessor::quantizeTransportSample(
+    float sample, float ditherLsb) noexcept
+{
+    const double dithered = static_cast<double>(sample) * 32768.0
+        + static_cast<double>(ditherLsb);
+    const double saturated = std::clamp(dithered, -32768.0, 32767.0);
+    return static_cast<int16_t>(std::lround(saturated));
 }
 
 void TxVoiceProcessor::processChannelStrip(QByteArray& float48Stereo) noexcept

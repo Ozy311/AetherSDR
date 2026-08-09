@@ -101,9 +101,15 @@ public:
     int latencyFrames() const noexcept;
 
 private:
+    static constexpr uint64_t kDitherSeed = 0x6A09E667F3BCC909ULL;
+
     void processChannelStrip(QByteArray& float48Stereo) noexcept;
     bool processWorkBuffer(int frames48);
     void prepareProcessors();
+    uint32_t nextDitherRandom24() noexcept;
+    float nextTpdfDitherLsb() noexcept;
+    static int16_t quantizeTransportSample(
+        float sample, float ditherLsb) noexcept;
 
     int m_inputRate{kDspRate};
     int m_maxInputFrames{0};
@@ -113,6 +119,7 @@ private:
     bool m_captureMeasurements{false};
     float m_micGain{1.0f};
     uint64_t m_packedStages{0};
+    uint64_t m_ditherState{kDitherSeed};
     Processors m_processors;
 
     std::unique_ptr<Resampler> m_inputResampler;
