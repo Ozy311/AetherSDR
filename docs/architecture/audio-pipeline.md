@@ -24,7 +24,7 @@ all run through the same DSP chain:
   negotiated device rate. After channel canonicalization, `TxVoiceProcessor`
   converts to float once, normalizes to a fixed 48 kHz DSP domain, runs optional
   TX RN2 and the complete voice strip, then performs one 48-to-24 kHz conversion
-  and one Int16 quantization at the unchanged transport boundary.
+  and one TPDF-dithered Int16 quantization at the unchanged transport boundary.
 - **Opus `remote_audio_tx` path**: the normal PC mic voice path sends 24 kHz
   stereo Int16 frames as 10 ms Opus packets over VITA-49 PCC `0x8005`.
 - **RADE TX/RX path**: RADE branches early from PC mic capture and bypasses the
@@ -303,7 +303,7 @@ flowchart TD
     L --> M["User-ordered 48 kHz float strip<br/>Gate / EQ / DeEss / Comp / Tube / PUDU / Reverb"]
     M --> N["PC mic gain -> Quindar -> final limiter<br/>48 kHz float32 stereo"]
     N --> O["Independent L/R egress SRC<br/>48 kHz -> 24 kHz float32"]
-    O --> P["Quantize once<br/>24 kHz stereo Int16"]
+    O --> P["Linked TPDF dither + round-to-nearest<br/>quantize once to 24 kHz stereo Int16"]
     P --> Q["Final monitor, scopes, PC mic meter"]
     Q --> R{"Opus enabled?"}
     R -->|yes| S["10 ms Opus remote_audio_tx<br/>PCC 0x8005"]
@@ -416,8 +416,12 @@ After capture channel canonicalization, `onTxAudioReady()` uses this ordering:
    silence before they can enter the stateful egress SRC.
 10. **Egress SRC**: independent left and right `Resampler` instances convert
     48 kHz float32 to 24 kHz float32, preserving the stereo representation.
-11. **Transport quantization**: the resampled float output is clipped and
-    converted once to 24 kHz stereo Int16. No dither is currently added.
+11. **Transport quantization**: one unshaped TPDF value with a 2-LSB
+    peak-to-peak range is added per frame, identically to L/R so the duplicated
+    mono voice representation remains exact. Samples are then rounded to the
+    nearest Int16 code and saturated at the Int16 rails. The allocation-free
+    deterministic PRNG has persistent streaming state and is returned to its
+    fixed seed by `TxVoiceProcessor::reset()` for reproducible offline tests.
 12. **Measurement seams**: when enabled for offline/tests,
     `normalizedFloat48Stereo()` exposes the normalized 48 kHz input and
     `postChannelStripFloat48Stereo()` exposes the 48 kHz post-strip/pre-gain
@@ -761,7 +765,7 @@ Radio-provided taps:
 | Quindar TX insertion | `ClientQuindarTone::process()` | float32 stereo | float32 stereo | 48 kHz | 2 | Inserts tones before final limiter |
 | Final voice limiter | `ClientFinalLimiter::process()` | float32 stereo | float32 stereo | 48 kHz | 2 | DC block, output trim, linked peak limiting |
 | Voice egress SRC | `TxVoiceProcessor::processWorkBuffer()` | float32 stereo | float32 stereo | 48 kHz -> 24 kHz | 2 | Independent matched L/R r8brain instances preserve stereo; state persists across blocks |
-| Voice transport quantization | `TxVoiceProcessor::processWorkBuffer()` | float32 stereo | Int16 stereo | 24 kHz | 2 | One clipped float-to-Int16 conversion; no dither |
+| Voice transport quantization | `TxVoiceProcessor::processWorkBuffer()` | float32 stereo | Int16 stereo | 24 kHz | 2 | Linked unshaped TPDF (2 LSB peak-to-peak), round-to-nearest, and Int16 saturation; deterministic state persists across blocks |
 | Opus TX packetization | `AudioEngine::onTxAudioReady()` | Int16 stereo | VITA PCC `0x8005` Opus | 24 kHz | 2 | 10 ms packets, paced queue |
 | Uncompressed voice fallback | `AudioEngine::onTxAudioReady()` | Int16 stereo | VITA PCC `0x03E3` float32 stereo | 24 kHz | 2 | 128 stereo frames per packet |
 | RADE TX branch | `AudioEngine::onTxAudioReady()` | Int16 stereo | float32 stereo | 24 kHz | 2 | Applies PC mic gain, canonical meter, emits `txRawPcmReady()` |
@@ -798,7 +802,7 @@ warning before it is discarded and regenerated.
 | `TxMicChannelNormalizer`, stereo input | Canonicalize and duplicate | Int16 stereo | Int16 stereo | Auto Left/Right/Average avoids one-sided stereo 6.02 dB loss; retains device rate |
 | `TxVoiceProcessor`, ingress | Format conversion, resample, duplicate | canonical Int16 stereo at device rate | float32 stereo 48 kHz | Takes one canonical channel, converts to float once, uses mono `Resampler::process()` when needed, then duplicates |
 | `TxVoiceProcessor`, egress | Preserve stereo and downsample | float32 stereo 48 kHz | float32 stereo 24 kHz | Separate L/R `Resampler` instances; no downmix |
-| `TxVoiceProcessor`, transport boundary | Quantize | float32 stereo 24 kHz | Int16 stereo 24 kHz | Single clipped conversion; no dither |
+| `TxVoiceProcessor`, transport boundary | Dither and quantize | float32 stereo 24 kHz | Int16 stereo 24 kHz | Single linked-channel TPDF-dithered conversion using round-to-nearest and Int16 saturation |
 | `AudioEngine::onTxAudioReady()`, RADE branch | Format conversion | Int16 stereo | float32 stereo | After PC mic gain and canonical meter |
 | `AudioEngine::onTxAudioReady()`, Opus TX | Encoding | Int16 stereo | Opus payload | 10 ms / 240 frame packets |
 | `AudioEngine::onTxAudioReady()`, VITA fallback | Format conversion | Int16 stereo | float32 stereo VITA | 128 stereo frames per packet |
@@ -849,8 +853,8 @@ warning before it is discarded and regenerated.
 - PC mic capture is canonicalized before resampling and metering, so one-sided
   stereo microphones keep full level and right-only microphones meter correctly.
 - Keep the normal voice strip in the fixed 48 kHz float domain. The 24 kHz rate
-  is the existing transport boundary, not the voice DSP engine rate. Quantize
-  only once after the final 48-to-24 kHz SRC.
+  is the existing transport boundary, not the voice DSP engine rate. Apply
+  dither and quantize only once after the final 48-to-24 kHz SRC.
 - DAX/TCI and RADE intentionally bypass the client voice strip. Do not move them
   through voice EQ/compression/limiting unless the digital-mode behavior is
   deliberately being redesigned.
