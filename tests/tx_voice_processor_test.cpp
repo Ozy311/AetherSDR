@@ -127,6 +127,67 @@ double transportToneRms(float frequencyHz)
         processor.transportFloat32Stereo(), kSettlingOutputFrames);
 }
 
+double capturedTransportToneRms(int inputRate, float frequencyHz)
+{
+    const int inputFrames = inputRate * 2;
+    TxVoiceProcessor processor;
+    QByteArray inputOutput = makeCanonicalTone(
+        inputFrames, inputRate, frequencyHz);
+    if (!processor.prepare(inputRate, inputFrames)
+        || !processor.processCapturedInt16(inputOutput)) {
+        return 0.0;
+    }
+
+    // Measure the final second so both SRCs are in steady state and every
+    // integer-Hz test tone spans an exact number of cycles.
+    return leftChannelRms(
+        processor.transportFloat32Stereo(),
+        TxVoiceProcessor::kTransportRate);
+}
+
+double capturedNormalizedToneRms(int inputRate, float frequencyHz)
+{
+    const int inputFrames = inputRate * 2;
+    TxVoiceProcessor processor;
+    processor.setMeasurementCaptureEnabled(true);
+    QByteArray inputOutput = makeCanonicalTone(
+        inputFrames, inputRate, frequencyHz);
+    if (!processor.prepare(inputRate, inputFrames)
+        || !processor.processCapturedInt16(inputOutput)) {
+        return 0.0;
+    }
+
+    return leftChannelRms(
+        processor.normalizedFloat48Stereo(), TxVoiceProcessor::kDspRate);
+}
+
+double leftChannelToneMagnitude(const QByteArray& floatStereo,
+                                int sampleRate,
+                                float frequencyHz,
+                                int startFrame,
+                                int analysisFrames)
+{
+    const auto* samples = reinterpret_cast<const float*>(
+        floatStereo.constData());
+    const int availableFrames = floatStereo.size()
+        / (2 * static_cast<int>(sizeof(float)));
+    if (!samples || startFrame < 0 || analysisFrames <= 0
+        || startFrame + analysisFrames > availableFrames) {
+        return 0.0;
+    }
+
+    constexpr double kTwoPi = 6.28318530717958647692;
+    double inPhase = 0.0;
+    double quadrature = 0.0;
+    for (int frame = 0; frame < analysisFrames; ++frame) {
+        const double phase = kTwoPi * frequencyHz * frame / sampleRate;
+        const double sample = samples[(startFrame + frame) * 2];
+        inPhase += sample * std::cos(phase);
+        quadrature += sample * std::sin(phase);
+    }
+    return 2.0 * std::hypot(inPhase, quadrature) / analysisFrames;
+}
+
 bool finiteFloatBuffer(const QByteArray& bytes)
 {
     const auto* samples = reinterpret_cast<const float*>(bytes.constData());
@@ -199,6 +260,75 @@ void testVoiceSrcBandwidthAndAliasRejection()
     report("aliases folding into 0-10 kHz remain below -100 dB",
            referenceRms > 0.0 && worstAliasDb <= -100.0,
            "worstAliasDb=" + std::to_string(worstAliasDb));
+}
+
+void testCapturedRateSrcBandwidthAndAliasRejection()
+{
+    const double reference24 = capturedTransportToneRms(24000, 1000.0f);
+    const double tenKhz24 = capturedTransportToneRms(24000, 10000.0f);
+    const double gain24Db = 20.0 * std::log10(
+        std::max(tenKhz24 / reference24, 1.0e-15));
+    report("24 -> 48 -> 24 path remains within 0.1 dB through 10 kHz",
+           reference24 > 0.0 && std::abs(gain24Db) <= 0.1,
+           "gainDb=" + std::to_string(gain24Db));
+
+    const double reference441 = capturedTransportToneRms(44100, 1000.0f);
+    const double tenKhz441 = capturedTransportToneRms(44100, 10000.0f);
+    const double gain441Db = 20.0 * std::log10(
+        std::max(tenKhz441 / reference441, 1.0e-15));
+    report("44.1 -> 48 -> 24 path remains within 0.1 dB through 10 kHz",
+           reference441 > 0.0 && std::abs(gain441Db) <= 0.1,
+           "gainDb=" + std::to_string(gain441Db));
+
+    const double normalizedReference441 =
+        capturedNormalizedToneRms(44100, 1000.0f);
+    const double normalizedTenKhz441 =
+        capturedNormalizedToneRms(44100, 10000.0f);
+    const double normalizedGain441Db = 20.0 * std::log10(
+        std::max(normalizedTenKhz441 / normalizedReference441, 1.0e-15));
+    report("44.1 -> 48 normalization remains within 0.1 dB through 10 kHz",
+           normalizedReference441 > 0.0
+               && std::abs(normalizedGain441Db) <= 0.1,
+           "gainDb=" + std::to_string(normalizedGain441Db));
+
+    // A 6 kHz tone sampled at 24 kHz has an interpolation image at 18 kHz
+    // after expansion to 48 kHz. Use the exact four-sample-period tone so
+    // int16 source quantization cannot set the rejection floor.
+    constexpr int kInputRate = 24000;
+    constexpr int kInputFrames = kInputRate * 2;
+    constexpr int kAnalysisFrames = TxVoiceProcessor::kDspRate;
+    TxVoiceProcessor imageProcessor;
+    imageProcessor.setMeasurementCaptureEnabled(true);
+    QByteArray imageInputOutput = makeCanonicalTone(
+        kInputFrames, kInputRate, 6000.0f);
+    const bool imageProcessed = imageProcessor.prepare(
+        kInputRate, kInputFrames)
+        && imageProcessor.processCapturedInt16(imageInputOutput);
+    const QByteArray& normalized = imageProcessor.normalizedFloat48Stereo();
+    const int normalizedFrames = normalized.size()
+        / (2 * static_cast<int>(sizeof(float)));
+    const int analysisStart = normalizedFrames - kAnalysisFrames;
+    const double fundamentalMagnitude = leftChannelToneMagnitude(
+        normalized, TxVoiceProcessor::kDspRate, 6000.0f,
+        analysisStart, kAnalysisFrames);
+    const double imageMagnitude = leftChannelToneMagnitude(
+        normalized, TxVoiceProcessor::kDspRate, 18000.0f,
+        analysisStart, kAnalysisFrames);
+    const double imageDb = 20.0 * std::log10(
+        std::max(imageMagnitude / fundamentalMagnitude, 1.0e-15));
+    report("24 -> 48 interpolation image remains below -100 dB",
+           imageProcessed && fundamentalMagnitude > 0.0 && imageDb <= -100.0,
+           "imageDb=" + std::to_string(imageDb));
+
+    // 14.7 kHz is exactly one third of 44.1 kHz, giving an int16-periodic
+    // stop-band probe without broadband quantization residue. If it survived
+    // the serial SRCs it would fold to 9.3 kHz at the 24 kHz transport rate.
+    const double alias441 = capturedTransportToneRms(44100, 14700.0f);
+    const double alias441Db = 20.0 * std::log10(
+        std::max(alias441 / reference441, 1.0e-15));
+    report("44.1 -> 48 -> 24 alias probe remains below -100 dB",
+           reference441 > 0.0 && alias441Db <= -100.0,
+           "aliasDb=" + std::to_string(alias441Db));
 }
 
 void testVoiceSrcLatencyBudgets()
@@ -756,6 +886,7 @@ int main()
 {
     testFixedRateContract();
     testVoiceSrcBandwidthAndAliasRejection();
+    testCapturedRateSrcBandwidthAndAliasRejection();
     testVoiceSrcLatencyBudgets();
     testReusableBuffersPreserveCapacity();
     testCapturedTransportUsesCallerOwnedStorage();
