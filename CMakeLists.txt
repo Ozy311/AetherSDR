@@ -4538,6 +4538,17 @@ target_link_libraries(automation_json_id_test PRIVATE
 )
 add_test(NAME automation_json_id_test COMMAND automation_json_id_test)
 
+# `connect ip` family resolution + the `family` field on `connect list` (#4912).
+# Pure verb-level test against a fake IConnectionAutomation — no socket, no radio.
+add_executable(automation_connect_family_test
+    tests/automation_connect_family_test.cpp
+)
+target_include_directories(automation_connect_family_test PRIVATE src tests)
+target_link_libraries(automation_connect_family_test PRIVATE
+    aethercore Qt6::Core Qt6::Network
+)
+add_test(NAME automation_connect_family_test COMMAND automation_connect_family_test)
+
 add_executable(gui_client_identity_policy_test
     tests/gui_client_identity_policy_test.cpp
 )

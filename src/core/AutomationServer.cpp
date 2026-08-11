@@ -1311,6 +1311,14 @@ QJsonObject connectionRadioToJson(const RadioInfo& radio)
     QJsonObject o{
         {QStringLiteral("name"), radio.name},
         {QStringLiteral("model"), radio.model},
+        // The wire-protocol discriminator (#4912). Without it `connect list`
+        // describes a Hermes-Lite 2 in prose only — "Hermes-Lite 2" lives in
+        // model, which is a display string — so a caller could not read the
+        // family back and pass it to `connect ip`, and could not work around a
+        // mis-resolved family either. RadioInfo has carried it since the
+        // aetherd Gap B backend split; only the serialisation was missing.
+        {QStringLiteral("family"),
+         radio.family.isEmpty() ? QStringLiteral("flex") : radio.family.toLower()},
         {QStringLiteral("serial"), radio.serial},
         {QStringLiteral("version"), radio.version},
         {QStringLiteral("nickname"), radio.nickname},
@@ -5517,10 +5525,23 @@ QJsonObject AutomationServer::doConnect(const QString& action,
     }
 
     if (a == QLatin1String("ip")) {
-        // connect ip <host-or-ip> [flex|hl2]
-        // The optional family picks which wire protocol to probe. Omitted keeps
-        // whatever the connect dialog's radio-type selector is set to, so every
-        // pre-existing `connect ip <addr>` script keeps working.
+        // connect ip <host-or-ip> [flex|hl2|icom]
+        //
+        // The optional family picks which wire protocol to probe. When it is
+        // omitted, DISCOVERY decides (#4912): an address the radio list already
+        // advertises is probed with that entry's family, so
+        // `connect ip 192.0.2.10` reaches a Hermes-Lite 2 without the caller
+        // having to know it is one. Before this, an omitted family fell through
+        // to whatever the connect dialog's radio-type selector happened to hold
+        // — Flex on a fresh instance — and the resulting failure surfaced only
+        // as a qCWarning while the reply still said ok/deferred.
+        //
+        // The dialog fallback is kept for an address nothing has advertised
+        // (a routed/off-subnet radio the caller knows about and discovery does
+        // not), so pre-existing scripts that lean on the selector still work.
+        // `familySource` in the reply says which of the three decided, because
+        // "family: flex" alone cannot distinguish a resolved answer from a
+        // default.
         static const QRegularExpression ipTokenSep(QStringLiteral("\\s+"));
         const QStringList ipTokens = arg.trimmed().split(ipTokenSep,
                                                          Qt::SkipEmptyParts);
@@ -5542,6 +5563,37 @@ QJsonObject AutomationServer::doConnect(const QString& action,
             return err(QStringLiteral("connect ip takes at most <host-or-ip> [flex|hl2|icom]"));
         }
 
+        // Match on the textual address the list itself publishes, so a caller
+        // can round-trip `connect list` → `connect ip` without reformatting.
+        QString discoveredFamily;
+        for (const RadioInfo& radio : conn->automationLocalRadios()) {
+            if (radio.address.toString().compare(target, Qt::CaseInsensitive) != 0) {
+                continue;
+            }
+            discoveredFamily = radio.family.isEmpty() ? QStringLiteral("flex")
+                                                      : radio.family.toLower();
+            break;
+        }
+
+        QString familySource;
+        if (!family.isEmpty()) {
+            // An explicit family contradicting discovery would probe the wrong
+            // plane, and that failure is invisible from here (deferred, logged,
+            // never returned). Fail fast and name both so the caller can see
+            // which of the two is wrong rather than reading a timeout.
+            if (!discoveredFamily.isEmpty() && discoveredFamily != family) {
+                return err(QStringLiteral("connect ip %1: requested radio type '%2' but "
+                                          "discovery reports '%3' at that address")
+                               .arg(target, family, discoveredFamily));
+            }
+            familySource = QStringLiteral("argument");
+        } else if (!discoveredFamily.isEmpty()) {
+            family = discoveredFamily;
+            familySource = QStringLiteral("discovery");
+        } else {
+            familySource = QStringLiteral("dialog");
+        }
+
         QPointer<QObject> guard(conn->asQObject());
         QTimer::singleShot(0, qApp, [guard, conn, target, family] {
             if (!guard) {
@@ -5558,6 +5610,7 @@ QJsonObject AutomationServer::doConnect(const QString& action,
             {QStringLiteral("connect"), QStringLiteral("ip")},
             {QStringLiteral("target"), target},
             {QStringLiteral("family"), family.isEmpty() ? QStringLiteral("dialog") : family},
+            {QStringLiteral("familySource"), familySource},
             {QStringLiteral("requested"), true},
             {QStringLiteral("deferred"), true},
         };
