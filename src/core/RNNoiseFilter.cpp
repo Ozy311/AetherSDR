@@ -72,12 +72,12 @@ void RNNoiseFilter::reset()
         m_down[channel] = needsResamplers
             ? std::make_unique<Resampler>(48000, 24000)
             : nullptr;
-        m_inAccum[channel].clear();
+        m_inAccum[channel].resize(0);
         m_input24k[channel].clear();
         m_processed48k[channel].clear();
         m_processed48kFloat[channel].clear();
     }
-    m_outAccum.clear();
+    m_outAccum.resize(0);
 }
 
 QByteArray RNNoiseFilter::process(const QByteArray& pcm24kStereo)
@@ -162,7 +162,7 @@ QByteArray RNNoiseFilter::process(const QByteArray& pcm24kStereo)
                     reinterpret_cast<const char*>(&accumData[consumedSamples]),
                     leftoverSamples * static_cast<int>(sizeof(float)));
             } else {
-                m_inAccum[channel].clear();
+                m_inAccum[channel].resize(0);
             }
 
             // 3. Scale RNNoise output back to [-1, 1], then downsample each
@@ -236,9 +236,13 @@ QByteArray RNNoiseFilter::process48kStereo(const QByteArray& pcm48kStereo)
 int RNNoiseFilter::process48kStereo(
     const QByteArray& pcm48kStereo, QByteArray& output)
 {
-    output.clear();
+    output.resize(0);
     if (!isValid() || pcm48kStereo.isEmpty()) {
-        output = pcm48kStereo;
+        output.resize(pcm48kStereo.size());
+        if (!pcm48kStereo.isEmpty()) {
+            std::memcpy(output.data(), pcm48kStereo.constData(),
+                        pcm48kStereo.size());
+        }
         return output.size() / (2 * static_cast<int>(sizeof(float)));
     }
 
@@ -292,7 +296,7 @@ int RNNoiseFilter::process48kStereo(
                 m_inAccum[channel].resize(
                     leftover * static_cast<int>(sizeof(float)));
             } else {
-                m_inAccum[channel].clear();
+                m_inAccum[channel].resize(0);
             }
         }
 

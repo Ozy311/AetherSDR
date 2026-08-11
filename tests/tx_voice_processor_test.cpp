@@ -1,6 +1,7 @@
 #include "core/ClientTube.h"
 #include "core/ClientGate.h"
 #include "core/RNNoiseFilter.h"
+#include "core/Resampler.h"
 #include "core/TxVoiceProcessor.h"
 
 #include <QByteArray>
@@ -17,6 +18,7 @@
 using AetherSDR::ClientTube;
 using AetherSDR::ClientGate;
 using AetherSDR::RNNoiseFilter;
+using AetherSDR::Resampler;
 using AetherSDR::TxVoiceProcessor;
 
 namespace {
@@ -201,6 +203,53 @@ void testVoiceSrcLatencyBudgets()
     report("worst-case serial SRC group delay remains below 20 ms",
            withinTwentyMs,
            detail);
+}
+
+void testReusableBuffersPreserveCapacity()
+{
+    constexpr int kFrames = 480;
+    std::vector<float> input(kFrames, 0.0f);
+    Resampler resampler(48000, 24000, kFrames,
+                        TxVoiceProcessor::kVoiceSrcTransitionBandPercent);
+    QByteArray output;
+    output.reserve(16384);
+    const qsizetype reservedCapacity = output.capacity();
+    const int outputFrames = resampler.process(input.data(), kFrames, output);
+
+    report("reusable SRC output preserves caller reservation",
+           outputFrames == kFrames / 2
+               && output.capacity() >= reservedCapacity,
+           "reserved=" + std::to_string(reservedCapacity)
+               + " capacity=" + std::to_string(output.capacity()));
+
+    constexpr int kPreparedFrames = 1024;
+    TxVoiceProcessor processor;
+    const bool prepared = processor.prepare(48000, kPreparedFrames);
+    const qsizetype normalizedCapacity =
+        processor.normalizedFloat48Stereo().capacity();
+    const qsizetype postStripCapacity =
+        processor.postChannelStripFloat48Stereo().capacity();
+    const qsizetype transportFloatCapacity =
+        processor.transportFloat32Stereo().capacity();
+    const qsizetype transportInt16Capacity =
+        processor.transportInt16Stereo().capacity();
+    const bool reservationsSurvivedPrepare = prepared
+        && normalizedCapacity >= kPreparedFrames * 2 * static_cast<int>(sizeof(float))
+        && postStripCapacity >= kPreparedFrames * 2 * static_cast<int>(sizeof(float))
+        && transportFloatCapacity > 0
+        && transportInt16Capacity > 0;
+
+    processor.reset();
+    report("TX prepare and reset preserve realtime buffer reservations",
+           reservationsSurvivedPrepare
+               && processor.normalizedFloat48Stereo().capacity()
+                   >= normalizedCapacity
+               && processor.postChannelStripFloat48Stereo().capacity()
+                   >= postStripCapacity
+               && processor.transportFloat32Stereo().capacity()
+                   >= transportFloatCapacity
+               && processor.transportInt16Stereo().capacity()
+                   >= transportInt16Capacity);
 }
 
 void test48kBypassAndMeasurementBoundaries()
@@ -578,6 +627,7 @@ int main()
     testFixedRateContract();
     testVoiceSrcBandwidthAndAliasRejection();
     testVoiceSrcLatencyBudgets();
+    testReusableBuffersPreserveCapacity();
     test48kBypassAndMeasurementBoundaries();
     testDeviceRateNormalization();
     testFloat48OfflineEntryAvoidsInputQuantization();

@@ -155,15 +155,15 @@ void TxVoiceProcessor::reset()
     if (m_rnnoiseEnabled && m_processors.rnnoise) {
         m_processors.rnnoise->reset();
     }
-    m_work48.clear();
-    m_resampledMono48.clear();
-    m_resampledLeft24.clear();
-    m_resampledRight24.clear();
-    m_rnnoiseOutput48.clear();
-    m_normalized48.clear();
-    m_postStrip48.clear();
-    m_transportFloat.clear();
-    m_transportInt16.clear();
+    m_work48.resize(0);
+    m_resampledMono48.resize(0);
+    m_resampledLeft24.resize(0);
+    m_resampledRight24.resize(0);
+    m_rnnoiseOutput48.resize(0);
+    m_normalized48.resize(0);
+    m_postStrip48.resize(0);
+    m_transportFloat.resize(0);
+    m_transportInt16.resize(0);
 }
 
 void TxVoiceProcessor::setProcessors(const Processors& processors) noexcept
@@ -198,8 +198,8 @@ void TxVoiceProcessor::setMeasurementCaptureEnabled(bool enabled) noexcept
 {
     m_captureMeasurements = enabled;
     if (!enabled) {
-        m_normalized48.clear();
-        m_postStrip48.clear();
+        m_normalized48.resize(0);
+        m_postStrip48.resize(0);
     }
 }
 

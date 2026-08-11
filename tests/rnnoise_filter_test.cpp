@@ -665,6 +665,31 @@ bool testBinauralPhaseDifferenceSurvivesDenoising()
     return true;
 }
 
+bool testNative48ReusableOutputPreservesCapacity()
+{
+    RNNoiseFilter filter(
+        RNNoiseFilter::OutputMode::ProcessedMono,
+        RNNoiseFilter::RateDomain::Native48k);
+    QByteArray input(
+        kBlockFrames * 2 * static_cast<int>(sizeof(float)), '\0');
+    QByteArray output;
+    output.reserve(input.size() * 4);
+    const qsizetype reservedCapacity = output.capacity();
+    const int outputFrames = filter.process48kStereo(input, output);
+
+    if (outputFrames != kBlockFrames || output.size() != input.size()
+        || output.capacity() < reservedCapacity) {
+        std::printf("native-48 reusable output lost capacity: "
+                    "frames=%d bytes=%lld reserved=%lld capacity=%lld\n",
+                    outputFrames,
+                    static_cast<long long>(output.size()),
+                    static_cast<long long>(reservedCapacity),
+                    static_cast<long long>(output.capacity()));
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int main()
@@ -674,7 +699,8 @@ int main()
         || !testProcessedMonoOutputIsDuplicated()
         || !testNoiseFloorDoesNotBreatheWithSpeech()
         || !testStereoChannelsStaySynchronizedWithConstantDryFloor()
-        || !testBinauralPhaseDifferenceSurvivesDenoising()) {
+        || !testBinauralPhaseDifferenceSurvivesDenoising()
+        || !testNative48ReusableOutputPreservesCapacity()) {
         return 1;
     }
     std::printf("rnnoise_filter_test passed\n");

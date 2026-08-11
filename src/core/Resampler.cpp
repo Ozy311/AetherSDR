@@ -26,7 +26,7 @@ QByteArray Resampler::process(const float* in, int numSamples)
 
 int Resampler::process(const float* in, int numSamples, QByteArray& output)
 {
-    output.clear();
+    output.resize(0);
     if (!in || numSamples <= 0) {
         return 0;
     }
