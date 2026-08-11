@@ -276,11 +276,23 @@ QJsonObject buildAudioDevicesSnapshot(const AudioEngine* audio, const QJsonObjec
     txRoute["actual_sample_format"] = (audio && audio->isTxStreaming())
         ? QJsonValue(QStringLiteral("Int16"))
         : QJsonValue();
-    txRoute["voice_normalizing_to_48k"] = (audio && audio->isTxStreaming())
-        ? QJsonValue(audio->txInputNormalizationTo48k())
+    const TxAudioResamplingRoute txResampling = audio
+        ? txAudioResamplingRoute(
+            audio->isRadeMode(),
+            audio->isDaxTxMode(),
+            audio->txInputNormalizationTo48k(),
+            audio->txRadeResamplingTo24k())
+        : TxAudioResamplingRoute{};
+    txRoute["voice_input_normalizing_to_48k"] =
+        (audio && audio->isTxStreaming())
+        ? QJsonValue(txResampling.voiceInputNormalizingTo48k)
+        : QJsonValue();
+    txRoute["voice_egress_resampling_to_24k"] =
+        (audio && audio->isTxStreaming())
+        ? QJsonValue(txResampling.voiceEgressResamplingTo24k)
         : QJsonValue();
     txRoute["rade_resampling_to_24k"] = (audio && audio->isTxStreaming())
-        ? QJsonValue(audio->txRadeResamplingTo24k())
+        ? QJsonValue(txResampling.radeResamplingTo24k)
         : QJsonValue();
     // Surface the active TX slice's id, mode, and per-slice DAX channel here
     // so the bundle's TX route summary has the same context a triager would

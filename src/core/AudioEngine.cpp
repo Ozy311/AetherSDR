@@ -2758,8 +2758,23 @@ QJsonArray AudioEngine::audioEndpointDiagnostics() const
     tx["sample_rate_hz"] = txRunning ? QJsonValue(m_txInputRate) : QJsonValue();
     tx["channel_count"] = txRunning ? QJsonValue(m_txInputChannels) : QJsonValue();
     tx["sample_format"] = txRunning ? QStringLiteral("Int16") : QString();
+    const DeviceDiagnostics::TxAudioResamplingRoute txResampling =
+        DeviceDiagnostics::txAudioResamplingRoute(
+            m_radeMode.load(std::memory_order_acquire),
+            m_daxTxMode.load(std::memory_order_acquire),
+            m_txInputRate != TxVoiceProcessor::kDspRate,
+            m_radeTxNeedsResample);
     tx["resampling_active"] = txRunning
-        ? QJsonValue(m_txInputRate != TxVoiceProcessor::kDspRate)
+        ? QJsonValue(txResampling.active)
+        : QJsonValue();
+    tx["voice_input_normalizing_to_48k"] = txRunning
+        ? QJsonValue(txResampling.voiceInputNormalizingTo48k)
+        : QJsonValue();
+    tx["voice_egress_resampling_to_24k"] = txRunning
+        ? QJsonValue(txResampling.voiceEgressResamplingTo24k)
+        : QJsonValue();
+    tx["rade_resampling_to_24k"] = txRunning
+        ? QJsonValue(txResampling.radeResamplingTo24k)
         : QJsonValue();
     tx["note"] = m_txInputMono ? QStringLiteral("mono input promoted to stereo for radio TX") : QString();
     const TxCaptureHealthTracker::Snapshot txHealth =
