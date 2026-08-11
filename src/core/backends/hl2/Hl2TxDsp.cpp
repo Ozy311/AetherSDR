@@ -168,7 +168,7 @@ bool Hl2TxDsp::isLowerSideband() const
     }
 }
 
-void Hl2TxDsp::processAudioBlock(const std::vector<float>& mono)
+void Hl2TxDsp::processAudioBlock(const std::vector<float>& mono, bool clientLeveled)
 {
     if (m_bandpass.empty() || mono.empty())
         return;
@@ -196,7 +196,18 @@ void Hl2TxDsp::processAudioBlock(const std::vector<float>& mono)
     // between words. The gain is capped so a quiet room is not amplified into
     // hiss, and the result is hard-limited below full scale afterwards, because
     // an ALC that can overshoot is a splatter generator.
-    if (m_config.alcEnabled) {
+    //
+    // Client-leveled audio bypasses the ALC entirely (#4796). A TCI/DAX client
+    // that attenuates its own tone — WSJT-X's Pwr slider is a digital
+    // attenuator on the audio it streams, not a rig command — must see output
+    // proportional to what it sent. Through the ALC it saw two other things
+    // instead: above the hold threshold its level control was normalized away
+    // to alcTargetPeak, and below it the gain froze at whatever history left
+    // behind, so the same slider position produced RF or none depending on the
+    // path taken to it. Pinning unity here (not just skipping the update)
+    // keeps the reset()-on-unkey contract: the next mic transmission starts
+    // from unity either way.
+    if (m_config.alcEnabled && !clientLeveled) {
         float blockPeak = 0.0f;
         for (std::size_t s = 0; s < consumed; ++s)
             blockPeak = std::max(blockPeak, std::fabs(

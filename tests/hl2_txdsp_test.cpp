@@ -56,7 +56,8 @@ static std::vector<std::complex<float>> modulate(WdspChannel::Mode mode,
                                                  double micGain, double seconds,
                                                  float* lastMicPeak = nullptr,
                                                  bool alc = false,
-                                                 const double* passband = nullptr)
+                                                 const double* passband = nullptr,
+                                                 bool clientLeveled = false)
 {
     Hl2TxDsp tx;
     Hl2TxDsp::Config cfg;
@@ -102,7 +103,8 @@ static std::vector<std::complex<float>> modulate(WdspChannel::Mode mode,
     for (std::size_t off = 0; off < audio.size(); off += kChunk) {
         const std::size_t n = std::min(kChunk, audio.size() - off);
         tx.processAudioBlock(std::vector<float>(audio.begin() + static_cast<std::ptrdiff_t>(off),
-                                                audio.begin() + static_cast<std::ptrdiff_t>(off + n)));
+                                                audio.begin() + static_cast<std::ptrdiff_t>(off + n)),
+                             clientLeveled);
     }
     return out;
 }
@@ -323,7 +325,7 @@ int main(int argc, char** argv)
                         amplitude * std::sin(2.0 * M_PI * 1000.0
                                              * (off + static_cast<int>(n)) / fs));
                 }
-                tx.processAudioBlock(chunk);
+                tx.processAudioBlock(chunk, /*clientLeveled=*/false);
             }
             return lastGainDb;
         };
@@ -344,6 +346,108 @@ int main(int argc, char** argv)
               "ALC still lifts audio at speech level");
         check(speechGainDb > quietGainDb + 20.0,
               "ALC distinguishes speech from room noise");
+    }
+
+    // ── #4796: client-leveled audio bypasses the ALC entirely ──────────────
+    //
+    // A TCI/DAX client's level control is a digital attenuator on the audio it
+    // streams (WSJT-X's Pwr slider). Through the ALC that control was either
+    // normalized away (above the hold threshold) or frozen into a
+    // path-dependent gain (below it). With the bypass, output must simply be
+    // proportional to input — even 5 dB BELOW the hold threshold, where the
+    // ALC used to freeze.
+    {
+        // -50 dBFS and -30 dBFS, both with the ALC configured ON, both marked
+        // client-leveled. 20 dB apart in, 20 dB apart out.
+        const auto quiet = modulate(WdspChannel::Mode::Usb, kTone, 0.00316, 1.0,
+                                    1.0, nullptr, true, nullptr,
+                                    /*clientLeveled=*/true);
+        const auto loud  = modulate(WdspChannel::Mode::Usb, kTone, 0.0316, 1.0,
+                                    1.0, nullptr, true, nullptr,
+                                    /*clientLeveled=*/true);
+        if (!quiet.empty() && !loud.empty()) {
+            const double a = binPower(quiet, kTone, kFsOut);
+            const double b = binPower(loud, kTone, kFsOut);
+            const double ratioDb = 20.0 * std::log10((b + 1e-12) / (a + 1e-12));
+            std::fprintf(stderr,
+                         "client-leveled: -50 dBFS %.6f, -30 dBFS %.6f, ratio %.1f dB\n",
+                         a, b, ratioDb);
+            check(ratioDb > 18.0 && ratioDb < 22.0,
+                  "client-leveled output is proportional to input (no ALC)");
+            // And the quiet tone was NOT hauled up toward the ALC target.
+            double mx = 0.0;
+            for (const auto& v : quiet) mx = std::max(mx, static_cast<double>(std::abs(v)));
+            check(mx < 0.05,
+                  "a -50 dBFS client tone stays near -50 dBFS on the wire");
+        }
+    }
+
+    // ── #4796: the reported hysteresis, as an assertion ─────────────────────
+    //
+    // One continuous transmission, level swept down-up-down across the hold
+    // threshold: -50 dBFS -> -30 dBFS -> -50 dBFS. This is the report's "slide
+    // the Pwr slider up, RF appears; slide it back, RF stays" — with the ALC in
+    // the path, the third segment came out ~26 dB hotter than the first,
+    // because the gain wound up during the loud segment was frozen (not
+    // reducing, input below hold) instead of released. Client-leveled audio
+    // must be path-independent: equal inputs, equal outputs, whatever came
+    // between.
+    {
+        Hl2TxDsp tx;
+        Hl2TxDsp::Config cfg;
+        cfg.mode = WdspChannel::Mode::Usb;
+        cfg.alcEnabled = true;   // configured ON — the bypass is per-block
+        std::string err;
+        if (!tx.configure(cfg, &err)) {
+            std::fprintf(stderr, "FAIL: hysteresis configure: %s\n", err.c_str());
+            ++g_failures;
+        } else {
+            std::vector<std::complex<float>> out;
+            QObject::connect(&tx, &Hl2TxDsp::iqReady, &tx,
+                             [&](const std::vector<std::complex<float>>& iq) {
+                out.insert(out.end(), iq.begin(), iq.end());
+            });
+
+            const int fs = cfg.inputSampleRateHz;
+            const double levels[] = {0.00316, 0.0316, 0.00316};
+            std::size_t marks[4] = {0, 0, 0, 0};
+            constexpr std::size_t kChunk = 240;
+            std::vector<float> chunk(kChunk);
+            int sample = 0;
+            for (int stage = 0; stage < 3; ++stage) {
+                for (int off = 0; off < fs; off += static_cast<int>(kChunk)) {
+                    for (std::size_t n = 0; n < kChunk; ++n, ++sample) {
+                        chunk[n] = static_cast<float>(
+                            levels[stage]
+                            * std::sin(2.0 * M_PI * 1000.0 * sample / fs));
+                    }
+                    tx.processAudioBlock(chunk, /*clientLeveled=*/true);
+                }
+                marks[stage + 1] = out.size();
+            }
+
+            // Compare the settled tail of each quiet segment (its second half).
+            auto tailPeak = [&](std::size_t from, std::size_t to) {
+                double mx = 0.0;
+                for (std::size_t i = from + (to - from) / 2; i < to; ++i)
+                    mx = std::max(mx, static_cast<double>(std::abs(out[i])));
+                return mx;
+            };
+            const double firstQuiet = tailPeak(marks[0], marks[1]);
+            const double loud       = tailPeak(marks[1], marks[2]);
+            const double lastQuiet  = tailPeak(marks[2], marks[3]);
+            const double reGainDb =
+                20.0 * std::log10((lastQuiet + 1e-12) / (firstQuiet + 1e-12));
+            std::fprintf(stderr,
+                         "hysteresis: quiet %.6f -> loud %.6f -> quiet %.6f "
+                         "(re-gain %.2f dB)\n",
+                         firstQuiet, loud, lastQuiet, reGainDb);
+            check(std::fabs(reGainDb) < 1.0,
+                  "equal client levels produce equal output before and after a "
+                  "loud excursion (no ALC hysteresis)");
+            check(loud > firstQuiet * 5.0,
+                  "the loud segment is genuinely louder (sweep is real)");
+        }
     }
 
     if (g_failures == 0)

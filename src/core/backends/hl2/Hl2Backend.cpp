@@ -2813,7 +2813,12 @@ void Hl2Backend::setKeying(bool key)
     // transmission because the pauses between words are what the hold is for.
     if (m_keyed && !key) {
         const double kHoldDbfs = m_alcHoldBelowDbfs;
-        if (m_txMicPeakMaxDbfs > -139.0f
+        // Not for client-leveled transmissions: the ALC is bypassed there
+        // (#4796), so a below-threshold peak is the client's own attenuation
+        // doing exactly what it asked for, and "raise mic gain" would send an
+        // operator chasing a control that was never in the path.
+        if (!m_txAudioClientLeveled
+            && m_txMicPeakMaxDbfs > -139.0f
             && m_txMicPeakMaxDbfs < static_cast<float>(kHoldDbfs)) {
             qCInfo(lcHl2) << "HL2 TX: microphone peaked at" << m_txMicPeakMaxDbfs
                           << "dBFS for the whole transmission, below the ALC hold"
@@ -2824,6 +2829,9 @@ void Hl2Backend::setKeying(bool key)
     }
     if (key) {
         m_txMicPeakMaxDbfs = -140.0f;
+        // A new transmission decides afresh whether it is client-leveled; the
+        // first submitTxAudio() block of the over re-marks it.
+        m_txAudioClientLeveled = false;
         // Start each transmission's peak hold from nothing, rather than trusting
         // the unkeyed branch in publishTelemetry() to have already walked it
         // down. Telemetry is 10 Hz, so a key inside 100 ms of the previous unkey
@@ -3014,7 +3022,8 @@ void Hl2Backend::applyFreqCalPpb(int ppb, bool persist)
     repushAllFrequencies();
 }
 
-void Hl2Backend::submitTxAudio(const QByteArray& int16Stereo, int sampleRateHz)
+void Hl2Backend::submitTxAudio(const QByteArray& int16Stereo, int sampleRateHz,
+                               bool clientLeveled)
 {
     // Only modulate while actually keyed. Feeding the modulator unkeyed would
     // fill the transmit queue with audio that goes out the instant MOX asserts —
@@ -3022,6 +3031,10 @@ void Hl2Backend::submitTxAudio(const QByteArray& int16Stereo, int sampleRateHz)
     // syllable.
     if (!m_txDsp || !m_keyed || int16Stereo.isEmpty())
         return;
+    // Remember whether THIS transmission carried client-leveled audio, so the
+    // unkey diagnostic knows a below-threshold peak was the client's own choice
+    // of level rather than a microphone the ALC declined to lift.
+    m_txAudioClientLeveled = m_txAudioClientLeveled || clientLeveled;
     if (sampleRateHz != 24000) {
         // Stated rather than silently resampled: the modulator's upsampler
         // assumes this rate, and a mismatch transmits at the wrong pitch.
@@ -3044,8 +3057,9 @@ void Hl2Backend::submitTxAudio(const QByteArray& int16Stereo, int sampleRateHz)
         const float r = static_cast<float>(pcm[2 * n + 1]) / 32768.0f;
         mono[static_cast<std::size_t>(n)] = 0.5f * (l + r);
     }
-    QMetaObject::invokeMethod(m_txDsp, [this, mono = std::move(mono)] {
-        m_txDsp->processAudioBlock(mono);
+    QMetaObject::invokeMethod(m_txDsp,
+                              [this, mono = std::move(mono), clientLeveled] {
+        m_txDsp->processAudioBlock(mono, clientLeveled);
     }, Qt::QueuedConnection);
 }
 

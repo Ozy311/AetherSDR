@@ -95,7 +95,18 @@ public:
 
 public slots:
     // Mono TX audio at inputSampleRateHz.
-    void processAudioBlock(const std::vector<float>& mono);
+    //
+    // `clientLeveled` marks audio whose level is owned by an external client —
+    // TCI or DAX TX audio (WSJT-X, fldigi, the PipeWire bridge), where the
+    // sender has already applied its own power/attenuation control. The ALC is
+    // bypassed for such blocks: an ALC exists to close the 20-30 dB gap between
+    // a microphone and full modulation, and applied to a client that sets its
+    // own level it does the opposite of what either party wants — it normalizes
+    // the client's level control away above the hold threshold, and freezes
+    // into a path-dependent gain below it (#4796). The engine's own generated
+    // audio (WSPR beacon, AX.25 modem tones) arrives with this false and keeps
+    // the ALC, matching its on-air level to date.
+    void processAudioBlock(const std::vector<float>& mono, bool clientLeveled);
     // Drop anything buffered — on unkey, so the next transmission does not
     // start with the tail of the previous one.
     void reset();

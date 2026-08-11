@@ -8251,7 +8251,9 @@ void AudioEngine::onTxAudioReady()
     // Expose the post-limiter int16 stream so the QSO recorder captures voice TX
     // for Client-Side recording (#3556). Emitted unconditionally; the recorder
     // slot fast-returns when not recording / not transmitting, so this is cheap.
-    emit txFinalMonitorPcmReady(data);
+    // Mic-chain audio: the level is ours to manage, so the backend's ALC stays
+    // in play.
+    emit txFinalMonitorPcmReady(data, /*clientLeveled=*/false);
 
     // ── TX post-final-limiter scope tap ─────────────────────────
     // Sampled here, AFTER everything the strip can do to the audio
@@ -8737,7 +8739,12 @@ void AudioEngine::feedDaxTxAudioInternal(const QByteArray& inPcm,
             dst[i] = static_cast<qint16>(
                 std::clamp(v * 32768.0f, -32768.0f, 32767.0f));
         }
-        emit txFinalMonitorPcmReady(out);
+        // markExternalSource is the source split this tap needs (#4796): true
+        // for TCI/DAX client audio, whose sender owns its level and must not
+        // get ALC makeup gain; false for the engine's own pre-shaped audio
+        // (WSPR pump, AX.25 modem), which is generated below full scale and
+        // keeps the ALC so its on-air level does not change.
+        emit txFinalMonitorPcmReady(out, /*clientLeveled=*/markExternalSource);
         return;
     }
 
