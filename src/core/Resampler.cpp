@@ -9,6 +9,7 @@ Resampler::Resampler(double srcRate, double dstRate, int maxBlockSamples, double
     , m_dstRate(dstRate)
     , m_maxBlockSamples(maxBlockSamples)
     , m_resampler(std::make_unique<r8b::CDSPResampler24>(srcRate, dstRate, maxBlockSamples, reqTransBand))
+    , m_groupDelayInputFrames(m_resampler->getInLenBeforeOutPos(0))
 {
     m_inBuf.reserve(maxBlockSamples);
     prewarm();
@@ -171,7 +172,7 @@ void Resampler::prewarm()
     // first real audio sample produces output immediately, removing the transient that would
     // otherwise appear at the start of every audio session.
     double* outPtr = nullptr;
-    int lenRequired = m_resampler->getInLenBeforeOutPos(0);
+    int lenRequired = m_groupDelayInputFrames;
     while (lenRequired > 0) {
         int len = std::min(lenRequired, m_maxBlockSamples);
         std::vector<double> zeros(len, 0.0);

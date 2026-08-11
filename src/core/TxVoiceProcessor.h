@@ -31,6 +31,9 @@ public:
     static constexpr int kTransportRate = 24000;
     static constexpr int kChannels = 2;
     static constexpr int kMaxStages = 8;
+    // Voice only: preserve the supported 10 kHz modulation passband while
+    // avoiding the delay of r8brain's general-purpose 2% transition profile.
+    static constexpr double kVoiceSrcTransitionBandPercent = 12.0;
 
     enum class Stage : uint8_t {
         None = 0,
@@ -95,9 +98,10 @@ public:
     bool isPrepared() const noexcept { return m_prepared; }
 
     // Deterministic end-to-end delay expressed in 48 kHz DSP frames. Includes
-    // RNNoise's one-frame WOLA delay and enabled gate lookahead. r8brain is
-    // configured to consume its integer startup latency; reverb pre-delay is
-    // an artistic wet-path parameter rather than whole-signal latency.
+    // serial ingress/egress SRC group delay, RNNoise's one-frame WOLA delay,
+    // and enabled gate lookahead. The matched L/R egress SRCs run in parallel
+    // and therefore contribute one delay. Reverb pre-delay is an artistic
+    // wet-path parameter rather than whole-signal latency.
     int latencyFrames() const noexcept;
 
 private:

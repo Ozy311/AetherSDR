@@ -49,6 +49,54 @@ QByteArray makeCanonicalTone(int frames, int sampleRate, float frequencyHz)
     return result;
 }
 
+std::vector<float> makeFloatStereoTone(
+    int frames, int sampleRate, float frequencyHz)
+{
+    std::vector<float> result(static_cast<size_t>(frames * 2));
+    constexpr double kTwoPi = 6.28318530717958647692;
+    for (int frame = 0; frame < frames; ++frame) {
+        const float sample = 0.25f * static_cast<float>(
+            std::sin(kTwoPi * frequencyHz * frame / sampleRate));
+        result[static_cast<size_t>(frame * 2)] = sample;
+        result[static_cast<size_t>(frame * 2 + 1)] = sample;
+    }
+    return result;
+}
+
+double leftChannelRms(const QByteArray& floatStereo, int skipFrames)
+{
+    const auto* samples = reinterpret_cast<const float*>(
+        floatStereo.constData());
+    const int frames = floatStereo.size()
+        / (2 * static_cast<int>(sizeof(float)));
+    if (!samples || frames <= skipFrames) {
+        return 0.0;
+    }
+
+    double sumSquares = 0.0;
+    for (int frame = skipFrames; frame < frames; ++frame) {
+        const double sample = samples[frame * 2];
+        sumSquares += sample * sample;
+    }
+    return std::sqrt(sumSquares / (frames - skipFrames));
+}
+
+double transportToneRms(float frequencyHz)
+{
+    constexpr int kInputFrames = 48000;
+    constexpr int kSettlingOutputFrames = 4000;
+    const std::vector<float> input = makeFloatStereoTone(
+        kInputFrames, TxVoiceProcessor::kDspRate, frequencyHz);
+
+    TxVoiceProcessor processor;
+    if (!processor.prepare(TxVoiceProcessor::kDspRate, kInputFrames)
+        || !processor.processFloat48(input.data(), kInputFrames)) {
+        return 0.0;
+    }
+    return leftChannelRms(
+        processor.transportFloat32Stereo(), kSettlingOutputFrames);
+}
+
 bool finiteFloatBuffer(const QByteArray& bytes)
 {
     const auto* samples = reinterpret_cast<const float*>(bytes.constData());
@@ -95,6 +143,63 @@ void testFixedRateContract()
     report("DSP rate is pinned to 48 kHz", TxVoiceProcessor::kDspRate == 48000);
     report("transport rate remains 24 kHz",
            TxVoiceProcessor::kTransportRate == 24000);
+    report("TX voice SRC transition profile is 12 percent",
+           TxVoiceProcessor::kVoiceSrcTransitionBandPercent == 12.0);
+}
+
+void testVoiceSrcBandwidthAndAliasRejection()
+{
+    const double referenceRms = transportToneRms(1000.0f);
+    const double tenKhzRms = transportToneRms(10000.0f);
+    const double tenKhzGainDb = 20.0 * std::log10(
+        std::max(tenKhzRms / referenceRms, 1.0e-15));
+
+    report("voice SRC remains within 0.1 dB through 10 kHz",
+           referenceRms > 0.0 && std::abs(tenKhzGainDb) <= 0.1,
+           "gainDb=" + std::to_string(tenKhzGainDb));
+
+    double worstAliasDb = -300.0;
+    for (const float frequencyHz : {
+             14000.0f, 16000.0f, 18000.0f, 20000.0f, 22000.0f}) {
+        const double aliasRms = transportToneRms(frequencyHz);
+        const double aliasDb = 20.0 * std::log10(
+            std::max(aliasRms / referenceRms, 1.0e-15));
+        worstAliasDb = std::max(worstAliasDb, aliasDb);
+    }
+    report("aliases folding into 0-10 kHz remain below -100 dB",
+           referenceRms > 0.0 && worstAliasDb <= -100.0,
+           "worstAliasDb=" + std::to_string(worstAliasDb));
+}
+
+void testVoiceSrcLatencyBudgets()
+{
+    struct ExpectedLatency {
+        int inputRate;
+        int frames48;
+    };
+    constexpr ExpectedLatency kExpected[] = {
+        {48000, 394},
+        {44100, 615},
+        {24000, 788},
+    };
+
+    bool exact = true;
+    bool withinTwentyMs = true;
+    std::string detail;
+    for (const ExpectedLatency expected : kExpected) {
+        TxVoiceProcessor processor;
+        const bool prepared = processor.prepare(expected.inputRate, 1024);
+        const int frames = processor.latencyFrames();
+        exact = prepared && frames == expected.frames48 && exact;
+        withinTwentyMs = prepared && frames <= 960 && withinTwentyMs;
+        detail += std::to_string(expected.inputRate) + "Hz="
+            + std::to_string(frames) + " ";
+    }
+
+    report("SRC group delay is reported for every capture rate", exact, detail);
+    report("worst-case serial SRC group delay remains below 20 ms",
+           withinTwentyMs,
+           detail);
 }
 
 void test48kBypassAndMeasurementBoundaries()
@@ -404,7 +509,7 @@ void testLatencyAccounting()
     processor.prepare(48000, 480);
 
     report("latency report includes RNNoise frame plus gate lookahead",
-           processor.latencyFrames() == 480 + 96,
+           processor.latencyFrames() == 394 + 480 + 96,
            "frames=" + std::to_string(processor.latencyFrames()));
 }
 
@@ -413,6 +518,8 @@ void testLatencyAccounting()
 int main()
 {
     testFixedRateContract();
+    testVoiceSrcBandwidthAndAliasRejection();
+    testVoiceSrcLatencyBudgets();
     test48kBypassAndMeasurementBoundaries();
     testDeviceRateNormalization();
     testFloat48OfflineEntryAvoidsInputQuantization();

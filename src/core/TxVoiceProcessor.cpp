@@ -31,7 +31,10 @@ bool TxVoiceProcessor::prepare(int inputRate, int maxInputFrames)
     m_maxInputFrames = maxInputFrames;
     if (inputRate != kDspRate) {
         m_inputResampler = std::make_unique<Resampler>(
-            inputRate, kDspRate, maxInputFrames);
+            inputRate,
+            kDspRate,
+            maxInputFrames,
+            kVoiceSrcTransitionBandPercent);
     } else {
         m_inputResampler.reset();
     }
@@ -39,9 +42,15 @@ bool TxVoiceProcessor::prepare(int inputRate, int maxInputFrames)
     m_maxDspFrames = static_cast<int>(
         std::ceil(static_cast<double>(maxInputFrames) * kDspRate / inputRate)) + 32;
     m_outputLeftResampler = std::make_unique<Resampler>(
-        kDspRate, kTransportRate, m_maxDspFrames);
+        kDspRate,
+        kTransportRate,
+        m_maxDspFrames,
+        kVoiceSrcTransitionBandPercent);
     m_outputRightResampler = std::make_unique<Resampler>(
-        kDspRate, kTransportRate, m_maxDspFrames);
+        kDspRate,
+        kTransportRate,
+        m_maxDspFrames,
+        kVoiceSrcTransitionBandPercent);
 
     m_inputMono.reserve(static_cast<size_t>(maxInputFrames));
     m_outputLeft.reserve(static_cast<size_t>(m_maxDspFrames));
@@ -433,7 +442,19 @@ const QByteArray& TxVoiceProcessor::postChannelStripFloat48Stereo() const noexce
 
 int TxVoiceProcessor::latencyFrames() const noexcept
 {
-    int frames = m_rnnoiseEnabled && m_processors.rnnoise
+    int frames = 0;
+    if (m_inputResampler) {
+        frames += static_cast<int>(std::lround(
+            static_cast<double>(m_inputResampler->groupDelayInputFrames())
+            * kDspRate / m_inputRate));
+    }
+    if (m_outputLeftResampler) {
+        frames += static_cast<int>(std::lround(
+            static_cast<double>(m_outputLeftResampler->groupDelayInputFrames())
+            * kDspRate / m_outputLeftResampler->srcRate()));
+    }
+
+    frames += m_rnnoiseEnabled && m_processors.rnnoise
             && m_processors.rnnoise->isValid()
         ? 480
         : 0;

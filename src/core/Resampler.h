@@ -48,6 +48,11 @@ public:
     double srcRate() const { return m_srcRate; }
     double dstRate() const { return m_dstRate; }
 
+    // Linear-phase signal delay expressed in source-rate samples. prewarm()
+    // consumes r8brain's no-output startup interval, but it does not remove
+    // this acoustic delay from the converted waveform.
+    int groupDelayInputFrames() const noexcept { return m_groupDelayInputFrames; }
+
 private:
     void prewarm();
 
@@ -55,6 +60,7 @@ private:
     double m_dstRate;
     int    m_maxBlockSamples;
     std::unique_ptr<r8b::CDSPResampler24> m_resampler;
+    int m_groupDelayInputFrames{0};
     std::vector<double> m_inBuf;   // float32 → double conversion buffer
 };
 
