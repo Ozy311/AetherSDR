@@ -13,10 +13,16 @@
 #include "RNNoiseFilter.h"
 #include "Resampler.h"
 
+#include <QLoggingCategory>
+
 #include <algorithm>
 #include <cmath>
 
 namespace AetherSDR {
+
+namespace {
+Q_LOGGING_CATEGORY(lcTxVoiceProcessor, "aether.audio.tx.voice")
+}
 
 TxVoiceProcessor::TxVoiceProcessor() = default;
 TxVoiceProcessor::~TxVoiceProcessor() = default;
@@ -113,6 +119,7 @@ void TxVoiceProcessor::prepareProcessors()
 void TxVoiceProcessor::reset()
 {
     m_ditherState = kDitherSeed;
+    m_warnedEgressFrameMismatch = false;
     if (m_inputResampler) {
         m_inputResampler->reset();
     }
@@ -313,9 +320,11 @@ bool TxVoiceProcessor::processWorkBuffer(int frames48)
         m_outputLeft.data(), frames48, m_resampledLeft24);
     const int rightOutputFrames = m_outputRightResampler->process(
         m_outputRight.data(), frames48, m_resampledRight24);
-    const int outputFrames = std::min(
+    const int outputFrames = reconcileEgressFrameCounts(
         leftOutputFrames, rightOutputFrames);
     if (outputFrames <= 0) {
+        m_transportFloat.resize(0);
+        m_transportInt16.resize(0);
         return false;
     }
 
@@ -337,6 +346,31 @@ bool TxVoiceProcessor::processWorkBuffer(int frames48)
         }
     }
     return true;
+}
+
+int TxVoiceProcessor::reconcileEgressFrameCounts(
+    int leftFrames, int rightFrames)
+{
+    if (leftFrames == rightFrames) {
+        m_warnedEgressFrameMismatch = false;
+        return leftFrames;
+    }
+
+    if (!m_warnedEgressFrameMismatch) {
+        qCWarning(lcTxVoiceProcessor)
+            << "TX egress SRC channel frame mismatch: left=" << leftFrames
+            << "right=" << rightFrames
+            << "-- transmitting the common prefix and resetting both channels";
+        m_warnedEgressFrameMismatch = true;
+    }
+
+    // Both resamplers consumed the same input interval, so their common
+    // prefix belongs to the current aligned timeline. Preserve that prefix,
+    // discard only the unmatched tail, and reset both histories before the
+    // next callback so the dropped tail cannot become a permanent L/R offset.
+    m_outputLeftResampler->reset();
+    m_outputRightResampler->reset();
+    return std::min(leftFrames, rightFrames);
 }
 
 uint32_t TxVoiceProcessor::nextDitherRandom24() noexcept

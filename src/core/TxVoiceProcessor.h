@@ -20,6 +20,7 @@ class ClientTube;
 class ClientTxTestTone;
 class RNNoiseFilter;
 class Resampler;
+class TxVoiceProcessorTestAccess;
 
 // Headless, backend-independent TX voice rate-domain processor. AudioEngine
 // remains responsible for capture normalization, mode routing, metering, and
@@ -109,10 +110,13 @@ public:
     int latencyFrames() const noexcept;
 
 private:
+    friend class TxVoiceProcessorTestAccess;
+
     static constexpr uint64_t kDitherSeed = 0x6A09E667F3BCC909ULL;
 
     void processChannelStrip(QByteArray& float48Stereo) noexcept;
     bool processWorkBuffer(int frames48);
+    int reconcileEgressFrameCounts(int leftFrames, int rightFrames);
     void prepareProcessors();
     uint32_t nextDitherRandom24() noexcept;
     float nextTpdfDitherLsb() noexcept;
@@ -125,6 +129,7 @@ private:
     bool m_prepared{false};
     bool m_rnnoiseEnabled{false};
     bool m_captureMeasurements{false};
+    bool m_warnedEgressFrameMismatch{false};
     float m_micGain{1.0f};
     uint64_t m_packedStages{0};
     uint64_t m_ditherState{kDitherSeed};

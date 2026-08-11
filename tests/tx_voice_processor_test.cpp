@@ -21,6 +21,31 @@ using AetherSDR::RNNoiseFilter;
 using AetherSDR::Resampler;
 using AetherSDR::TxVoiceProcessor;
 
+namespace AetherSDR {
+
+class TxVoiceProcessorTestAccess
+{
+public:
+    static int reconcileEgressFrameCounts(
+        TxVoiceProcessor& processor, int leftFrames, int rightFrames)
+    {
+        return processor.reconcileEgressFrameCounts(leftFrames, rightFrames);
+    }
+
+    static void dirtyEgressResamplerHistories(TxVoiceProcessor& processor)
+    {
+        std::vector<float> left(480, 0.25f);
+        std::vector<float> right(960, -0.25f);
+        QByteArray discarded;
+        processor.m_outputLeftResampler->process(
+            left.data(), static_cast<int>(left.size()), discarded);
+        processor.m_outputRightResampler->process(
+            right.data(), static_cast<int>(right.size()), discarded);
+    }
+};
+
+} // namespace AetherSDR
+
 namespace {
 
 int g_failed = 0;
@@ -286,6 +311,36 @@ void testResamplerResetRestoresFreshState()
            resetFrames == freshFrames && afterReset == freshOutput,
            "resetFrames=" + std::to_string(resetFrames)
                + " freshFrames=" + std::to_string(freshFrames));
+}
+
+void testStereoEgressMismatchSalvagesAndRealigns()
+{
+    constexpr int kFrames = 480;
+    TxVoiceProcessor recovered;
+    recovered.prepare(48000, kFrames);
+    AetherSDR::TxVoiceProcessorTestAccess::dirtyEgressResamplerHistories(
+        recovered);
+    const int commonFrames =
+        AetherSDR::TxVoiceProcessorTestAccess::reconcileEgressFrameCounts(
+            recovered, 240, 239);
+
+    report("stereo egress mismatch preserves the common aligned prefix",
+           commonFrames == 239,
+           "frames=" + std::to_string(commonFrames));
+
+    const std::vector<float> probe = makeFloatStereoTone(
+        kFrames, TxVoiceProcessor::kDspRate, 997.0f);
+    const bool recoveredProcessed = recovered.processFloat48(
+        probe.data(), kFrames);
+
+    TxVoiceProcessor fresh;
+    fresh.prepare(48000, kFrames);
+    const bool freshProcessed = fresh.processFloat48(probe.data(), kFrames);
+
+    report("stereo egress mismatch resets both channels to fresh alignment",
+           recoveredProcessed && freshProcessed
+               && recovered.transportFloat32Stereo()
+                   == fresh.transportFloat32Stereo());
 }
 
 void test48kBypassAndMeasurementBoundaries()
@@ -665,6 +720,7 @@ int main()
     testVoiceSrcLatencyBudgets();
     testReusableBuffersPreserveCapacity();
     testResamplerResetRestoresFreshState();
+    testStereoEgressMismatchSalvagesAndRealigns();
     test48kBypassAndMeasurementBoundaries();
     testDeviceRateNormalization();
     testFloat48OfflineEntryAvoidsInputQuantization();
