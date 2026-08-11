@@ -379,6 +379,10 @@ at the negotiated device rate. Rate conversion then depends on the route:
   `TxVoiceProcessor::processCapturedInt16()`. It converts the duplicated signal
   to mono float32 once, uses the stateful r8brain `Resampler::process()` path to
   reach 48 kHz when needed, and then duplicates the 48 kHz mono result to L/R.
+  After consuming the capture samples, it replaces that caller-owned block
+  in-place with the final 24 kHz stereo Int16 transport output. Queued monitor
+  consumers therefore retain an immutable completed block rather than sharing
+  a reusable processor-owned output buffer.
 - Native 48 kHz input skips the ingress SRC but still enters the same float32
   processing domain.
 - RADE retains its separate conversion to 24 kHz before its early branch. DAX
@@ -425,8 +429,9 @@ After capture channel canonicalization, `onTxAudioReady()` uses this ordering:
 12. **Measurement seams**: when enabled for offline/tests,
     `normalizedFloat48Stereo()` exposes the normalized 48 kHz input and
     `postChannelStripFloat48Stereo()` exposes the 48 kHz post-strip/pre-gain
-    signal. `transportFloat32Stereo()` and `transportInt16Stereo()` expose the
-    final 24 kHz representations.
+    signal. `transportFloat32Stereo()` exposes the final 24 kHz float
+    representation; the caller-owned in/out block carries the corresponding
+    dithered Int16 transport representation.
 13. **Monitor taps**: both legacy monitor pointers currently receive the stable
     post-limiter, post-SRC 24 kHz Int16 representation. The named 48 kHz
     measurement seam above is the accurate post-strip tap.

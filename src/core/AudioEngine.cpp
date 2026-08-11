@@ -7952,7 +7952,6 @@ void AudioEngine::onTxAudioReady()
     if (!m_txVoiceProcessor->processCapturedInt16(data)) {
         return;
     }
-    data = m_txVoiceProcessor->transportInt16Stereo();
 
     // The legacy pre-tail monitor currently has no active GUI owner. Keep its
     // feed alive at the stable 24 kHz representation until it is replaced by

@@ -117,8 +117,10 @@ double transportToneRms(float frequencyHz)
         kInputFrames, TxVoiceProcessor::kDspRate, frequencyHz);
 
     TxVoiceProcessor processor;
+    QByteArray transportOutput;
     if (!processor.prepare(TxVoiceProcessor::kDspRate, kInputFrames)
-        || !processor.processFloat48(input.data(), kInputFrames)) {
+        || !processor.processFloat48(
+            input.data(), kInputFrames, transportOutput)) {
         return 0.0;
     }
     return leftChannelRms(
@@ -256,13 +258,10 @@ void testReusableBuffersPreserveCapacity()
         processor.postChannelStripFloat48Stereo().capacity();
     const qsizetype transportFloatCapacity =
         processor.transportFloat32Stereo().capacity();
-    const qsizetype transportInt16Capacity =
-        processor.transportInt16Stereo().capacity();
     const bool reservationsSurvivedPrepare = prepared
         && normalizedCapacity >= kPreparedFrames * 2 * static_cast<int>(sizeof(float))
         && postStripCapacity >= kPreparedFrames * 2 * static_cast<int>(sizeof(float))
-        && transportFloatCapacity > 0
-        && transportInt16Capacity > 0;
+        && transportFloatCapacity > 0;
 
     processor.reset();
     report("TX prepare and reset preserve realtime buffer reservations",
@@ -272,9 +271,35 @@ void testReusableBuffersPreserveCapacity()
                && processor.postChannelStripFloat48Stereo().capacity()
                    >= postStripCapacity
                && processor.transportFloat32Stereo().capacity()
-                   >= transportFloatCapacity
-               && processor.transportInt16Stereo().capacity()
-                   >= transportInt16Capacity);
+                   >= transportFloatCapacity);
+}
+
+void testCapturedTransportUsesCallerOwnedStorage()
+{
+    constexpr int kFrames = 480;
+    TxVoiceProcessor processor;
+    const bool prepared = processor.prepare(48000, kFrames);
+
+    QByteArray firstBlock = makeCanonicalTone(kFrames, 48000, 997.0f);
+    const char* const firstInputStorage = firstBlock.constData();
+    const bool firstProcessed = processor.processCapturedInt16(firstBlock);
+    const bool firstStorageReused = firstBlock.constData() == firstInputStorage;
+
+    // Model the queued monitor/recorder consumers that retain the completed
+    // block after the audio callback returns.
+    const QByteArray retainedFirstBlock = firstBlock;
+
+    QByteArray secondBlock = makeCanonicalTone(kFrames, 48000, 1201.0f);
+    const char* const secondInputStorage = secondBlock.constData();
+    const bool secondProcessed = processor.processCapturedInt16(secondBlock);
+    const bool secondStorageReused = secondBlock.constData() == secondInputStorage;
+
+    report("captured transport reuses unique caller-owned input storage",
+           prepared && firstProcessed && secondProcessed
+               && firstStorageReused && secondStorageReused);
+    report("retained transport output does not affect the next callback buffer",
+           !retainedFirstBlock.isEmpty()
+               && retainedFirstBlock.constData() != secondBlock.constData());
 }
 
 void testResamplerResetRestoresFreshState()
@@ -330,12 +355,15 @@ void testStereoEgressMismatchSalvagesAndRealigns()
 
     const std::vector<float> probe = makeFloatStereoTone(
         kFrames, TxVoiceProcessor::kDspRate, 997.0f);
+    QByteArray recoveredOutput;
     const bool recoveredProcessed = recovered.processFloat48(
-        probe.data(), kFrames);
+        probe.data(), kFrames, recoveredOutput);
 
     TxVoiceProcessor fresh;
     fresh.prepare(48000, kFrames);
-    const bool freshProcessed = fresh.processFloat48(probe.data(), kFrames);
+    QByteArray freshOutput;
+    const bool freshProcessed = fresh.processFloat48(
+        probe.data(), kFrames, freshOutput);
 
     report("stereo egress mismatch resets both channels to fresh alignment",
            recoveredProcessed && freshProcessed
@@ -348,8 +376,8 @@ void test48kBypassAndMeasurementBoundaries()
     TxVoiceProcessor processor;
     processor.setMeasurementCaptureEnabled(true);
     const bool prepared = processor.prepare(48000, 1024);
-    const bool processed = processor.processCapturedInt16(
-        makeCanonicalTone(480, 48000, 1000.0f));
+    QByteArray transportOutput = makeCanonicalTone(480, 48000, 1000.0f);
+    const bool processed = processor.processCapturedInt16(transportOutput);
 
     report("48 kHz processor prepares", prepared);
     report("48 kHz block processes", processed);
@@ -363,13 +391,13 @@ void test48kBypassAndMeasurementBoundaries()
            processor.transportFloat32Stereo().size()
                == 240 * 2 * static_cast<int>(sizeof(float)));
     report("egress contains 240 stereo int16 frames",
-           processor.transportInt16Stereo().size()
+           transportOutput.size()
                == 240 * 2 * static_cast<int>(sizeof(int16_t)));
     report("bypass output remains finite",
            finiteFloatBuffer(processor.transportFloat32Stereo()));
     report("mono voice remains duplicated stereo through egress",
            duplicatedStereo(processor.transportFloat32Stereo(), true)
-               && duplicatedStereo(processor.transportInt16Stereo(), false));
+               && duplicatedStereo(transportOutput, false));
 }
 
 void testDeviceRateNormalization()
@@ -377,11 +405,11 @@ void testDeviceRateNormalization()
     TxVoiceProcessor processor;
     processor.setMeasurementCaptureEnabled(true);
     const bool prepared = processor.prepare(44100, 1024);
-    const bool processed = processor.processCapturedInt16(
-        makeCanonicalTone(441, 44100, 1000.0f));
+    QByteArray transportOutput = makeCanonicalTone(441, 44100, 1000.0f);
+    const bool processed = processor.processCapturedInt16(transportOutput);
     const int normalizedFrames = processor.normalizedFloat48Stereo().size()
         / (2 * static_cast<int>(sizeof(float)));
-    const int transportFrames = processor.transportInt16Stereo().size()
+    const int transportFrames = transportOutput.size()
         / (2 * static_cast<int>(sizeof(int16_t)));
 
     report("44.1 kHz capture rate prepares", prepared);
@@ -406,7 +434,9 @@ void testFloat48OfflineEntryAvoidsInputQuantization()
     TxVoiceProcessor processor;
     processor.setMeasurementCaptureEnabled(true);
     processor.prepare(48000, 480);
-    const bool processed = processor.processFloat48(input.data(), 480);
+    QByteArray transportOutput;
+    const bool processed = processor.processFloat48(
+        input.data(), 480, transportOutput);
 
     report("native float 48 kHz offline block processes", processed);
     report("native float entry preserves sub-int16 input values exactly",
@@ -430,8 +460,8 @@ void testChannelStripRunsAt48k()
     processor.setStageOrder(packedSingleStage(TxVoiceProcessor::Stage::Tube));
     processor.setMeasurementCaptureEnabled(true);
     processor.prepare(48000, 1024);
-    const bool processed = processor.processCapturedInt16(
-        makeCanonicalTone(480, 48000, 1000.0f));
+    QByteArray transportOutput = makeCanonicalTone(480, 48000, 1000.0f);
+    const bool processed = processor.processCapturedInt16(transportOutput);
 
     report("channel-strip block processes", processed);
     report("tube is prepared at the canonical 48 kHz rate",
@@ -450,7 +480,9 @@ void testNonFiniteSamplesCannotPoisonEgressSrc()
 
     TxVoiceProcessor processor;
     processor.prepare(48000, 480);
-    const bool processed = processor.processFloat48(input.data(), 480);
+    QByteArray transportOutput;
+    const bool processed = processor.processFloat48(
+        input.data(), 480, transportOutput);
 
     report("non-finite input block still processes", processed);
     report("non-finite samples cannot poison float transport output",
@@ -462,14 +494,15 @@ void testMeasurementCaptureCanBeDisabled()
     TxVoiceProcessor processor;
     processor.setMeasurementCaptureEnabled(false);
     processor.prepare(48000, 1024);
-    processor.processCapturedInt16(makeCanonicalTone(480, 48000, 1000.0f));
+    QByteArray transportOutput = makeCanonicalTone(480, 48000, 1000.0f);
+    processor.processCapturedInt16(transportOutput);
 
     report("disabled normalized tap holds no copied block",
            processor.normalizedFloat48Stereo().isEmpty());
     report("disabled post-strip tap holds no copied block",
            processor.postChannelStripFloat48Stereo().isEmpty());
     report("transport output remains available with taps disabled",
-           !processor.transportInt16Stereo().isEmpty());
+           !transportOutput.isEmpty());
 }
 
 void testBlockBoundaryContinuityAndReset()
@@ -478,21 +511,21 @@ void testBlockBoundaryContinuityAndReset()
 
     TxVoiceProcessor whole;
     whole.prepare(48000, 4800);
-    whole.processCapturedInt16(input);
-    const QByteArray wholeOutput = whole.transportInt16Stereo();
+    QByteArray wholeOutput = input;
+    whole.processCapturedInt16(wholeOutput);
 
     TxVoiceProcessor blocked;
     blocked.prepare(48000, 480);
     QByteArray blockedOutput;
     constexpr int kInputBlockBytes = 480 * 2 * static_cast<int>(sizeof(int16_t));
     for (int offset = 0; offset < input.size(); offset += kInputBlockBytes) {
-        const bool processed = blocked.processCapturedInt16(
-            input.mid(offset, kInputBlockBytes));
+        QByteArray block = input.mid(offset, kInputBlockBytes);
+        const bool processed = blocked.processCapturedInt16(block);
         if (!processed) {
             report("streaming blocks all produce output", false);
             return;
         }
-        blockedOutput.append(blocked.transportInt16Stereo());
+        blockedOutput.append(block);
     }
 
     report("48 -> 24 SRC is invariant to 10 ms block boundaries",
@@ -503,8 +536,9 @@ void testBlockBoundaryContinuityAndReset()
     blocked.reset();
     QByteArray afterReset;
     for (int offset = 0; offset < input.size(); offset += kInputBlockBytes) {
-        blocked.processCapturedInt16(input.mid(offset, kInputBlockBytes));
-        afterReset.append(blocked.transportInt16Stereo());
+        QByteArray block = input.mid(offset, kInputBlockBytes);
+        blocked.processCapturedInt16(block);
+        afterReset.append(block);
     }
     report("reset restores deterministic SRC stream state",
            afterReset == blockedOutput);
@@ -519,18 +553,19 @@ void testOversizedCaptureBlockIsProcessed()
 
     TxVoiceProcessor oversized;
     oversized.prepare(48000, kPreparedInputFrames);
-    const bool oversizedProcessed = oversized.processCapturedInt16(input);
-    const QByteArray oversizedOutput = oversized.transportInt16Stereo();
+    QByteArray oversizedOutput = input;
+    const bool oversizedProcessed = oversized.processCapturedInt16(
+        oversizedOutput);
 
     TxVoiceProcessor partitioned;
     partitioned.prepare(48000, kPreparedInputFrames);
     QByteArray partitionedOutput;
-    const bool firstProcessed = partitioned.processCapturedInt16(
-        input.left(kPreparedInputFrames * kFrameBytes));
-    partitionedOutput.append(partitioned.transportInt16Stereo());
-    const bool secondProcessed = partitioned.processCapturedInt16(
-        input.mid(kPreparedInputFrames * kFrameBytes));
-    partitionedOutput.append(partitioned.transportInt16Stereo());
+    QByteArray firstBlock = input.left(kPreparedInputFrames * kFrameBytes);
+    const bool firstProcessed = partitioned.processCapturedInt16(firstBlock);
+    partitionedOutput.append(firstBlock);
+    QByteArray secondBlock = input.mid(kPreparedInputFrames * kFrameBytes);
+    const bool secondProcessed = partitioned.processCapturedInt16(secondBlock);
+    partitionedOutput.append(secondBlock);
 
     report("capture block larger than prepared size is processed",
            oversizedProcessed);
@@ -553,9 +588,9 @@ void testTransportTpdfDither()
 
     TxVoiceProcessor processor;
     processor.prepare(48000, kInputFrames);
+    QByteArray firstOutput;
     const bool processed = processor.processFloat48(
-        silence.data(), kInputFrames);
-    const QByteArray firstOutput = processor.transportInt16Stereo();
+        silence.data(), kInputFrames, firstOutput);
     const QByteArray floatOutput = processor.transportFloat32Stereo();
     const auto* quantized = reinterpret_cast<const int16_t*>(
         firstOutput.constData());
@@ -593,9 +628,10 @@ void testTransportTpdfDither()
            "sum=" + std::to_string(sampleSum));
 
     processor.reset();
-    processor.processFloat48(silence.data(), kInputFrames);
+    QByteArray afterReset;
+    processor.processFloat48(silence.data(), kInputFrames, afterReset);
     report("reset restores deterministic TPDF stream state",
-           processor.transportInt16Stereo() == firstOutput);
+           afterReset == firstOutput);
 }
 
 void testDitheredTransportSaturatesAtInt16Rails()
@@ -605,12 +641,13 @@ void testDitheredTransportSaturatesAtInt16Rails()
         std::vector<float> input(kInputFrames * 2, inputSample);
         TxVoiceProcessor processor;
         processor.prepare(48000, kInputFrames);
-        if (!processor.processFloat48(input.data(), kInputFrames)) {
+        QByteArray int16Bytes;
+        if (!processor.processFloat48(
+            input.data(), kInputFrames, int16Bytes)) {
             return false;
         }
 
         const QByteArray& floatBytes = processor.transportFloat32Stereo();
-        const QByteArray& int16Bytes = processor.transportInt16Stereo();
         const auto* floatSamples = reinterpret_cast<const float*>(
             floatBytes.constData());
         const auto* int16Samples = reinterpret_cast<const int16_t*>(
@@ -654,12 +691,14 @@ void testRnnoiseNative48kIsland()
     bool allSized = true;
     bool allDuplicated = true;
     for (int block = 0; block < 12; ++block) {
-        allProcessed = processor.processCapturedInt16(
-            makeCanonicalTone(480, 48000, 700.0f)) && allProcessed;
-        allSized = processor.transportInt16Stereo().size()
+        QByteArray transportOutput = makeCanonicalTone(
+            480, 48000, 700.0f);
+        allProcessed = processor.processCapturedInt16(transportOutput)
+            && allProcessed;
+        allSized = transportOutput.size()
             == 240 * 2 * static_cast<int>(sizeof(int16_t)) && allSized;
         allDuplicated = duplicatedStereo(
-            processor.transportInt16Stereo(), false) && allDuplicated;
+            transportOutput, false) && allDuplicated;
     }
 
     report("RNNoise native 48 kHz island processes complete frames", allProcessed);
@@ -681,8 +720,8 @@ void testDisabledRnnoiseIsNotDereferencedDuringPrepare()
     rnnoise.reset();
     const bool prepared = processor.prepare(48000, 480);
     processor.setRnnoise(nullptr);
-    const bool processed = processor.processCapturedInt16(
-        makeCanonicalTone(480, 48000, 700.0f));
+    QByteArray transportOutput = makeCanonicalTone(480, 48000, 700.0f);
+    const bool processed = processor.processCapturedInt16(transportOutput);
 
     report("disabled stale RNNoise association is not reset during prepare",
            prepared && processed);
@@ -719,6 +758,7 @@ int main()
     testVoiceSrcBandwidthAndAliasRejection();
     testVoiceSrcLatencyBudgets();
     testReusableBuffersPreserveCapacity();
+    testCapturedTransportUsesCallerOwnedStorage();
     testResamplerResetRestoresFreshState();
     testStereoEgressMismatchSalvagesAndRealigns();
     test48kBypassAndMeasurementBoundaries();

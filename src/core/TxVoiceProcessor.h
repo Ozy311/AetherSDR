@@ -87,14 +87,20 @@ public:
     void setMeasurementCaptureEnabled(bool enabled) noexcept;
 
     // Input must already be canonical duplicated-stereo int16. The channel
-    // selection/averaging policy remains in TxMicChannelNormalizer.
-    bool processCapturedInt16(const QByteArray& canonicalInput);
+    // selection/averaging policy remains in TxMicChannelNormalizer. On
+    // success, the consumed capture block is replaced in-place with the final
+    // 24 kHz stereo int16 transport block. The caller retains ownership, so a
+    // queued consumer can keep that immutable block without sharing storage
+    // that this processor will write on the next callback.
+    bool processCapturedInt16(QByteArray& canonicalInputOutput);
 
     // Offline/test entry point for audio already in the canonical DSP domain.
-    // Input is interleaved stereo float32 at exactly 48 kHz.
-    bool processFloat48(const float* interleavedStereo, int frames);
+    // Input is interleaved stereo float32 at exactly 48 kHz. The caller owns
+    // the returned 24 kHz stereo int16 transport block.
+    bool processFloat48(const float* interleavedStereo,
+                        int frames,
+                        QByteArray& transportInt16Output);
 
-    const QByteArray& transportInt16Stereo() const noexcept;
     const QByteArray& transportFloat32Stereo() const noexcept;
     const QByteArray& normalizedFloat48Stereo() const noexcept;
     const QByteArray& postChannelStripFloat48Stereo() const noexcept;
@@ -115,7 +121,7 @@ private:
     static constexpr uint64_t kDitherSeed = 0x6A09E667F3BCC909ULL;
 
     void processChannelStrip(QByteArray& float48Stereo) noexcept;
-    bool processWorkBuffer(int frames48);
+    bool processWorkBuffer(int frames48, QByteArray& transportInt16Output);
     int reconcileEgressFrameCounts(int leftFrames, int rightFrames);
     void prepareProcessors();
     uint32_t nextDitherRandom24() noexcept;
@@ -149,7 +155,6 @@ private:
     QByteArray m_normalized48;
     QByteArray m_postStrip48;
     QByteArray m_transportFloat;
-    QByteArray m_transportInt16;
 };
 
 } // namespace AetherSDR

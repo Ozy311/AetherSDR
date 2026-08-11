@@ -73,9 +73,6 @@ bool TxVoiceProcessor::prepare(int inputRate, int maxInputFrames)
     m_postStrip48.reserve(m_work48.capacity());
     m_transportFloat.reserve(
         (m_maxDspFrames / 2 + 32) * kChannels * static_cast<int>(sizeof(float)));
-    m_transportInt16.reserve(
-        (m_maxDspFrames / 2 + 32) * kChannels * static_cast<int>(sizeof(int16_t)));
-
     prepareProcessors();
     m_prepared = true;
     reset();
@@ -170,7 +167,6 @@ void TxVoiceProcessor::reset()
     m_normalized48.resize(0);
     m_postStrip48.resize(0);
     m_transportFloat.resize(0);
-    m_transportInt16.resize(0);
 }
 
 void TxVoiceProcessor::setProcessors(const Processors& processors) noexcept
@@ -210,12 +206,12 @@ void TxVoiceProcessor::setMeasurementCaptureEnabled(bool enabled) noexcept
     }
 }
 
-bool TxVoiceProcessor::processCapturedInt16(const QByteArray& canonicalInput)
+bool TxVoiceProcessor::processCapturedInt16(QByteArray& canonicalInputOutput)
 {
-    if (!m_prepared || canonicalInput.isEmpty()) {
+    if (!m_prepared || canonicalInputOutput.isEmpty()) {
         return false;
     }
-    const int inputFrames = canonicalInput.size()
+    const int inputFrames = canonicalInputOutput.size()
         / (kChannels * static_cast<int>(sizeof(int16_t)));
     if (inputFrames <= 0) {
         return false;
@@ -227,7 +223,8 @@ bool TxVoiceProcessor::processCapturedInt16(const QByteArray& canonicalInput)
     // bounded chunks, and the scratch buffers may grow for this exceptional
     // case. Process the delayed audio now instead of creating a silent hole.
 
-    const auto* input = reinterpret_cast<const int16_t*>(canonicalInput.constData());
+    const auto* input = reinterpret_cast<const int16_t*>(
+        canonicalInputOutput.constData());
     m_inputMono.resize(static_cast<size_t>(inputFrames));
     for (int frame = 0; frame < inputFrames; ++frame) {
         m_inputMono[static_cast<size_t>(frame)] = input[frame * 2] / 32768.0f;
@@ -251,10 +248,12 @@ bool TxVoiceProcessor::processCapturedInt16(const QByteArray& canonicalInput)
         work[frame * 2] = mono48Samples[frame];
         work[frame * 2 + 1] = mono48Samples[frame];
     }
-    return processWorkBuffer(frames48);
+    return processWorkBuffer(frames48, canonicalInputOutput);
 }
 
-bool TxVoiceProcessor::processFloat48(const float* interleavedStereo, int frames)
+bool TxVoiceProcessor::processFloat48(const float* interleavedStereo,
+                                      int frames,
+                                      QByteArray& transportInt16Output)
 {
     if (!m_prepared || !interleavedStereo || frames <= 0
         || frames > m_maxDspFrames) {
@@ -263,10 +262,11 @@ bool TxVoiceProcessor::processFloat48(const float* interleavedStereo, int frames
     m_work48.resize(frames * kChannels * static_cast<int>(sizeof(float)));
     std::copy_n(interleavedStereo, frames * kChannels,
                 reinterpret_cast<float*>(m_work48.data()));
-    return processWorkBuffer(frames);
+    return processWorkBuffer(frames, transportInt16Output);
 }
 
-bool TxVoiceProcessor::processWorkBuffer(int frames48)
+bool TxVoiceProcessor::processWorkBuffer(int frames48,
+                                         QByteArray& transportInt16Output)
 {
     if (m_captureMeasurements) {
         m_normalized48 = m_work48;
@@ -324,16 +324,17 @@ bool TxVoiceProcessor::processWorkBuffer(int frames48)
         leftOutputFrames, rightOutputFrames);
     if (outputFrames <= 0) {
         m_transportFloat.resize(0);
-        m_transportInt16.resize(0);
+        transportInt16Output.resize(0);
         return false;
     }
 
     m_transportFloat.resize(
         outputFrames * kChannels * static_cast<int>(sizeof(float)));
-    m_transportInt16.resize(
+    transportInt16Output.resize(
         outputFrames * kChannels * static_cast<int>(sizeof(int16_t)));
     auto* outputFloat = reinterpret_cast<float*>(m_transportFloat.data());
-    auto* outputInt16 = reinterpret_cast<int16_t*>(m_transportInt16.data());
+    auto* outputInt16 = reinterpret_cast<int16_t*>(
+        transportInt16Output.data());
     const auto* left = reinterpret_cast<const float*>(m_resampledLeft24.constData());
     const auto* right = reinterpret_cast<const float*>(m_resampledRight24.constData());
     for (int frame = 0; frame < outputFrames; ++frame) {
@@ -458,11 +459,6 @@ void TxVoiceProcessor::processChannelStrip(QByteArray& float48Stereo) noexcept
                 break;
         }
     }
-}
-
-const QByteArray& TxVoiceProcessor::transportInt16Stereo() const noexcept
-{
-    return m_transportInt16;
 }
 
 const QByteArray& TxVoiceProcessor::transportFloat32Stereo() const noexcept
