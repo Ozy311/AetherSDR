@@ -1990,9 +1990,14 @@ routed/off-subnet radios. The response carries both `"family"` (the type
 actually used, or `"dialog"` when it was left to the selector) and
 `"familySource"`: `"argument"`, `"discovery"` or `"dialog"`. Read
 `familySource`, not `family` — `"family":"flex"` alone cannot tell a resolved
-answer from a default. An explicit type that contradicts a discovered entry is
-refused, naming both, rather than probing the wrong plane and failing where
-only the log can see it.
+answer from a default.
+
+**An explicit type always wins, including against discovery** — it is you saying you know
+what is at that address, which is the whole point of being able to pass it. When the two
+disagree the reply carries `"discoveryFamily"` (present whenever discovery had an opinion
+at all), so a caller that wants strictness compares it against `"family"` and decides for
+itself, while a caller working around a wrong discovery entry still gets through. The
+mismatch is also logged.
 
 `connect wait <timeout_ms>` holds that request's response until the radio
 connects, the connect fails, or the timeout expires — the preferred unattended
@@ -2009,8 +2014,11 @@ running out the clock.
 Because every connect verb answers `{"ok":true,"deferred":true}` before its real
 work runs, a failure afterwards used to be visible only in the log. The wait
 reply now also carries `"lastError"` and `"lastErrorAgeMs"` — the last deferred
-connect/disconnect failure and how long ago it happened, so a stale one is
-distinguishable from this attempt's.
+connect/disconnect failure and how long ago it happened. It is **scoped to the current
+attempt**: a connect that lands retires it, and so does scheduling a fresh one, so its
+presence means this attempt has a failure behind it rather than "something went wrong at
+some point since the process started". A failed `disconnect` is recorded there too, but
+never completes an in-flight `connect wait` — its message belongs to the disconnect.
 
 ### `streams`
 Radio-side display-stream inventory + leak detector (#3856). `get pans` can never
