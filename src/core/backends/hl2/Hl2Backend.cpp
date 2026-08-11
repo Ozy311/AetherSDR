@@ -3034,6 +3034,15 @@ void Hl2Backend::submitTxAudio(const QByteArray& int16Stereo, int sampleRateHz,
     // Remember whether THIS transmission carried client-leveled audio, so the
     // unkey diagnostic knows a below-threshold peak was the client's own choice
     // of level rather than a microphone the ALC declined to lift.
+    //
+    // The sticky OR — and the per-block flag it forwards — lean on mic and
+    // client audio never interleaving inside one transmission: AudioEngine
+    // steps local mic capture aside while a TCI/DAX source is actively
+    // feeding (onTxAudioReady's tciAudioFresh() gate). If that mutual
+    // exclusion is ever relaxed, Hl2TxDsp would flip its ALC per block and
+    // process m_inBuffer residue under the newest block's flag — no crash,
+    // just a level that depends on block alignment. Whoever touches the
+    // mic-capture gate owns re-checking this.
     m_txAudioClientLeveled = m_txAudioClientLeveled || clientLeveled;
     if (sampleRateHz != 24000) {
         // Stated rather than silently resampled: the modulator's upsampler

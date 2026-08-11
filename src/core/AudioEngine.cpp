@@ -8742,8 +8742,10 @@ void AudioEngine::feedDaxTxAudioInternal(const QByteArray& inPcm,
         // markExternalSource is the source split this tap needs (#4796): true
         // for TCI/DAX client audio, whose sender owns its level and must not
         // get ALC makeup gain; false for the engine's own pre-shaped audio
-        // (WSPR pump, AX.25 modem), which is generated below full scale and
-        // keeps the ALC so its on-air level does not change.
+        // (WSPR pump, AX.25 modem, RADE modem waveform — all reaching here
+        // via sendModemTxAudio or the WSPR pump with markExternalSource
+        // false), which the engine generates at a known level and which keeps
+        // the ALC so its on-air level does not change.
         emit txFinalMonitorPcmReady(out, /*clientLeveled=*/markExternalSource);
         return;
     }
