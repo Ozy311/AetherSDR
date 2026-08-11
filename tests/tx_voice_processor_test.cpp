@@ -252,6 +252,42 @@ void testReusableBuffersPreserveCapacity()
                    >= transportInt16Capacity);
 }
 
+void testResamplerResetRestoresFreshState()
+{
+    constexpr int kFrames = 960;
+    const std::vector<float> history = makeFloatStereoTone(
+        kFrames, TxVoiceProcessor::kDspRate, 317.0f);
+    const std::vector<float> probe = makeFloatStereoTone(
+        kFrames, TxVoiceProcessor::kDspRate, 997.0f);
+    std::vector<float> historyMono(kFrames);
+    std::vector<float> probeMono(kFrames);
+    for (int frame = 0; frame < kFrames; ++frame) {
+        historyMono[static_cast<size_t>(frame)] =
+            history[static_cast<size_t>(frame * 2)];
+        probeMono[static_cast<size_t>(frame)] =
+            probe[static_cast<size_t>(frame * 2)];
+    }
+
+    Resampler resetInstance(48000, 24000, kFrames);
+    resetInstance.processMonoToStereo(historyMono.data(), kFrames);
+    resetInstance.reset();
+    const QByteArray afterReset = resetInstance.processMonoToStereo(
+        probeMono.data(), kFrames);
+
+    Resampler freshInstance(48000, 24000, kFrames);
+    const QByteArray freshOutput = freshInstance.processMonoToStereo(
+        probeMono.data(), kFrames);
+    constexpr int kStereoFloatFrameBytes =
+        2 * static_cast<int>(sizeof(float));
+    const int resetFrames = afterReset.size() / kStereoFloatFrameBytes;
+    const int freshFrames = freshOutput.size() / kStereoFloatFrameBytes;
+
+    report("resampler reset restores fresh deterministic stream state",
+           resetFrames == freshFrames && afterReset == freshOutput,
+           "resetFrames=" + std::to_string(resetFrames)
+               + " freshFrames=" + std::to_string(freshFrames));
+}
+
 void test48kBypassAndMeasurementBoundaries()
 {
     TxVoiceProcessor processor;
@@ -628,6 +664,7 @@ int main()
     testVoiceSrcBandwidthAndAliasRejection();
     testVoiceSrcLatencyBudgets();
     testReusableBuffersPreserveCapacity();
+    testResamplerResetRestoresFreshState();
     test48kBypassAndMeasurementBoundaries();
     testDeviceRateNormalization();
     testFloat48OfflineEntryAvoidsInputQuantization();

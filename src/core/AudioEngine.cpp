@@ -7870,7 +7870,14 @@ void AudioEngine::onTxAudioReady()
     // TxVoiceProcessor at the negotiated device rate. Do not call
     // processStereoToStereo() here: that helper would average raw mic L/R and
     // reintroduce the one-sided-channel 6.02 dB loss.
-    if (m_radeMode && m_radeTxNeedsResample && m_txResampler) {
+    const bool radeMode = m_radeMode.load(std::memory_order_acquire);
+    if (radeMode
+        && m_radeTxResamplerResetPending.exchange(
+            false, std::memory_order_acq_rel)
+        && m_txResampler) {
+        m_txResampler->reset();
+    }
+    if (radeMode && m_radeTxNeedsResample && m_txResampler) {
         // Convert canonical duplicated int16 stereo → float32 mono for the
         // mono-to-stereo resampler.
         const auto* i16 = reinterpret_cast<const int16_t*>(data.constData());
@@ -7895,7 +7902,7 @@ void AudioEngine::onTxAudioReady()
     }
 
     // RADE mode: apply client-side gain + meter, then convert int16 → float32
-    if (m_radeMode) {
+    if (radeMode) {
         // Apply client-side mic gain (same int16 gain path as SSB below)
         const float gain = m_pcMicGain.load();
         if (gain < 0.999f) {
@@ -8199,8 +8206,16 @@ void AudioEngine::setAllowBluetoothTelephonyOutput(bool on)
 
 void AudioEngine::setRadeMode(bool on)
 {
-    if (m_radeMode == on) return;
-    m_radeMode = on;
+    if (m_radeMode.load(std::memory_order_acquire) == on) {
+        return;
+    }
+    if (on) {
+        // Publish the reset request before RADE becomes visible to the audio
+        // callback. The callback owns the resampler state and consumes this
+        // request before processing the first new RADE block.
+        m_radeTxResamplerResetPending.store(true, std::memory_order_release);
+    }
+    m_radeMode.store(on, std::memory_order_release);
     // RADE TX: onTxAudioReady() emits txRawPcmReady (float32) then returns
     // early — the Opus voice TX path never runs. RADEEngine receives the
     // raw PCM, encodes it to a modem waveform, and emits it via
@@ -8212,8 +8227,9 @@ void AudioEngine::setRadeMode(bool on)
     // use the physical mic and discard every dax_tx packet, producing no
     // TX waveform. feedDaxTxAudio/m_daxTxUseRadioRoute are irrelevant:
     // RADE bypasses feedDaxTxAudio entirely.
-    if (!on)
+    if (!on) {
         m_radeRxBuffer.clear();
+    }
     clearTxAccumulators();
 }
 

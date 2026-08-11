@@ -2,6 +2,8 @@
 
 #include "CDSPResampler.h"
 
+#include <algorithm>
+
 namespace AetherSDR {
 
 Resampler::Resampler(double srcRate, double dstRate, int maxBlockSamples, double reqTransBand)
@@ -174,9 +176,10 @@ void Resampler::prewarm()
     double* outPtr = nullptr;
     int lenRequired = m_groupDelayInputFrames;
     while (lenRequired > 0) {
-        int len = std::min(lenRequired, m_maxBlockSamples);
-        std::vector<double> zeros(len, 0.0);
-        m_resampler->process(zeros.data(), len, outPtr);
+        const int len = std::min(lenRequired, m_maxBlockSamples);
+        m_inBuf.resize(static_cast<size_t>(len));
+        std::fill(m_inBuf.begin(), m_inBuf.end(), 0.0);
+        m_resampler->process(m_inBuf.data(), len, outPtr);
         lenRequired -= len;
     }
 }
