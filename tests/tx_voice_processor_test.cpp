@@ -715,29 +715,25 @@ void testTransportTpdfDither()
 {
     constexpr int kInputFrames = 48000;
     std::vector<float> silence(kInputFrames * 2, 0.0f);
+    std::vector<float> subLsbProbe(kInputFrames * 2, 1.0e-9f);
 
     TxVoiceProcessor processor;
     processor.prepare(48000, kInputFrames);
-    QByteArray firstOutput;
+    QByteArray silentOutput;
     const bool processed = processor.processFloat48(
-        silence.data(), kInputFrames, firstOutput);
+        silence.data(), kInputFrames, silentOutput);
     const QByteArray floatOutput = processor.transportFloat32Stereo();
     const auto* quantized = reinterpret_cast<const int16_t*>(
-        firstOutput.constData());
-    const int sampleCount = firstOutput.size()
+        silentOutput.constData());
+    const int sampleCount = silentOutput.size()
         / static_cast<int>(sizeof(int16_t));
 
-    bool bounded = true;
-    int nonZeroSamples = 0;
-    int64_t sampleSum = 0;
+    bool exactSilence = true;
     for (int sample = 0; sample < sampleCount; ++sample) {
-        bounded = quantized[sample] >= -1 && quantized[sample] <= 1
-            && bounded;
-        nonZeroSamples += quantized[sample] != 0 ? 1 : 0;
-        sampleSum += quantized[sample];
+        exactSilence = quantized[sample] == 0 && exactSilence;
     }
 
-    report("silent float transport block processes with dither", processed);
+    report("silent float transport block processes", processed);
     report("dither does not alter the float transport measurement tap",
            finiteFloatBuffer(floatOutput)
                && std::all_of(
@@ -745,23 +741,49 @@ void testTransportTpdfDither()
                    reinterpret_cast<const float*>(floatOutput.constData())
                        + floatOutput.size() / static_cast<int>(sizeof(float)),
                    [](float sample) { return sample == 0.0f; }));
-    report("linked TPDF preserves duplicated mono transport channels",
-           duplicatedStereo(firstOutput, false));
-    report("silent-input TPDF quantization remains within one int16 LSB",
-           bounded);
-    report("TPDF decorrelates digital silence from the zero code",
-           nonZeroSamples > sampleCount / 10,
-           "nonZero=" + std::to_string(nonZeroSamples)
-               + " samples=" + std::to_string(sampleCount));
-    report("silent-input TPDF has near-zero DC bias",
-           std::abs(sampleSum) < sampleCount / 100,
-           "sum=" + std::to_string(sampleSum));
+    report("exact digital silence remains the zero int16 code", exactSilence);
+    report("digital silence remains duplicated stereo",
+           duplicatedStereo(silentOutput, false));
+
+    QByteArray advancedProbeOutput;
+    const bool probeProcessed = processor.processFloat48(
+        subLsbProbe.data(), kInputFrames, advancedProbeOutput);
+    const auto* probeSamples = reinterpret_cast<const int16_t*>(
+        advancedProbeOutput.constData());
+    const int probeSampleCount = advancedProbeOutput.size()
+        / static_cast<int>(sizeof(int16_t));
+    int nonZeroProbeSamples = 0;
+    int64_t probeSampleSum = 0;
+    for (int sample = 0; sample < probeSampleCount; ++sample) {
+        nonZeroProbeSamples += probeSamples[sample] != 0 ? 1 : 0;
+        probeSampleSum += probeSamples[sample];
+    }
+    report("nonzero sub-LSB signal is still TPDF dithered",
+           probeProcessed && nonZeroProbeSamples > probeSampleCount / 10,
+           "nonZero=" + std::to_string(nonZeroProbeSamples)
+               + " samples=" + std::to_string(probeSampleCount));
+    report("sub-LSB TPDF remains linked across duplicated channels",
+           duplicatedStereo(advancedProbeOutput, false));
+    report("sub-LSB TPDF retains near-zero DC bias",
+           std::abs(probeSampleSum) < probeSampleCount / 100,
+           "sum=" + std::to_string(probeSampleSum));
+
+    TxVoiceProcessor freshProcessor;
+    freshProcessor.prepare(48000, kInputFrames);
+    QByteArray freshProbeOutput;
+    freshProcessor.processFloat48(
+        subLsbProbe.data(), kInputFrames, freshProbeOutput);
+    report("silent frames continue advancing the dither PRNG",
+           advancedProbeOutput != freshProbeOutput);
 
     processor.reset();
+    QByteArray resetSilentOutput;
+    processor.processFloat48(silence.data(), kInputFrames, resetSilentOutput);
     QByteArray afterReset;
-    processor.processFloat48(silence.data(), kInputFrames, afterReset);
+    processor.processFloat48(subLsbProbe.data(), kInputFrames, afterReset);
     report("reset restores deterministic TPDF stream state",
-           afterReset == firstOutput);
+           resetSilentOutput == silentOutput
+               && afterReset == advancedProbeOutput);
 }
 
 void testDitheredTransportSaturatesAtInt16Rails()

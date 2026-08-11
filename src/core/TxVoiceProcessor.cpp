@@ -340,7 +340,17 @@ bool TxVoiceProcessor::processWorkBuffer(int frames48,
     for (int frame = 0; frame < outputFrames; ++frame) {
         outputFloat[frame * 2] = left[frame];
         outputFloat[frame * 2 + 1] = right[frame];
+        const bool exactDigitalSilence = left[frame] == 0.0f
+            && right[frame] == 0.0f;
+        // Advance the streaming PRNG for every frame so dither remains
+        // block-partition invariant. Exact zero has no quantization error to
+        // decorrelate, so preserve the transport's digital-silence code.
         const float ditherLsb = nextTpdfDitherLsb();
+        if (exactDigitalSilence) {
+            outputInt16[frame * 2] = 0;
+            outputInt16[frame * 2 + 1] = 0;
+            continue;
+        }
         for (int channel = 0; channel < kChannels; ++channel) {
             outputInt16[frame * 2 + channel] = quantizeTransportSample(
                 outputFloat[frame * 2 + channel], ditherLsb);
