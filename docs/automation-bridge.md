@@ -2540,9 +2540,29 @@ or a regression test. Read-only: it keys nothing and sets nothing.
       "label":"Mic slider (0-100, 50 = unity)","value":80},
      {"key":"micGainAppliedLinear",
       "label":"Mic gain at the modulator (linear)","value":3.98},
+     {"key":"rfPowerPercent","label":"Drive requested (0-100)","value":60},
+     {"key":"txDriveRegister","label":"Drive written (raw 0-255)","value":153},
+     {"key":"txDriveGated","label":"Drive held at 0 by the TX gate","value":false},
      {"key":"forwardPowerPeakW",
-      "label":"Forward (W, approx — peak estimate)","value":4.56}]}
+      "label":"Forward (W, approx — peak HOLD, display only)","value":4.56}]}
 ```
+
+**Assert on `forwardPowerW`, never on `forwardPowerPeakW`.** The peak row is a
+meter's display hold: a single key-edge ADC sample decays over seconds, so a
+script that asserts on it reads a transient from the start of the over as
+though it were the power now. It is reset at each key edge, which is right for
+a needle and wrong for a test.
+
+On the HL2, `rfPowerPercent` / `txDriveRegister` / `txDriveGated` are the
+requested-versus-applied pair for transmit drive. `txDriveRegister` is the raw
+value last written to the radio and is **absent until the first write** — a `0`
+there means the radio was commanded to zero drive, not that nothing has
+happened yet. `txDriveGated` is true when the transmit gate
+(`AETHER_AUTOMATION_ALLOW_TX` unset, or a TX-blocked session) forced the
+register to 0 while the requested percent stayed where the operator left it;
+without it that divergence is invisible. Note the gateware decodes only the
+drive byte's top nibble, so the raw scale moves in steps of 16 — a percent
+alone does not tell you which of the 16 drives the radio actually got.
 
 **This is deliberately not assembled from the models, and that is the whole
 point.** `get` already reports those, and a model reports what the operator
