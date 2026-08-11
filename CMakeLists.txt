@@ -4549,6 +4549,17 @@ target_link_libraries(automation_connect_family_test PRIVATE
 )
 add_test(NAME automation_connect_family_test COMMAND automation_connect_family_test)
 
+# `connect wait` phase reporting + deferred connect-failure delivery (#4912).
+add_executable(automation_connect_wait_phase_test
+    tests/automation_connect_wait_phase_test.cpp
+)
+target_include_directories(automation_connect_wait_phase_test PRIVATE src tests)
+target_link_libraries(automation_connect_wait_phase_test PRIVATE
+    aethercore Qt6::Core Qt6::Network
+)
+add_test(NAME automation_connect_wait_phase_test
+         COMMAND automation_connect_wait_phase_test)
+
 add_executable(gui_client_identity_policy_test
     tests/gui_client_identity_policy_test.cpp
 )

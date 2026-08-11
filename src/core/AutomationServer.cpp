@@ -5406,6 +5406,38 @@ QJsonObject AutomationServer::doWaveform(const QString& action,
                + action + QStringLiteral("'"));
 }
 
+// Record a connect/disconnect failure that happened AFTER the verb replied.
+//
+// Every connect verb schedules its real work onto the GUI event loop and
+// answers {ok:true, deferred:true} immediately, so until now a failure existed
+// only as a qCWarning — the client that asked could not see it, and the only
+// symptom was a `connect wait` that ran its whole timeout and then reported the
+// generic "timed out waiting for radio connection" (#4912).
+//
+// Two things happen here: the message is kept for the next `connect wait` to
+// report, and any wait already in flight is answered NOW, because it is waiting
+// on precisely the thing that just failed.
+void AutomationServer::noteConnectFailure(const QString& what,
+                                          const QString& error)
+{
+    const QString detail = error.trimmed();
+    m_lastConnectError = detail.isEmpty() ? what + QStringLiteral(" failed")
+                                          : what + QStringLiteral(": ") + detail;
+    m_lastConnectErrorMs = QDateTime::currentMSecsSinceEpoch();
+    qCWarning(lcAutomation).noquote()
+        << what << "failed after scheduling:" << error;
+
+    // finishConnectWait() erases from m_connectWaits, so iterate a copy.
+    const std::vector<std::shared_ptr<ConnectWait>> pending = m_connectWaits;
+    for (const std::shared_ptr<ConnectWait>& wait : pending) {
+        if (!wait || wait->complete) {
+            continue;
+        }
+        wait->error = m_lastConnectError;
+        finishConnectWait(wait, false);
+    }
+}
+
 QJsonObject AutomationServer::doConnect(const QString& action,
                                         const QString& arg,
                                         QLocalSocket* sock)
@@ -5467,14 +5499,14 @@ QJsonObject AutomationServer::doConnect(const QString& action,
             }
 
             QPointer<QObject> guard(conn->asQObject());
-            QTimer::singleShot(0, qApp, [guard, conn, selectedSerial] {
+            QPointer<AutomationServer> self(this);
+            QTimer::singleShot(0, qApp, [guard, self, conn, selectedSerial] {
                 if (!guard) {
                     return;
                 }
                 QString error;
-                if (!conn->automationConnectLocalSerial(selectedSerial, &error)) {
-                    qCWarning(lcAutomation).noquote()
-                        << "connect local first failed after scheduling:" << error;
+                if (!conn->automationConnectLocalSerial(selectedSerial, &error) && self) {
+                    self->noteConnectFailure(QStringLiteral("connect local first"), error);
                 }
             });
             return QJsonObject{
@@ -5497,14 +5529,15 @@ QJsonObject AutomationServer::doConnect(const QString& action,
                 }
 
                 QPointer<QObject> guard(conn->asQObject());
-                QTimer::singleShot(0, qApp, [guard, conn, serial] {
+                QPointer<AutomationServer> self(this);
+                QTimer::singleShot(0, qApp, [guard, self, conn, serial] {
                     if (!guard) {
                         return;
                     }
                     QString error;
-                    if (!conn->automationConnectLocalSerial(serial, &error)) {
-                        qCWarning(lcAutomation).noquote()
-                            << "connect local serial failed after scheduling:" << error;
+                    if (!conn->automationConnectLocalSerial(serial, &error) && self) {
+                        self->noteConnectFailure(QStringLiteral("connect local serial"),
+                                                 error);
                     }
                 });
                 return QJsonObject{
@@ -5595,14 +5628,14 @@ QJsonObject AutomationServer::doConnect(const QString& action,
         }
 
         QPointer<QObject> guard(conn->asQObject());
-        QTimer::singleShot(0, qApp, [guard, conn, target, family] {
+        QPointer<AutomationServer> self(this);
+        QTimer::singleShot(0, qApp, [guard, self, conn, target, family] {
             if (!guard) {
                 return;
             }
             QString error;
-            if (!conn->automationConnectByIp(target, family, &error)) {
-                qCWarning(lcAutomation).noquote()
-                    << "connect ip failed after scheduling:" << error;
+            if (!conn->automationConnectByIp(target, family, &error) && self) {
+                self->noteConnectFailure(QStringLiteral("connect ip ") + target, error);
             }
         });
         return QJsonObject{
@@ -5674,14 +5707,14 @@ QJsonObject AutomationServer::doDisconnect()
     }
 
     QPointer<QObject> guard(conn->asQObject());
-    QTimer::singleShot(0, qApp, [guard, conn] {
+    QPointer<AutomationServer> self(this);
+    QTimer::singleShot(0, qApp, [guard, self, conn] {
         if (!guard) {
             return;
         }
         QString error;
-        if (!conn->automationDisconnect(&error)) {
-            qCWarning(lcAutomation).noquote()
-                << "disconnect failed after scheduling:" << error;
+        if (!conn->automationDisconnect(&error) && self) {
+            self->noteConnectFailure(QStringLiteral("disconnect"), error);
         }
     });
 
@@ -5862,6 +5895,17 @@ QJsonObject AutomationServer::doConnectWait(int timeoutMs, QLocalSocket* sock)
             finishConnectWait(wait, false);
         }
     });
+    // A connect that FAILS emits connectionError and never emits
+    // connectionStateChanged, so without this edge the wait had no way to hear
+    // about it and sat out the full timeout before reporting the generic
+    // "timed out" — the wrong diagnosis for a connect that already died (#4912).
+    wait->errorConnection = connect(m_radioModel, &RadioModel::connectionError,
+                                    this, [this, wait](const QString& msg) {
+        wait->error = msg.trimmed().isEmpty()
+            ? QStringLiteral("radio connection failed")
+            : msg.trimmed();
+        finishConnectWait(wait, false);
+    });
     connect(wait->timer, &QTimer::timeout, this, [this, wait] {
         finishConnectWait(wait, true);
     });
@@ -5885,6 +5929,7 @@ void AutomationServer::finishConnectWait(const std::shared_ptr<ConnectWait>& wai
         wait->timer = nullptr;
     }
     QObject::disconnect(wait->connection);
+    QObject::disconnect(wait->errorConnection);
 
     const auto newEnd = std::remove(m_connectWaits.begin(), m_connectWaits.end(), wait);
     m_connectWaits.erase(newEnd, m_connectWaits.end());
@@ -5906,13 +5951,42 @@ void AutomationServer::finishConnectWait(const std::shared_ptr<ConnectWait>& wai
     };
     if (connected) {
         response[QStringLiteral("radio")] = radioSnapshot(m_radioModel);
-    } else if (timedOut) {
-        response[QStringLiteral("timeout")] = true;
-        response[QStringLiteral("error")] =
-            QStringLiteral("timed out waiting for radio connection");
     } else {
-        response[QStringLiteral("error")] =
-            QStringLiteral("radio connection did not complete");
+        // WHAT THE CALLER ACTUALLY NEEDS TO KNOW IS "IS IT STILL WORKING?" —
+        // and until now the reply could not say (#4912). A timeout meant both
+        // "this connect died" and "this connect is still coming", and the HL2
+        // makes the second case ordinary: Hl2Backend::connectRadio() parks the
+        // request behind the DSP open and re-drives it later, emitting nothing
+        // in between, so a wait can expire mid-queue on a connect that then
+        // succeeds. Polling `get radio` was the only way to tell.
+        //
+        // `phase` splits them: "connecting" means an attempt is genuinely in
+        // flight and waiting again is the right move; "idle" means nothing is
+        // pending and waiting again will time out identically.
+        const bool inFlight = m_radioModel && m_radioModel->isConnectAttemptInFlight();
+        response[QStringLiteral("phase")] = inFlight ? QStringLiteral("connecting")
+                                                     : QStringLiteral("idle");
+        if (timedOut) {
+            response[QStringLiteral("timeout")] = true;
+            response[QStringLiteral("error")] =
+                QStringLiteral("timed out waiting for radio connection");
+        } else if (!wait->error.isEmpty()) {
+            response[QStringLiteral("error")] = wait->error;
+        } else {
+            response[QStringLiteral("error")] =
+                QStringLiteral("radio connection did not complete");
+        }
+        // The last deferred connect failure, whenever it happened. A verb that
+        // replied {ok:true, deferred:true} and then failed is otherwise
+        // unobservable from the client side; the age is what lets a caller tell
+        // this attempt's failure from a stale one.
+        if (!m_lastConnectError.isEmpty()) {
+            response[QStringLiteral("lastError")] = m_lastConnectError;
+            if (m_lastConnectErrorMs >= 0) {
+                response[QStringLiteral("lastErrorAgeMs")] = static_cast<int>(
+                    QDateTime::currentMSecsSinceEpoch() - m_lastConnectErrorMs);
+            }
+        }
     }
 
     writeJsonResponse(socket, response);
