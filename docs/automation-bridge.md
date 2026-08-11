@@ -1968,24 +1968,49 @@ so `connect show` is safe when the dialog is already open. `connect local first`
 captures the first currently discovered local radio's serial before scheduling
 the request, so the response and deferred connect target stay consistent.
 `connect local serial <serial>` selects by discovery serial. `connect ip
-<host-or-ip> [flex|hl2]` uses the manual **Connect by IP** probe path; if the
+<host-or-ip> [flex|hl2|icom]` uses the manual **Connect by IP** probe path; if the
 probe finds a radio, the panel emits its normal `connectRequested` signal and
 `MainWindow` performs the standard Multi-Flex/client-slot checks before
 `RadioModel` connects.
 
 The optional radio type selects which wire protocol to probe, matching the
 dialog's **Radio type** dropdown: `flex` opens the TCP/4992 command plane, `hl2`
-sends a directed HPSDR Protocol 1 discovery datagram to UDP/1024. The two are
-disjoint — a Hermes-Lite 2 never answers the Flex probe and vice versa — so an
-address is only reached with the right type. Omit it and the dialog's current
-selection is used, which keeps every existing `connect ip <addr>` script
-working; the response echoes `"family"` as the requested type or `"dialog"`.
+sends a directed HPSDR Protocol 1 discovery datagram to UDP/1024, and `icom`
+uses the CI-V backend. They are disjoint — a Hermes-Lite 2 never answers the
+Flex probe and vice versa — so an address is only reached with the right type.
 A directed HL2 probe is the only way to reach a Hermes-Lite 2 that discovery
 broadcasts cannot see (VPN, routed subnet), and it is bounded at ~600 ms.
 
-`connect wait <timeout_ms>` holds that request's response until
-`RadioModel::connectionStateChanged(true)` or timeout, which is the preferred
-unattended "request then assert" flow.
+**Omit the type and discovery decides.** If the address appears in `connect
+list`, that entry's `family` is used, so `connect ip <addr>` reaches an HL2
+without the caller having to know it is one. Only an address nothing has
+advertised falls back to the connect dialog's current selection — which is what
+every pre-existing `connect ip <addr>` script relied on, and still does for
+routed/off-subnet radios. The response carries both `"family"` (the type
+actually used, or `"dialog"` when it was left to the selector) and
+`"familySource"`: `"argument"`, `"discovery"` or `"dialog"`. Read
+`familySource`, not `family` — `"family":"flex"` alone cannot tell a resolved
+answer from a default. An explicit type that contradicts a discovered entry is
+refused, naming both, rather than probing the wrong plane and failing where
+only the log can see it.
+
+`connect wait <timeout_ms>` holds that request's response until the radio
+connects, the connect fails, or the timeout expires — the preferred unattended
+"request then assert" flow.
+
+A reply that is not `connected` carries `"phase"`: `"connecting"` means an
+attempt is still in flight and waiting again is the right move, `"idle"` means
+nothing is pending and another wait will time out identically. **This matters on
+the HL2**, which queues a connect behind its DSP open and re-drives it later, so
+a wait can legitimately expire on a connect that then succeeds. A connect that
+fails outright returns immediately with the backend's own message instead of
+running out the clock.
+
+Because every connect verb answers `{"ok":true,"deferred":true}` before its real
+work runs, a failure afterwards used to be visible only in the log. The wait
+reply now also carries `"lastError"` and `"lastErrorAgeMs"` — the last deferred
+connect/disconnect failure and how long ago it happened, so a stale one is
+distinguishable from this attempt's.
 
 ### `streams`
 Radio-side display-stream inventory + leak detector (#3856). `get pans` can never
