@@ -3134,16 +3134,9 @@ void Hl2Backend::applyDrive(int percent)
     // uncommanded in a transmit-BLOCKED session, defeating connectRadio()'s
     // deliberate drive=0 safety seed. Assert drive off instead. (#4449 review)
     if (!m_txAllowed) {
-        // Remembered so the health snapshot can SAY the gate zeroed it (#4912).
-        // Without this row the operator's commanded percent reads back intact
-        // from TransmitModel while the register is held at 0 — a readback that
-        // shares the failure it is meant to catch, in the one place where the
-        // divergence is safety-adjacent.
-        m_txDriveGated = true;
         setTxDriveLevel(0);
         return;
     }
-    m_txDriveGated = false;
     const int clamped = percent < 0 ? 0 : (percent > 100 ? 100 : percent);
     setTxDriveLevel(clamped * kTxDriveMax / 100);
 }
@@ -3454,7 +3447,14 @@ IRadioBackend::HealthSnapshot Hl2Backend::healthSnapshot() const
     // 0 here would read as "the radio was commanded to zero drive".
     put("txDriveRegister", QStringLiteral("Drive written (raw 0-255)"),
         m_txDriveRegister >= 0 ? QVariant(m_txDriveRegister) : QVariant());
-    put("txDriveGated", QStringLiteral("Drive held at 0 by the TX gate"), m_txDriveGated);
+    // Reported from the GATE, not from an observation of it acting. Latching this
+    // inside applyDrive() looked equivalent and was not: finishDspSetup() seeds the
+    // register with a direct setTxDriveLevel(0) that never goes through applyDrive(),
+    // so a TX-blocked session where nobody touched the drive slider read
+    // "rfPowerPercent: 100, txDriveRegister: 0, txDriveGated: false" — the row
+    // positively denying responsibility for the exact divergence it exists to
+    // explain. The gate is a session property, so it is always knowable.
+    put("txDriveGated", QStringLiteral("Drive held at 0 by the TX gate"), !m_txAllowed);
 
     // THE VOICE CHAIN, END TO END, AS THE MODULATOR ACTUALLY RAN IT.
     //

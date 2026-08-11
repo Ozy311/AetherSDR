@@ -725,6 +725,20 @@ int main(int argc, char** argv)
         spin(300);
         check(gated.isConnected(), "#4912: gated backend connects");
 
+        // BEFORE touching drive at all — the case a latched flag got wrong (#4918
+        // review). finishDspSetup() seeds the register with a direct
+        // setTxDriveLevel(0) that bypasses applyDrive(), so nothing observes the
+        // gate acting; meanwhile m_rfPowerPercent still reads its default 100.
+        // A flag set only inside applyDrive() therefore denied responsibility for
+        // the very divergence the row exists to explain.
+        {
+            const auto h0 = gated.healthSnapshot();
+            check(h0.values.value(QStringLiteral("txDriveGated")).toBool(),
+                  "#4918: the gate is reported before drive is ever commanded");
+            check(h0.values.value(QStringLiteral("rfPowerPercent")).toInt() == 100,
+                  "#4918: and the requested percent is still its default 100");
+        }
+
         gatedDrive = -1;
         gated.setTxPower(100);
         spin(200);
