@@ -44,6 +44,22 @@
 
 using namespace AetherSDR;
 
+namespace AetherSDR {
+
+// noteConnectFailure() is private; the header already befriends this name for
+// the other automation tests.
+class AutomationServerTestAccess
+{
+public:
+    static void noteFailure(AutomationServer& server, const QString& what,
+                            const QString& error, bool answerPendingWaits)
+    {
+        server.noteConnectFailure(what, error, answerPendingWaits);
+    }
+};
+
+} // namespace AetherSDR
+
 namespace {
 
 int failures = 0;
@@ -230,6 +246,56 @@ int main(int argc, char** argv)
               "a later wait still reports the last deferred connect failure");
         check(reply.contains(QStringLiteral("lastErrorAgeMs")),
               "the last failure is aged, so a stale one is distinguishable");
+    }
+
+    // ── A fresh attempt retires the previous failure ────────────────────────
+    //
+    // #4918 review: `m_lastConnectError` was set and never cleared, so one
+    // failure rode along on every later non-connected wait for the life of the
+    // process — and the field's presence reads as "this attempt failed".
+    {
+        conn.refuse = false;                       // this one is accepted
+        driver.request(connectVerb(QStringLiteral("ip"), QStringLiteral("192.0.2.98")));
+        const QJsonObject reply =
+            waiter.request(connectVerb(QStringLiteral("wait"), QStringLiteral("60")),
+                           3000);
+        check(!reply.contains(QStringLiteral("lastError")),
+              "scheduling a fresh connect retires the previous failure");
+        check(!reply.contains(QStringLiteral("lastErrorAgeMs")),
+              "and its age goes with it");
+    }
+
+    // ── A failed DISCONNECT does not answer a connect wait ──────────────────
+    //
+    // #4918 review: noteConnectFailure() completed EVERY pending wait, so a
+    // disconnect failure handed its message to an unrelated connect still
+    // legitimately in flight.
+    //
+    // Driven through the verb's failure hook rather than the `disconnect` verb
+    // itself: doDisconnect() refuses up front unless the radio is connected, so
+    // the deferred path this guards is unreachable from a socket in a test with
+    // no radio. Calling the hook directly is what makes the guard testable at
+    // all — and the guard, not the route to it, is the thing under test.
+    {
+        conn.refuse = true;
+        waiter.send(connectVerb(QStringLiteral("wait"), QStringLiteral("700")));
+        pump(80);
+
+        AutomationServerTestAccess::noteFailure(
+            server, QStringLiteral("disconnect"), QStringLiteral("port busy"),
+            /*answerPendingWaits=*/false);
+        pump(120);
+
+        const QJsonObject reply = waiter.readReply(3000);
+        check(!reply.isEmpty(), "the wait still ends, on its own timeout");
+        check(reply.value(QStringLiteral("timeout")).toBool(),
+              "a failed disconnect does not answer an in-flight connect wait");
+        check(!reply.value(QStringLiteral("error")).toString()
+                   .contains(QLatin1String("port busy")),
+              "and the disconnect's message is never reported as the wait's error");
+        check(reply.value(QStringLiteral("lastError")).toString()
+                  .contains(QLatin1String("port busy")),
+              "it is still RECORDED though — a deferred failure a caller can see");
     }
 
     // ── The in-flight flag itself ───────────────────────────────────────────

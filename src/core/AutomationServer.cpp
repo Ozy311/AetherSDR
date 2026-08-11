@@ -5417,8 +5417,19 @@ QJsonObject AutomationServer::doWaveform(const QString& action,
 // Two things happen here: the message is kept for the next `connect wait` to
 // report, and any wait already in flight is answered NOW, because it is waiting
 // on precisely the thing that just failed.
+// A landed connect retires the last deferred failure (#4918 review). Without
+// this, one failure rode along on every later non-connected `connect wait` for
+// the life of the process — and the field's mere presence reads as "something
+// went wrong with THIS attempt", which is the opposite of what it then meant.
+void AutomationServer::clearLastConnectError()
+{
+    m_lastConnectError.clear();
+    m_lastConnectErrorMs = -1;
+}
+
 void AutomationServer::noteConnectFailure(const QString& what,
-                                          const QString& error)
+                                          const QString& error,
+                                          bool answerPendingWaits)
 {
     const QString detail = error.trimmed();
     m_lastConnectError = detail.isEmpty() ? what + QStringLiteral(" failed")
@@ -5426,6 +5437,14 @@ void AutomationServer::noteConnectFailure(const QString& what,
     m_lastConnectErrorMs = QDateTime::currentMSecsSinceEpoch();
     qCWarning(lcAutomation).noquote()
         << what << "failed after scheduling:" << error;
+
+    // Only a failed CONNECT answers an outstanding `connect wait` (#4918 review).
+    // A failed disconnect is recorded the same way — it is still a deferred
+    // failure a caller should be able to see — but completing the wait with it
+    // would hand a legitimately-in-flight connect somebody else's error text.
+    if (!answerPendingWaits) {
+        return;
+    }
 
     // finishConnectWait() erases from m_connectWaits, so iterate a copy.
     const std::vector<std::shared_ptr<ConnectWait>> pending = m_connectWaits;
@@ -5482,6 +5501,12 @@ QJsonObject AutomationServer::doConnect(const QString& action,
     if (m_radioModel && m_radioModel->isConnected()) {
         return err(QStringLiteral("already connected to a radio"));
     }
+
+    // Everything below schedules a fresh attempt, and `lastError` is meant to
+    // describe THIS one — so retire the previous failure here as well as on a
+    // successful connect. A caller that wants the older failure has already had
+    // it reported once.
+    clearLastConnectError();
 
     if (a == QLatin1String("local")) {
         const QList<RadioInfo> radios = conn->automationLocalRadios();
@@ -5610,14 +5635,23 @@ QJsonObject AutomationServer::doConnect(const QString& action,
 
         QString familySource;
         if (!family.isEmpty()) {
-            // An explicit family contradicting discovery would probe the wrong
-            // plane, and that failure is invisible from here (deferred, logged,
-            // never returned). Fail fast and name both so the caller can see
-            // which of the two is wrong rather than reading a timeout.
+            // THE ARGUMENT WINS, even against discovery — it is the caller saying
+            // "I know what is at this address" (#4918 review). An earlier revision
+            // refused the contradiction, which inverted the point of the argument:
+            // it made the explicit form WEAKER than the inferred one, changed the
+            // behaviour of the already-documented `connect ip <addr> flex`, and
+            // closed the escape hatch this commit's `family` field exists to open
+            // — exactly when discovery is the thing that is wrong (stale entry, a
+            // recycled DHCP lease, a mis-parsed reply).
+            //
+            // The disagreement is still worth seeing, so it is returned as data
+            // rather than as a refusal: a strict caller compares `family` against
+            // `discoveryFamily` itself and decides.
             if (!discoveredFamily.isEmpty() && discoveredFamily != family) {
-                return err(QStringLiteral("connect ip %1: requested radio type '%2' but "
-                                          "discovery reports '%3' at that address")
-                               .arg(target, family, discoveredFamily));
+                qCWarning(lcAutomation).noquote()
+                    << "connect ip" << target << "requested family" << family
+                    << "but discovery reports" << discoveredFamily
+                    << "— honouring the argument";
             }
             familySource = QStringLiteral("argument");
         } else if (!discoveredFamily.isEmpty()) {
@@ -5638,7 +5672,7 @@ QJsonObject AutomationServer::doConnect(const QString& action,
                 self->noteConnectFailure(QStringLiteral("connect ip ") + target, error);
             }
         });
-        return QJsonObject{
+        QJsonObject reply{
             {QStringLiteral("ok"), true},
             {QStringLiteral("connect"), QStringLiteral("ip")},
             {QStringLiteral("target"), target},
@@ -5647,6 +5681,12 @@ QJsonObject AutomationServer::doConnect(const QString& action,
             {QStringLiteral("requested"), true},
             {QStringLiteral("deferred"), true},
         };
+        // What discovery believed, whenever it had an opinion — so a caller that
+        // passed an explicit family can tell whether it overrode anything.
+        if (!discoveredFamily.isEmpty()) {
+            reply[QStringLiteral("discoveryFamily")] = discoveredFamily;
+        }
+        return reply;
     }
 
     return err(QStringLiteral("unknown connect action: ") + action
@@ -5714,7 +5754,8 @@ QJsonObject AutomationServer::doDisconnect()
         }
         QString error;
         if (!conn->automationDisconnect(&error) && self) {
-            self->noteConnectFailure(QStringLiteral("disconnect"), error);
+            self->noteConnectFailure(QStringLiteral("disconnect"), error,
+                                     /*answerPendingWaits=*/false);
         }
     });
 
@@ -5870,6 +5911,7 @@ QJsonObject AutomationServer::doConnectWait(int timeoutMs, QLocalSocket* sock)
         return err(QStringLiteral("no radio model available"));
     }
     if (m_radioModel->isConnected()) {
+        clearLastConnectError();   // connected is connected — nothing is outstanding
         return QJsonObject{
             {QStringLiteral("ok"), true},
             {QStringLiteral("connected"), true},
@@ -5943,6 +5985,9 @@ void AutomationServer::finishConnectWait(const std::shared_ptr<ConnectWait>& wai
     }
 
     const bool connected = m_radioModel && m_radioModel->isConnected();
+    if (connected) {
+        clearLastConnectError();
+    }
     QJsonObject response{
         {QStringLiteral("ok"), connected},
         {QStringLiteral("connected"), connected},

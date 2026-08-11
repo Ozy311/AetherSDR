@@ -861,7 +861,15 @@ private:
     // without the caller needing a clock of its own.
     QString m_lastConnectError;
     qint64 m_lastConnectErrorMs{-1};
-    void noteConnectFailure(const QString& what, const QString& error);
+    // answerPendingWaits: whether this failure should complete outstanding
+    // `connect wait` calls. True for the connect verbs; false for disconnect,
+    // whose error would otherwise be handed to an unrelated connect still in
+    // flight.
+    void noteConnectFailure(const QString& what, const QString& error,
+                            bool answerPendingWaits = true);
+    // A connect that lands retires the previous failure, so `lastError` describes
+    // the current state of the world rather than everything that ever went wrong.
+    void clearLastConnectError();
 
     QTimer* m_memoryTimer{nullptr};
     QElapsedTimer m_memoryClock;

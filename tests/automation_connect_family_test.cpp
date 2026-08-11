@@ -212,21 +212,47 @@ int main(int argc, char** argv)
               "the explicit family reaches the connection panel");
     }
 
-    // ── Explicit family contradicting discovery fails fast ──────────────────
+    // ── Explicit family OVERRIDES discovery, and the disagreement is data ───
+    //
+    // The argument is the caller saying "I know what is at this address", so it
+    // has to win — otherwise the explicit form is weaker than the inferred one and
+    // the workaround for a wrong discovery entry disappears exactly when it is
+    // needed. An earlier revision refused this case; #4918's review caught it.
     {
         conn.byIpCalls = 0;
+        conn.lastFamily = QStringLiteral("<unset>");
         const QJsonObject reply =
             AutomationServerTestAccess::connect(
                 server, QStringLiteral("ip"),
                 QString(QLatin1String(kHl2Address)) + QStringLiteral(" flex"));
         settle();
-        check(!reply.value(QStringLiteral("ok")).toBool(),
-              "connect ip <hl2 address> flex is refused");
-        const QString error = reply.value(QStringLiteral("error")).toString();
-        check(error.contains(QLatin1String("flex")) && error.contains(QLatin1String("hl2")),
-              "the refusal names both the requested and the discovered family");
-        check(conn.byIpCalls == 0,
-              "nothing is scheduled when the families contradict");
+        check(reply.value(QStringLiteral("ok")).toBool(),
+              "connect ip <hl2 address> flex is accepted, not refused");
+        check(reply.value(QStringLiteral("family")).toString() == QLatin1String("flex"),
+              "the caller's family wins over discovery");
+        check(reply.value(QStringLiteral("familySource")).toString()
+                  == QLatin1String("argument"),
+              "and is labelled as coming from the argument");
+        check(reply.value(QStringLiteral("discoveryFamily")).toString()
+                  == QLatin1String("hl2"),
+              "the disagreement is returned as data, so a strict caller can compare");
+        check(conn.lastFamily == QLatin1String("flex"),
+              "the overriding family is what reaches the connection panel");
+    }
+
+    // ── No disagreement to report when discovery agrees ─────────────────────
+    {
+        const QJsonObject reply =
+            AutomationServerTestAccess::connect(
+                server, QStringLiteral("ip"),
+                QString(QLatin1String(kHl2Address)) + QStringLiteral(" hl2"));
+        settle();
+        check(reply.value(QStringLiteral("discoveryFamily")).toString()
+                  == QLatin1String("hl2"),
+              "discoveryFamily still reports what discovery believed");
+        check(reply.value(QStringLiteral("familySource")).toString()
+                  == QLatin1String("argument"),
+              "an agreeing argument is still an argument");
     }
 
     // ── An undiscovered address still falls back to the dialog selector ─────
