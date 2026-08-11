@@ -370,6 +370,42 @@ void testBlockBoundaryContinuityAndReset()
            afterReset == blockedOutput);
 }
 
+void testOversizedCaptureBlockIsProcessed()
+{
+    constexpr int kPreparedInputFrames = 1024;
+    constexpr int kInputFrames = 2000;
+    constexpr int kFrameBytes = 2 * static_cast<int>(sizeof(int16_t));
+    const QByteArray input = makeCanonicalTone(kInputFrames, 48000, 997.0f);
+
+    TxVoiceProcessor oversized;
+    oversized.prepare(48000, kPreparedInputFrames);
+    const bool oversizedProcessed = oversized.processCapturedInt16(input);
+    const QByteArray oversizedOutput = oversized.transportInt16Stereo();
+
+    TxVoiceProcessor partitioned;
+    partitioned.prepare(48000, kPreparedInputFrames);
+    QByteArray partitionedOutput;
+    const bool firstProcessed = partitioned.processCapturedInt16(
+        input.left(kPreparedInputFrames * kFrameBytes));
+    partitionedOutput.append(partitioned.transportInt16Stereo());
+    const bool secondProcessed = partitioned.processCapturedInt16(
+        input.mid(kPreparedInputFrames * kFrameBytes));
+    partitionedOutput.append(partitioned.transportInt16Stereo());
+
+    report("capture block larger than prepared size is processed",
+           oversizedProcessed);
+    report("oversized capture block preserves expected transport frame count",
+           oversizedOutput.size()
+               == (kInputFrames / 2) * kFrameBytes,
+           "bytes=" + std::to_string(oversizedOutput.size()));
+    report("oversized capture processing is stream-continuous",
+           firstProcessed && secondProcessed
+               && oversizedOutput == partitionedOutput,
+           "oversizedBytes=" + std::to_string(oversizedOutput.size())
+               + " partitionedBytes="
+               + std::to_string(partitionedOutput.size()));
+}
+
 void testTransportTpdfDither()
 {
     constexpr int kInputFrames = 48000;
@@ -549,6 +585,7 @@ int main()
     testNonFiniteSamplesCannotPoisonEgressSrc();
     testMeasurementCaptureCanBeDisabled();
     testBlockBoundaryContinuityAndReset();
+    testOversizedCaptureBlockIsProcessed();
     testTransportTpdfDither();
     testDitheredTransportSaturatesAtInt16Rails();
     testRnnoiseNative48kIsland();

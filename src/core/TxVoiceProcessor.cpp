@@ -210,9 +210,15 @@ bool TxVoiceProcessor::processCapturedInt16(const QByteArray& canonicalInput)
     }
     const int inputFrames = canonicalInput.size()
         / (kChannels * static_cast<int>(sizeof(int16_t)));
-    if (inputFrames <= 0 || inputFrames > m_maxInputFrames) {
+    if (inputFrames <= 0) {
         return false;
     }
+
+    // m_maxInputFrames is the expected callback size used for preparation and
+    // steady-state allocation. Device callbacks can exceed it after a
+    // scheduling stall; the stateful resamplers already process such input in
+    // bounded chunks, and the scratch buffers may grow for this exceptional
+    // case. Process the delayed audio now instead of creating a silent hole.
 
     const auto* input = reinterpret_cast<const int16_t*>(canonicalInput.constData());
     m_inputMono.resize(static_cast<size_t>(inputFrames));

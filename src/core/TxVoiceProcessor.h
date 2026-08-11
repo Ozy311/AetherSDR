@@ -71,6 +71,8 @@ public:
     TxVoiceProcessor& operator=(const TxVoiceProcessor&) = delete;
 
     // Call outside the realtime callback when the capture format changes.
+    // maxInputFrames sizes the normal realtime working set; an unusually
+    // large capture callback is still processed rather than discarded.
     bool prepare(int inputRate, int maxInputFrames);
     void reset();
 
