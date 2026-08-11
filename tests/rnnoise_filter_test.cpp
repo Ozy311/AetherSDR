@@ -690,6 +690,30 @@ bool testNative48ReusableOutputPreservesCapacity()
     return true;
 }
 
+bool testNative48EntryPointRejectsLegacyRateDomain()
+{
+    RNNoiseFilter filter(
+        RNNoiseFilter::OutputMode::ProcessedMono,
+        RNNoiseFilter::RateDomain::Legacy24k);
+    QByteArray input(
+        kBlockFrames * 2 * static_cast<int>(sizeof(float)), Qt::Uninitialized);
+    auto* samples = reinterpret_cast<float*>(input.data());
+    for (int frame = 0; frame < kBlockFrames; ++frame) {
+        samples[frame * 2] = 0.25f;
+        samples[frame * 2 + 1] = -0.125f;
+    }
+
+    QByteArray output;
+    const int outputFrames = filter.process48kStereo(input, output);
+    if (outputFrames != kBlockFrames || output != input) {
+        std::printf("legacy rate domain did not pass through native-48 input: "
+                    "frames=%d bytes=%lld\n",
+                    outputFrames, static_cast<long long>(output.size()));
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int main()
@@ -700,7 +724,8 @@ int main()
         || !testNoiseFloorDoesNotBreatheWithSpeech()
         || !testStereoChannelsStaySynchronizedWithConstantDryFloor()
         || !testBinauralPhaseDifferenceSurvivesDenoising()
-        || !testNative48ReusableOutputPreservesCapacity()) {
+        || !testNative48ReusableOutputPreservesCapacity()
+        || !testNative48EntryPointRejectsLegacyRateDomain()) {
         return 1;
     }
     std::printf("rnnoise_filter_test passed\n");

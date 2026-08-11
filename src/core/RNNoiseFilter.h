@@ -75,7 +75,8 @@ private:
     std::array<std::unique_ptr<Resampler>, 2> m_up;    // 24kHz → 48kHz per channel
     std::array<std::unique_ptr<Resampler>, 2> m_down;  // 48kHz → 24kHz per channel
     std::array<QByteArray, 2> m_inAccum;               // 48kHz mono float input
-    QByteArray m_outAccum;                             // 24kHz stereo float output
+    // Native 48 kHz or legacy 24 kHz stereo float output.
+    QByteArray m_outAccum;
     std::array<std::vector<float>, 2> m_input24k;
     std::array<std::vector<float>, 2> m_processed48k;
     std::array<std::vector<float>, 2> m_processed48kFloat;

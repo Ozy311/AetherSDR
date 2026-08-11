@@ -237,6 +237,16 @@ int RNNoiseFilter::process48kStereo(
     const QByteArray& pcm48kStereo, QByteArray& output)
 {
     output.resize(0);
+    if (m_rateDomain != RateDomain::Native48k) {
+        qCWarning(lcRn2)
+            << "RNNoiseFilter: process48kStereo() requires native-48 kHz rate domain";
+        output.resize(pcm48kStereo.size());
+        if (!pcm48kStereo.isEmpty()) {
+            std::memcpy(output.data(), pcm48kStereo.constData(),
+                        pcm48kStereo.size());
+        }
+        return output.size() / (2 * static_cast<int>(sizeof(float)));
+    }
     if (!isValid() || pcm48kStereo.isEmpty()) {
         output.resize(pcm48kStereo.size());
         if (!pcm48kStereo.isEmpty()) {
