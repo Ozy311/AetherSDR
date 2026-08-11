@@ -2651,6 +2651,11 @@ QAudioFormat AudioEngine::makeFormat() const
     return fmt;
 }
 
+bool AudioEngine::txInputNormalizationTo48k() const
+{
+    return m_txInputRate != TxVoiceProcessor::kDspRate;
+}
+
 QJsonArray AudioEngine::audioEndpointDiagnostics() const
 {
     QThread* const ownerThread = thread();

@@ -179,7 +179,7 @@ public:
     bool hasKiwiSdrAudioSource(const QString& sourceId) const;
     int  txInputSampleRate() const { return m_txInputRate; }
     int  txInputChannelCount() const { return m_txInputChannels; }
-    bool txInputNormalizationTo48k() const { return m_txInputRate != 48000; }
+    bool txInputNormalizationTo48k() const;
     bool txRadeResamplingTo24k() const { return m_radeTxNeedsResample; }
     bool rxOutputResamplingActive() const { return m_rxOutputRate.load() != DEFAULT_SAMPLE_RATE; }
     QJsonArray audioEndpointDiagnostics() const;
