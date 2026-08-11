@@ -25,7 +25,9 @@ class TxVoiceProcessorTestAccess;
 // Headless, backend-independent TX voice rate-domain processor. AudioEngine
 // remains responsible for capture normalization, mode routing, metering, and
 // transport. This class makes the canonical 48 kHz float DSP island explicit
-// and returns the unchanged 24 kHz stereo int16 transport representation.
+// and returns the existing 24 kHz stereo int16 voice-output representation.
+// It is the final PCM boundary for Flex remote_audio_tx; host-modulating
+// backends currently consume the same seam and may convert onward.
 class TxVoiceProcessor {
 public:
     static constexpr int kDspRate = 48000;

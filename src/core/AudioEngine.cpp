@@ -7950,8 +7950,10 @@ void AudioEngine::onTxAudioReady()
     // Canonical mic input enters this seam at the negotiated device rate,
     // becomes float once, and stays float through RN2, the user-orderable
     // channel strip, mic gain, Quindar, and the final limiter. A matched
-    // stereo r8brain pair performs the sole 48 -> 24 kHz egress conversion;
-    // quantization happens once at the unchanged Opus/VITA boundary.
+    // stereo r8brain pair performs the sole 48 -> 24 kHz conversion inside
+    // this voice processor; quantization happens once at its 24 kHz output
+    // boundary. That is final for Flex Opus/VITA. Host-modulating backends
+    // currently consume the same Int16 seam and may convert onward.
     // Radio-authoritative mode/passband filtering remains downstream.
     m_txVoiceProcessor->setStageOrder(
         m_txChainPacked.load(std::memory_order_acquire));
