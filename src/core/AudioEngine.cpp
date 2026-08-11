@@ -6783,13 +6783,19 @@ void AudioEngine::setRn2TxEnabled(bool on)
             RNNoiseFilter::RateDomain::Native48k);
         if (!m_rn2Tx->isValid()) {
             qCWarning(lcAudio) << "AudioEngine: RN2 TX rnnoise_create() failed — disabling";
+            m_txVoiceProcessor->setRnnoise(nullptr);
             m_rn2Tx.reset();
             emit rn2TxEnabledChanged(false);
             return;
         }
+        m_txVoiceProcessor->setRnnoise(m_rn2Tx.get());
         m_rn2TxEnabled.store(true);
     } else {
         m_rn2TxEnabled.store(false);
+        // TxVoiceProcessor does not own this raw association. Clear it while
+        // the filter is still alive so a later prepare()/reset() cannot
+        // dereference an RNNoiseFilter destroyed here.
+        m_txVoiceProcessor->setRnnoise(nullptr);
         m_rn2Tx.reset();
     }
     saveAetherialTubePreampTxSettings();
@@ -7929,7 +7935,6 @@ void AudioEngine::onTxAudioReady()
     m_txVoiceProcessor->setStageOrder(
         m_txChainPacked.load(std::memory_order_acquire));
     m_txVoiceProcessor->setMicGain(m_pcMicGain.load());
-    m_txVoiceProcessor->setRnnoise(m_rn2Tx.get());
     m_txVoiceProcessor->setRnnoiseEnabled(m_rn2TxEnabled.load());
     m_txVoiceProcessor->setMeasurementCaptureEnabled(false);
     if (!m_txVoiceProcessor->processCapturedInt16(data)) {

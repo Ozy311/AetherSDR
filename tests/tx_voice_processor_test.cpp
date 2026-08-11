@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -490,6 +491,27 @@ void testRnnoiseNative48kIsland()
     report("TX RNNoise ProcessedMono remains duplicated stereo", allDuplicated);
 }
 
+void testDisabledRnnoiseIsNotDereferencedDuringPrepare()
+{
+    auto rnnoise = std::make_unique<RNNoiseFilter>(
+        RNNoiseFilter::OutputMode::ProcessedMono,
+        RNNoiseFilter::RateDomain::Native48k);
+    TxVoiceProcessor processor;
+    processor.setRnnoise(rnnoise.get());
+    processor.setRnnoiseEnabled(false);
+
+    // Simulate the stale association that exposed the original ownership bug.
+    // A disabled processor must not touch it while prepare() resets the graph.
+    rnnoise.reset();
+    const bool prepared = processor.prepare(48000, 480);
+    processor.setRnnoise(nullptr);
+    const bool processed = processor.processCapturedInt16(
+        makeCanonicalTone(480, 48000, 700.0f));
+
+    report("disabled stale RNNoise association is not reset during prepare",
+           prepared && processed);
+}
+
 void testLatencyAccounting()
 {
     ClientGate gate;
@@ -530,6 +552,7 @@ int main()
     testTransportTpdfDither();
     testDitheredTransportSaturatesAtInt16Rails();
     testRnnoiseNative48kIsland();
+    testDisabledRnnoiseIsNotDereferencedDuringPrepare();
     testLatencyAccounting();
 
     std::printf("\n%s (%d failure%s)\n",

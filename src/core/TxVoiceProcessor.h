@@ -77,6 +77,8 @@ public:
     void setProcessors(const Processors& processors) noexcept;
     void setStageOrder(uint64_t packedStages) noexcept;
     void setRnnoiseEnabled(bool enabled) noexcept;
+    // Non-owning association. The owner must pass nullptr before destroying
+    // the RNNoiseFilter; AudioEngine establishes and clears it at that seam.
     void setRnnoise(RNNoiseFilter* rnnoise) noexcept;
     void setMicGain(float gain) noexcept;
     void setMeasurementCaptureEnabled(bool enabled) noexcept;

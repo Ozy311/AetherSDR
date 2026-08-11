@@ -152,7 +152,7 @@ void TxVoiceProcessor::reset()
     if (m_processors.quindar) {
         m_processors.quindar->reset();
     }
-    if (m_processors.rnnoise) {
+    if (m_rnnoiseEnabled && m_processors.rnnoise) {
         m_processors.rnnoise->reset();
     }
     m_work48.clear();
