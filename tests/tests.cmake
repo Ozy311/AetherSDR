@@ -3281,6 +3281,7 @@ add_executable(device_diagnostics_test
 )
 target_include_directories(device_diagnostics_test PRIVATE src)
 target_link_libraries(device_diagnostics_test PRIVATE Qt6::Core)
+add_test(NAME device_diagnostics_test COMMAND device_diagnostics_test)
 
 add_executable(midi_settings_test
     tests/midi_settings_test.cpp
