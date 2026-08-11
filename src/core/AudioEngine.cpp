@@ -7876,12 +7876,6 @@ void AudioEngine::onTxAudioReady()
     // processStereoToStereo() here: that helper would average raw mic L/R and
     // reintroduce the one-sided-channel 6.02 dB loss.
     const bool radeMode = m_radeMode.load(std::memory_order_acquire);
-    if (radeMode
-        && m_radeTxResamplerResetPending.exchange(
-            false, std::memory_order_acq_rel)
-        && m_txResampler) {
-        m_txResampler->reset();
-    }
     if (radeMode && m_radeTxNeedsResample && m_txResampler) {
         // Convert canonical duplicated int16 stereo → float32 mono for the
         // mono-to-stereo resampler.
@@ -8214,10 +8208,33 @@ void AudioEngine::setRadeMode(bool on)
         return;
     }
     if (on) {
-        // Publish the reset request before RADE becomes visible to the audio
-        // callback. The callback owns the resampler state and consumes this
-        // request before processing the first new RADE block.
-        m_radeTxResamplerResetPending.store(true, std::memory_order_release);
+        // Voice no longer advances RADE's 24 kHz SRC, so discard any history
+        // retained from the previous RADE session before publishing the new
+        // mode. The resampler belongs to the audio thread; run the reset there,
+        // between callbacks, and preserve setRadeMode()'s synchronous contract.
+        QThread* const ownerThread = thread();
+        if (ownerThread && ownerThread != QThread::currentThread()) {
+            if (!ownerThread->isRunning()) {
+                qCWarning(lcAudio)
+                    << "AudioEngine: cannot enable RADE while audio thread is stopped";
+                return;
+            }
+            const bool invoked = QMetaObject::invokeMethod(
+                this,
+                [this]() {
+                    if (m_txResampler) {
+                        m_txResampler->reset();
+                    }
+                },
+                Qt::BlockingQueuedConnection);
+            if (!invoked) {
+                qCWarning(lcAudio)
+                    << "AudioEngine: failed to reset RADE TX resampler";
+                return;
+            }
+        } else if (m_txResampler) {
+            m_txResampler->reset();
+        }
     }
     m_radeMode.store(on, std::memory_order_release);
     // RADE TX: onTxAudioReady() emits txRawPcmReady (float32) then returns

@@ -907,9 +907,6 @@ private:
     QByteArray    m_txFloatAccumulator;  // accumulate float32 PCM for RADE modem TX
     QByteArray    m_daxPreTxBuffer;      // short rolling pre-TX buffer for low-latency DAX mode
     std::atomic<bool> m_radeMode{false}; // RADE digital voice mode active (atomic: cross-thread)
-    // setRadeMode() publishes this before enabling RADE. The TX audio thread
-    // consumes it once so the RADE-only SRC is never reset concurrently.
-    std::atomic<bool> m_radeTxResamplerResetPending{false};
     std::atomic<float> m_pcMicGain{1.0f};     // client-side PC mic gain (0.0-1.0)
     std::atomic<bool>  m_daxTxMode{false};    // DAX TX mode: VirtualAudioBridge handles TX
     QElapsedTimer      m_txSourceStartTime;
