@@ -390,6 +390,10 @@ at the negotiated device rate. Rate conversion then depends on the route:
   in-place with the final 24 kHz stereo Int16 transport output. Queued monitor
   consumers therefore retain an immutable completed block rather than sharing
   a reusable processor-owned output buffer.
+- `prepare(..., maxInputFrames)` sizes the normal realtime working set; it is
+  not an input ceiling. A capture callback larger than that reservation is
+  still processed, with scratch buffers allowed to grow for the exceptional
+  block, rather than dropping the delayed microphone audio.
 - Native 48 kHz input skips the ingress SRC but still enters the same float32
   processing domain.
 - The voice SRCs use a 12% transition-band profile selected to retain the
@@ -397,9 +401,13 @@ at the negotiated device rate. Rate conversion then depends on the route:
   group delay of the general-purpose 2% profile. Their deterministic serial SRC
   delay, expressed in the 48 kHz DSP domain, is 394 frames (about 8.2 ms) for
   48 kHz capture, 615 frames (about 12.8 ms) for 44.1 kHz capture, and 788
-  frames (about 16.4 ms) for 24 kHz capture. RNNoise and enabled gate lookahead
-  add their separately reported delays. `TxVoiceProcessor::latencyFrames()`
-  reports the combined enabled-path delay in 48 kHz frames.
+  frames (about 16.4 ms) for 24 kHz capture. Enabled gate lookahead and the
+  nominal 480-frame RNNoise contribution are added by
+  `TxVoiceProcessor::latencyFrames()`, which reports the configured-path delay
+  in 48 kHz frames. The SRC and gate terms are deterministic. RNNoise's current
+  callback-sized streaming adapter can emit additional startup silence for
+  irregular callback partitions while waiting for complete 480-frame output,
+  so the RNNoise term is nominal rather than a universal wall-clock guarantee.
 - RADE retains its separate conversion to 24 kHz before its early branch. DAX
   TX does not consume this mic buffer; DAX/TCI audio arrives separately through
   `feedDaxTxAudio()`.
@@ -438,7 +446,9 @@ After capture channel canonicalization, `onTxAudioReady()` uses this ordering:
    stateful r8brain SRC converts it to the fixed DSP rate; the result is then
    duplicated to float32 stereo.
 4. **Optional TX RN2**: the mic-preamp RNNoise instance runs directly in the
-   native 48 kHz domain. RX RN2 retains its existing legacy rate wrapper.
+   native 48 kHz domain. `TxVoiceProcessor` supplies a reusable caller-owned
+   output buffer to `RNNoiseFilter::process48kStereo(input, output)`; RX RN2
+   retains its existing legacy rate wrapper.
 5. **Test tone**: `ClientTxTestTone` can replace the mic signal with a generated
    48 kHz float32 stereo tone before the user voice strip.
 6. **Voice DSP strip**: `TxVoiceProcessor::processChannelStrip()` runs float32
@@ -465,7 +475,9 @@ After capture channel canonicalization, `onTxAudioReady()` uses this ordering:
     When both float samples in a frame are exactly zero, the PRNG still advances
     but the frame remains the exact Int16 digital-silence code. Nonzero samples,
     including sub-LSB values, retain normal TPDF treatment.
-12. **Measurement seams**: when enabled for offline/tests,
+12. **Measurement seams**: capture is disabled by default and production
+    `AudioEngine` does not toggle it per block. Offline/tests enable it
+    explicitly when they need the named intermediate buffers.
     `normalizedFloat48Stereo()` exposes the normalized 48 kHz input and
     `postChannelStripFloat48Stereo()` exposes the 48 kHz post-strip/pre-gain
     signal. `transportFloat32Stereo()` exposes the final 24 kHz float
@@ -605,6 +617,13 @@ the life of the session.
 When `m_radeMode` is active, `AudioEngine::onTxAudioReady()` branches before the
 normal Opus voice TX path. RADE receives float32 PCM and bypasses the Opus
 `remote_audio_tx` encoder entirely.
+
+On the transition into RADE, `AudioEngine::setRadeMode(true)` resets the
+RADE-only device-to-24 kHz resampler on the audio thread before publishing the
+new mode. The reset therefore discards history from a previous RADE session
+without running resampler reset/prewarm work inside the realtime capture
+callback. This changes neither RADE's rate domain nor its steady-state signal
+latency.
 
 `RADEEngine::feedTxAudio()` expects 24 kHz stereo float32 PCM. It averages L/R
 and downsamples to 16 kHz mono for LPCNet feature extraction, encodes the RADE
@@ -815,7 +834,7 @@ Radio-provided taps:
 | PC mic capture | `AudioEngine::startTxStream()` | device Int16 | Int16 from `QAudioSource` | negotiated device rate | 1 or 2 | macOS push-buffer polling; Linux/Windows pull mode |
 | PC mic channel canonicalization | `TxMicChannelNormalizer::canonicalizeInt16ToMonoStereo()` | Int16 mono/stereo | duplicated-stereo Int16 | negotiated device rate | 1 or 2 -> 1 -> 2 | Auto selects stronger one-sided stereo channel or averages balanced stereo; no SRC here |
 | Voice float conversion / ingress SRC | `TxVoiceProcessor::processCapturedInt16()` | duplicated-stereo Int16 | float32 stereo | device rate -> 48 kHz when needed | 2 -> 1 -> 2 | Converts to float once; stateful mono r8brain SRC; native 48 kHz skips SRC |
-| TX RN2 | `RNNoiseFilter::process48kStereo()` | float32 stereo | float32 stereo | 48 kHz | 2 -> 1 -> 2 | Optional mic denoiser in `Native48k` rate domain |
+| TX RN2 | `RNNoiseFilter::process48kStereo(input, output)` | float32 stereo | float32 stereo | 48 kHz | 2 -> 1 -> 2 | Optional mic denoiser in `Native48k` rate domain; reuses caller-owned output storage |
 | PC mic voice strip | `TxVoiceProcessor::processChannelStrip()` | float32 stereo | float32 stereo | 48 kHz | 2 | Ordered Gate/EQ/DeEss/Comp/Tube/PUDU/Reverb |
 | PC mic gain | `TxVoiceProcessor::processWorkBuffer()` | float32 stereo | float32 stereo | 48 kHz | 2 | 0..100 maps to 0.0..1.0 attenuation |
 | Quindar TX insertion | `ClientQuindarTone::process()` | float32 stereo | float32 stereo | 48 kHz | 2 | Inserts tones before final limiter |

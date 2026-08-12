@@ -110,11 +110,13 @@ public:
     int inputRate() const noexcept { return m_inputRate; }
     bool isPrepared() const noexcept { return m_prepared; }
 
-    // Deterministic end-to-end delay expressed in 48 kHz DSP frames. Includes
-    // serial ingress/egress SRC group delay, RNNoise's one-frame WOLA delay,
+    // Configured-path delay expressed in 48 kHz DSP frames. Includes exact
+    // serial ingress/egress SRC group delay, RNNoise's nominal one-frame delay,
     // and enabled gate lookahead. The matched L/R egress SRCs run in parallel
-    // and therefore contribute one delay. Reverb pre-delay is an artistic
-    // wet-path parameter rather than whole-signal latency.
+    // and therefore contribute one delay. RNNoise's callback-sized streaming
+    // adapter can add startup silence for irregular block partitions, so its
+    // term is not an exact wall-clock guarantee. Reverb pre-delay is an
+    // artistic wet-path parameter rather than whole-signal latency.
     int latencyFrames() const noexcept;
 
 private:
