@@ -103,6 +103,16 @@ public:
                         int frames,
                         QByteArray& transportInt16Output);
 
+    // A matched egress pair should always return equal frame counts. If it
+    // does not, processing preserves the aligned common prefix and raises this
+    // request. The owner must service it between realtime callbacks; resetting
+    // r8brain from processWorkBuffer() would violate Resampler's contract.
+    bool egressRecoveryPending() const noexcept
+    {
+        return m_egressRecoveryPending;
+    }
+    void recoverEgressAfterMismatch();
+
     const QByteArray& transportFloat32Stereo() const noexcept;
     const QByteArray& normalizedFloat48Stereo() const noexcept;
     const QByteArray& postChannelStripFloat48Stereo() const noexcept;
@@ -140,6 +150,7 @@ private:
     bool m_rnnoiseEnabled{false};
     bool m_captureMeasurements{false};
     bool m_warnedEgressFrameMismatch{false};
+    bool m_egressRecoveryPending{false};
     float m_micGain{1.0f};
     uint64_t m_packedStages{0};
     uint64_t m_ditherState{kDitherSeed};

@@ -117,6 +117,7 @@ void TxVoiceProcessor::reset()
 {
     m_ditherState = kDitherSeed;
     m_warnedEgressFrameMismatch = false;
+    m_egressRecoveryPending = false;
     if (m_inputResampler) {
         m_inputResampler->reset();
     }
@@ -371,17 +372,30 @@ int TxVoiceProcessor::reconcileEgressFrameCounts(
         qCWarning(lcTxVoiceProcessor)
             << "TX egress SRC channel frame mismatch: left=" << leftFrames
             << "right=" << rightFrames
-            << "-- transmitting the common prefix and resetting both channels";
+            << "-- transmitting the common prefix and requesting recovery"
+               " between callbacks";
         m_warnedEgressFrameMismatch = true;
     }
 
     // Both resamplers consumed the same input interval, so their common
     // prefix belongs to the current aligned timeline. Preserve that prefix,
-    // discard only the unmatched tail, and reset both histories before the
-    // next callback so the dropped tail cannot become a permanent L/R offset.
+    // discard only the unmatched tail, and ask the owner to reset both
+    // histories between callbacks so the dropped tail cannot become a
+    // permanent L/R offset. Resampler::reset() performs prewarming and must not
+    // run from this realtime processing call.
+    m_egressRecoveryPending = true;
+    return std::min(leftFrames, rightFrames);
+}
+
+void TxVoiceProcessor::recoverEgressAfterMismatch()
+{
+    if (!m_egressRecoveryPending) {
+        return;
+    }
     m_outputLeftResampler->reset();
     m_outputRightResampler->reset();
-    return std::min(leftFrames, rightFrames);
+    m_egressRecoveryPending = false;
+    m_warnedEgressFrameMismatch = false;
 }
 
 uint32_t TxVoiceProcessor::nextDitherRandom24() noexcept

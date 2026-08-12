@@ -1086,6 +1086,9 @@ private:
     std::unique_ptr<WsprBeacon>         m_wsprBeacon;
     std::unique_ptr<ClientQuindarTone>  m_clientQuindarTone;
     std::unique_ptr<TxVoiceProcessor>   m_txVoiceProcessor;
+    // Audio-thread only: prevents duplicate queued recovery work after the
+    // impossible matched-egress frame-count mismatch.
+    bool m_txVoiceEgressRecoveryQueued{false};
     // Audio-thread-loaded pointer for the post-final-limiter monitor
     // (final-output recording).  Same lock-free atomic pointer pattern
     // as m_txPostDspMonitor.

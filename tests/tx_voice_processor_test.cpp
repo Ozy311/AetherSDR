@@ -498,6 +498,15 @@ void testStereoEgressMismatchSalvagesAndRealigns()
     report("stereo egress mismatch preserves the common aligned prefix",
            commonFrames == 239,
            "frames=" + std::to_string(commonFrames));
+    report("stereo egress mismatch defers expensive SRC recovery",
+           recovered.egressRecoveryPending());
+
+    // AudioEngine services this request on its event loop after the realtime
+    // callback returns. The headless test performs the same control-boundary
+    // action explicitly.
+    recovered.recoverEgressAfterMismatch();
+    report("deferred stereo egress recovery clears the request",
+           !recovered.egressRecoveryPending());
 
     const std::vector<float> probe = makeFloatStereoTone(
         kFrames, TxVoiceProcessor::kDspRate, 997.0f);

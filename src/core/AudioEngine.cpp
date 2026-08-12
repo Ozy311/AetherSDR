@@ -7959,7 +7959,24 @@ void AudioEngine::onTxAudioReady()
         m_txChainPacked.load(std::memory_order_acquire));
     m_txVoiceProcessor->setMicGain(m_pcMicGain.load());
     m_txVoiceProcessor->setRnnoiseEnabled(m_rn2TxEnabled.load());
-    if (!m_txVoiceProcessor->processCapturedInt16(data)) {
+    const bool voiceProcessed = m_txVoiceProcessor->processCapturedInt16(data);
+    if (m_txVoiceProcessor->egressRecoveryPending()
+        && !m_txVoiceEgressRecoveryQueued) {
+        m_txVoiceEgressRecoveryQueued = true;
+        const bool queued = QMetaObject::invokeMethod(
+            this,
+            [this]() {
+                m_txVoiceProcessor->recoverEgressAfterMismatch();
+                m_txVoiceEgressRecoveryQueued = false;
+            },
+            Qt::QueuedConnection);
+        if (!queued) {
+            m_txVoiceEgressRecoveryQueued = false;
+            qCWarning(lcAudio)
+                << "AudioEngine: failed to queue TX egress SRC recovery";
+        }
+    }
+    if (!voiceProcessed) {
         return;
     }
 
