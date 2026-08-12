@@ -226,13 +226,6 @@ QByteArray RNNoiseFilter::process(const QByteArray& pcm24kStereo)
     return QByteArray(needed, '\0');
 }
 
-QByteArray RNNoiseFilter::process48kStereo(const QByteArray& pcm48kStereo)
-{
-    QByteArray output;
-    process48kStereo(pcm48kStereo, output);
-    return output;
-}
-
 int RNNoiseFilter::process48kStereo(
     const QByteArray& pcm48kStereo, QByteArray& output)
 {
@@ -289,13 +282,14 @@ int RNNoiseFilter::process48kStereo(
             m_processed48k[channel].resize(consumedSamples);
             auto* accum = reinterpret_cast<float*>(m_inAccum[channel].data());
             for (int frame = 0; frame < completeFrames; ++frame) {
-                float* output = &m_processed48k[channel][frame * FRAME_SIZE];
+                float* frameOutput =
+                    &m_processed48k[channel][frame * FRAME_SIZE];
                 float* input = &accum[frame * FRAME_SIZE];
                 if (m_dryMix > 0.0f) {
                     rnnoise_process_frame_with_dry_mix(
-                        m_states[channel], output, input, m_dryMix);
+                        m_states[channel], frameOutput, input, m_dryMix);
                 } else {
-                    rnnoise_process_frame(m_states[channel], output, input);
+                    rnnoise_process_frame(m_states[channel], frameOutput, input);
                 }
             }
 

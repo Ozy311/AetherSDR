@@ -52,7 +52,6 @@ public:
     // resamplers. Input and output are interleaved 48 kHz stereo float32 with
     // an identical frame count. This is the TX voice path's fixed-rate seam;
     // the existing process() entry point remains the 24 kHz RX-compatible API.
-    QByteArray process48kStereo(const QByteArray& pcm48kStereo);
     int process48kStereo(const QByteArray& pcm48kStereo, QByteArray& output);
 
     // Fraction of the original spectrum retained in each RX frame, clamped to
