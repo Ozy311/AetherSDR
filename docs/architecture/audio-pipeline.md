@@ -325,7 +325,9 @@ flowchart TD
 - macOS prefers sample rates in this order for general devices: 48 kHz,
   44.1 kHz, then 24 kHz. For Bluetooth headset inputs that CoreAudio reports
   as native 8, 16, or 24 kHz-only, AetherSDR opens the mic at that native rate
-  first and then applies the conversion required by the selected TX route.
+  first. Normal voice then normalizes the captured signal to its fixed 48 kHz
+  DSP domain; the separate RADE route instead converts it to RADE's 24 kHz
+  handoff rate. DAX/TCI TX does not consume the PC-mic capture buffer.
 - Linux and other non-Windows platforms prefer 24 kHz, then 48 kHz, then
   44.1 kHz.
 - Stereo is tried before mono for each sample rate.

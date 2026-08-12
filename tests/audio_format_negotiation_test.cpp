@@ -157,8 +157,9 @@ int main()
             Mac, Out, Pan, dev({48000}, {F}),
             true, 48000, F, ResamplerKind::PreservePan, 2, true, FormatPreference::Int16First});
 
-    // ── macOS Bluetooth-HFP mic: native low rate first, NOT forced to 48k
-    //    (#2615). preferred-first puts 16k ahead of the 48k ladder. ───────────
+    // ── macOS Bluetooth-HFP mic: open the native low rate first (#2615).
+    //    preferred-first puts 16k ahead of the 48k device ladder; downstream
+    //    voice DSP still normalizes the captured signal to its own 48k domain. ─
     {
         DeviceCaps c = dev({8000, 16000, 24000}, {I});
         c.isBluetoothHfp = true;
