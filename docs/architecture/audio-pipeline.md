@@ -325,7 +325,7 @@ flowchart TD
 - macOS prefers sample rates in this order for general devices: 48 kHz,
   44.1 kHz, then 24 kHz. For Bluetooth headset inputs that CoreAudio reports
   as native 8, 16, or 24 kHz-only, AetherSDR opens the mic at that native rate
-  first and then uses its normal radio-native conversion when needed.
+  first and then applies the conversion required by the selected TX route.
 - Linux and other non-Windows platforms prefer 24 kHz, then 48 kHz, then
   44.1 kHz.
 - Stereo is tried before mono for each sample rate.
@@ -401,8 +401,11 @@ at the negotiated device rate. Rate conversion then depends on the route:
   group delay of the general-purpose 2% profile. Their deterministic serial SRC
   delay, expressed in the 48 kHz DSP domain, is 394 frames (about 8.2 ms) for
   48 kHz capture, 615 frames (about 12.8 ms) for 44.1 kHz capture, and 788
-  frames (about 16.4 ms) for 24 kHz capture. Enabled gate lookahead and the
-  nominal 480-frame RNNoise contribution are added by
+  frames (about 16.4 ms) for 24 kHz capture. Supported low-rate capture has a
+  longer interpolation filter: 1,240 frames (about 25.8 ms) at 16 kHz and
+  2,104 frames (about 43.8 ms) at 8 kHz. These figures include the serial
+  ingress and egress SRCs but not optional DSP latency. Enabled gate lookahead
+  and the nominal 480-frame RNNoise contribution are added by
   `TxVoiceProcessor::latencyFrames()`, which reports the configured-path delay
   in 48 kHz frames. The SRC and gate terms are deterministic. RNNoise's current
   callback-sized streaming adapter can emit additional startup silence for

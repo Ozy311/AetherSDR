@@ -336,29 +336,45 @@ void testVoiceSrcLatencyBudgets()
     struct ExpectedLatency {
         int inputRate;
         int frames48;
+        int budgetFrames48;
     };
     constexpr ExpectedLatency kExpected[] = {
-        {48000, 394},
-        {44100, 615},
-        {24000, 788},
+        {48000, 394, 960},
+        {44100, 615, 960},
+        {24000, 788, 960},
+        // Low-rate capture remains supported for macOS Bluetooth/HFP and the
+        // Windows fallback ladder. These ratios require longer interpolation
+        // filters than the common 24/44.1/48 kHz device rates.
+        {16000, 1240, 1440},
+        {8000, 2104, 2160},
     };
 
     bool exact = true;
-    bool withinTwentyMs = true;
+    bool commonRatesWithinTwentyMs = true;
+    bool withinRateSpecificBudgets = true;
     std::string detail;
     for (const ExpectedLatency expected : kExpected) {
         TxVoiceProcessor processor;
         const bool prepared = processor.prepare(expected.inputRate, 1024);
         const int frames = processor.latencyFrames();
         exact = prepared && frames == expected.frames48 && exact;
-        withinTwentyMs = prepared && frames <= 960 && withinTwentyMs;
+        if (expected.inputRate >= 24000) {
+            commonRatesWithinTwentyMs = prepared && frames <= 960
+                && commonRatesWithinTwentyMs;
+        }
+        withinRateSpecificBudgets = prepared
+            && frames <= expected.budgetFrames48
+            && withinRateSpecificBudgets;
         detail += std::to_string(expected.inputRate) + "Hz="
             + std::to_string(frames) + " ";
     }
 
     report("SRC group delay is reported for every capture rate", exact, detail);
-    report("worst-case serial SRC group delay remains below 20 ms",
-           withinTwentyMs,
+    report("24/44.1/48 kHz serial SRC delay remains below 20 ms",
+           commonRatesWithinTwentyMs,
+           detail);
+    report("supported low-rate SRC delays remain within documented budgets",
+           withinRateSpecificBudgets,
            detail);
 }
 
