@@ -7959,7 +7959,6 @@ void AudioEngine::onTxAudioReady()
         m_txChainPacked.load(std::memory_order_acquire));
     m_txVoiceProcessor->setMicGain(m_pcMicGain.load());
     m_txVoiceProcessor->setRnnoiseEnabled(m_rn2TxEnabled.load());
-    m_txVoiceProcessor->setMeasurementCaptureEnabled(false);
     if (!m_txVoiceProcessor->processCapturedInt16(data)) {
         return;
     }
