@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -61,8 +62,11 @@ public:
         ClientReverb* reverb{nullptr};
         ClientFinalLimiter* finalLimiter{nullptr};
         ClientTxTestTone* testTone{nullptr};
+        // RNNoiseFilter is deliberately absent: it is the one processor whose
+        // owner can retire it while the audio thread is running, so it is
+        // published through setRnnoise() alone rather than copied in as part
+        // of a struct assignment.
         ClientQuindarTone* quindar{nullptr};
-        RNNoiseFilter* rnnoise{nullptr};
         EqTap eqTap{nullptr};
         void* eqTapContext{nullptr};
     };
@@ -82,8 +86,12 @@ public:
     void setProcessors(const Processors& processors) noexcept;
     void setStageOrder(uint64_t packedStages) noexcept;
     void setRnnoiseEnabled(bool enabled) noexcept;
-    // Non-owning association. The owner must pass nullptr before destroying
-    // the RNNoiseFilter; AudioEngine establishes and clears it at that seam.
+    // Non-owning association, published with release semantics because the
+    // owner writes it from its own thread while the audio thread reads it
+    // every block. The owner must pass nullptr before the RNNoiseFilter can
+    // stop being reachable; AudioEngine does that at its ownership seam and
+    // then keeps the object alive, so a racing acquire load that still sees
+    // the old pointer dereferences a live filter rather than freed memory.
     void setRnnoise(RNNoiseFilter* rnnoise) noexcept;
     void setMicGain(float gain) noexcept;
     void setMeasurementCaptureEnabled(bool enabled) noexcept;
@@ -147,7 +155,13 @@ private:
     int m_maxInputFrames{0};
     int m_maxDspFrames{0};
     bool m_prepared{false};
-    bool m_rnnoiseEnabled{false};
+    // Both are read on the audio thread and written from the owner's thread
+    // (setRnnoise at the RN2 ownership seam; setRnnoiseEnabled from the
+    // capture callback today, but latencyFrames() is a public const accessor
+    // any thread may call). Atomics make that well-defined for the cost of
+    // one relaxed/acquire load per block.
+    std::atomic<RNNoiseFilter*> m_rnnoise{nullptr};
+    std::atomic<bool> m_rnnoiseEnabled{false};
     bool m_captureMeasurements{false};
     bool m_warnedEgressFrameMismatch{false};
     bool m_egressRecoveryPending{false};

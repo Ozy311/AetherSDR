@@ -157,8 +157,9 @@ void TxVoiceProcessor::reset()
     if (m_processors.quindar) {
         m_processors.quindar->reset();
     }
-    if (m_rnnoiseEnabled && m_processors.rnnoise) {
-        m_processors.rnnoise->reset();
+    if (auto* rnnoise = m_rnnoise.load(std::memory_order_acquire);
+        m_rnnoiseEnabled.load(std::memory_order_relaxed) && rnnoise) {
+        rnnoise->reset();
     }
     m_work48.resize(0);
     m_resampledMono48.resize(0);
@@ -185,12 +186,12 @@ void TxVoiceProcessor::setStageOrder(uint64_t packedStages) noexcept
 
 void TxVoiceProcessor::setRnnoiseEnabled(bool enabled) noexcept
 {
-    m_rnnoiseEnabled = enabled;
+    m_rnnoiseEnabled.store(enabled, std::memory_order_relaxed);
 }
 
 void TxVoiceProcessor::setRnnoise(RNNoiseFilter* rnnoise) noexcept
 {
-    m_processors.rnnoise = rnnoise;
+    m_rnnoise.store(rnnoise, std::memory_order_release);
 }
 
 void TxVoiceProcessor::setMicGain(float gain) noexcept
@@ -273,9 +274,12 @@ bool TxVoiceProcessor::processWorkBuffer(int frames48,
         m_normalized48 = m_work48;
     }
 
-    if (m_rnnoiseEnabled && m_processors.rnnoise
-        && m_processors.rnnoise->isValid()) {
-        m_processors.rnnoise->process48kStereo(m_work48, m_rnnoiseOutput48);
+    // One acquire load for the whole block: re-reading the member between the
+    // guard and the call would reintroduce the window this is here to close.
+    auto* const rnnoise = m_rnnoise.load(std::memory_order_acquire);
+    if (m_rnnoiseEnabled.load(std::memory_order_relaxed) && rnnoise
+        && rnnoise->isValid()) {
+        rnnoise->process48kStereo(m_work48, m_rnnoiseOutput48);
         m_work48.swap(m_rnnoiseOutput48);
     }
 
@@ -514,8 +518,9 @@ int TxVoiceProcessor::latencyFrames() const noexcept
             * kDspRate / m_outputLeftResampler->srcRate()));
     }
 
-    frames += m_rnnoiseEnabled && m_processors.rnnoise
-            && m_processors.rnnoise->isValid()
+    auto* const rnnoise = m_rnnoise.load(std::memory_order_acquire);
+    frames += m_rnnoiseEnabled.load(std::memory_order_relaxed) && rnnoise
+            && rnnoise->isValid()
         ? 480
         : 0;
     for (int index = 0; index < kMaxStages; ++index) {

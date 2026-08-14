@@ -13,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using AetherSDR::ClientTube;
@@ -859,8 +860,8 @@ void testRnnoiseNative48kIsland()
         RNNoiseFilter::RateDomain::Native48k);
     TxVoiceProcessor processor;
     TxVoiceProcessor::Processors processors;
-    processors.rnnoise = &rnnoise;
     processor.setProcessors(processors);
+    processor.setRnnoise(&rnnoise);
     processor.setRnnoiseEnabled(true);
     processor.prepare(48000, 480);
 
@@ -916,8 +917,8 @@ void testLatencyAccounting()
     TxVoiceProcessor processor;
     TxVoiceProcessor::Processors processors;
     processors.gate = &gate;
-    processors.rnnoise = &rnnoise;
     processor.setProcessors(processors);
+    processor.setRnnoise(&rnnoise);
     processor.setStageOrder(packedSingleStage(TxVoiceProcessor::Stage::Gate));
     processor.setRnnoiseEnabled(true);
     processor.prepare(48000, 480);
@@ -925,6 +926,90 @@ void testLatencyAccounting()
     report("latency report includes RNNoise frame plus gate lookahead",
            processor.latencyFrames() == 394 + 480 + 96,
            "frames=" + std::to_string(processor.latencyFrames()));
+}
+
+// setRnnoise() is the single publication point for the one processor whose
+// owner can retire it mid-stream. Pin the whole cycle: a published filter is
+// used, unpublishing takes effect on the very next block without disturbing
+// framing, and republishing a retained filter resumes cleanly. AudioEngine
+// now keeps the RNNoiseFilter alive for its own lifetime and only unpublishes
+// on disable, so this models the real ownership sequence.
+void testRnnoisePublicationCycle()
+{
+    RNNoiseFilter rnnoise(
+        RNNoiseFilter::OutputMode::ProcessedMono,
+        RNNoiseFilter::RateDomain::Native48k);
+    TxVoiceProcessor processor;
+    processor.setRnnoise(&rnnoise);
+    processor.setRnnoiseEnabled(true);
+    const bool prepared = processor.prepare(48000, 480);
+
+    const auto runBlock = [&processor]() {
+        QByteArray block = makeCanonicalTone(480, 48000, 700.0f);
+        const bool ok = processor.processCapturedInt16(block);
+        return std::make_pair(ok, block);
+    };
+
+    bool publishedOk = true;
+    for (int block = 0; block < 4; ++block) {
+        publishedOk = runBlock().first && publishedOk;
+    }
+
+    // Unpublish exactly the way AudioEngine's disable path does. The filter
+    // object stays alive here, matching the retain-for-lifetime ownership.
+    processor.setRnnoise(nullptr);
+    const auto unpublished = runBlock();
+
+    processor.setRnnoise(&rnnoise);
+    rnnoise.reset();
+    const auto republished = runBlock();
+
+    const int expectedBytes = 240 * 2 * static_cast<int>(sizeof(int16_t));
+    report("published RNNoise association processes blocks", prepared && publishedOk);
+    report("unpublished RNNoise preserves 10 ms transport framing",
+           unpublished.first && unpublished.second.size() == expectedBytes
+               && duplicatedStereo(unpublished.second, false),
+           "bytes=" + std::to_string(unpublished.second.size()));
+    report("republishing a retained RNNoise filter resumes cleanly",
+           republished.first && republished.second.size() == expectedBytes
+               && duplicatedStereo(republished.second, false),
+           "bytes=" + std::to_string(republished.second.size()));
+
+    // Framing alone would still pass if setRnnoise(nullptr) were ignored, so
+    // prove the stage is actually out of the chain: a processor unpublished
+    // before its first block must be sample-identical to one that never had a
+    // filter at all. RN2's 480-frame delay line makes any leak visible.
+    TxVoiceProcessor unpublishedEarly;
+    unpublishedEarly.setRnnoise(&rnnoise);
+    unpublishedEarly.setRnnoiseEnabled(true);
+    unpublishedEarly.prepare(48000, 480);
+    unpublishedEarly.setRnnoise(nullptr);
+
+    TxVoiceProcessor neverPublished;
+    neverPublished.setRnnoiseEnabled(true);
+    neverPublished.prepare(48000, 480);
+
+    bool bypassMatches = true;
+    for (int block = 0; block < 6; ++block) {
+        QByteArray a = makeCanonicalTone(480, 48000, 700.0f);
+        QByteArray b = makeCanonicalTone(480, 48000, 700.0f);
+        const bool okA = unpublishedEarly.processCapturedInt16(a);
+        const bool okB = neverPublished.processCapturedInt16(b);
+        bypassMatches = okA && okB && a == b && bypassMatches;
+    }
+    report("unpublishing removes RNNoise from the chain, not just the guard",
+           bypassMatches);
+
+    // latencyFrames() must follow the same published state, since it is the
+    // accessor callers use to reason about the chain.
+    processor.setRnnoise(nullptr);
+    const int withoutRnnoise = processor.latencyFrames();
+    processor.setRnnoise(&rnnoise);
+    const int withRnnoise = processor.latencyFrames();
+    report("latencyFrames() tracks the published RNNoise association",
+           withRnnoise == withoutRnnoise + 480,
+           "without=" + std::to_string(withoutRnnoise)
+               + " with=" + std::to_string(withRnnoise));
 }
 
 } // namespace
@@ -951,6 +1036,7 @@ int main()
     testDitheredTransportSaturatesAtInt16Rails();
     testRnnoiseNative48kIsland();
     testDisabledRnnoiseIsNotDereferencedDuringPrepare();
+    testRnnoisePublicationCycle();
     testLatencyAccounting();
 
     std::printf("\n%s (%d failure%s)\n",

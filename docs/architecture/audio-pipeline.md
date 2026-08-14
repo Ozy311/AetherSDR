@@ -529,7 +529,21 @@ The limiter precedes the 48-to-24 kHz egress SRC. Although it bounds samples in
 the 48 kHz domain, the SRC's band-limited reconstruction can overshoot that
 sample ceiling. The final Int16 conversion saturates any resulting over-range
 samples, so the limiter ceiling is not currently a guaranteed post-SRC or true-
-peak ceiling. Changing that policy requires measured headroom or a separately
+peak ceiling.
+
+This ordering is deliberate rather than an oversight, so do not "fix" it
+without revisiting the trade. The measured worst case is about +1.5 dBFS, and
+only for a pathological input — a ceiling-limited full-scale square wave, the
+hardest signal a linear-phase decimator can be handed. Real limited speech
+overshoots far less. The obvious alternative, lowering the limiter ceiling by a
+matching true-peak margin, is rejected on purpose: absent radio-side
+compensation, even 1 dB of headroom costs roughly 21% of PEP. Occasional speech
+overshoots, clipped once at the Int16 rail, are preferable to a permanently
+reduced transmitter output — particularly for the tightly integrated Aurora.
+The pre-refactor chain made no stronger guarantee in practice either:
+`ClientFinalLimiter` is a smoothed peak limiter, not a brickwall.
+
+Changing that policy requires measured headroom or a separately
 specified post-SRC safeguard; it must not silently add lookahead latency.
 
 ### Passband authority, SRC filtering, and oversampling

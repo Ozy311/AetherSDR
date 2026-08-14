@@ -6798,9 +6798,20 @@ void AudioEngine::setRn2TxEnabled(bool on)
     if (m_rn2TxEnabled.load() == on) return;
     std::lock_guard<std::recursive_mutex> lock(m_dspMutex);
     if (on) {
-        m_rn2Tx = std::make_unique<RNNoiseFilter>(
-            RNNoiseFilter::OutputMode::ProcessedMono,
-            RNNoiseFilter::RateDomain::Native48k);
+        // Construct once and retain for this engine's lifetime. Publishing a
+        // raw pointer that the audio thread dereferences every block and then
+        // freeing it on disable is what produced the RN2 SIGSEGV twice.
+        // Clearing the association first narrows the window but cannot close
+        // it: a block that has already loaded the pointer is still inside
+        // process48kStereo() when the destructor would run, and this setter
+        // holds m_dspMutex — which processRxAudioData() also takes — so it
+        // cannot wait on the audio thread to drain without deadlocking.
+        // Retaining one filter removes the failure mode instead of racing it.
+        if (!m_rn2Tx) {
+            m_rn2Tx = std::make_unique<RNNoiseFilter>(
+                RNNoiseFilter::OutputMode::ProcessedMono,
+                RNNoiseFilter::RateDomain::Native48k);
+        }
         if (!m_rn2Tx->isValid()) {
             qCWarning(lcAudio) << "AudioEngine: RN2 TX rnnoise_create() failed — disabling";
             m_txVoiceProcessor->setRnnoise(nullptr);
@@ -6808,15 +6819,17 @@ void AudioEngine::setRn2TxEnabled(bool on)
             emit rn2TxEnabledChanged(false);
             return;
         }
+        // A retained filter still holds the previous session's frame
+        // accumulator, so start each enable from a defined state.
+        m_rn2Tx->reset();
         m_txVoiceProcessor->setRnnoise(m_rn2Tx.get());
         m_rn2TxEnabled.store(true);
     } else {
         m_rn2TxEnabled.store(false);
-        // TxVoiceProcessor does not own this raw association. Clear it while
-        // the filter is still alive so a later prepare()/reset() cannot
-        // dereference an RNNoiseFilter destroyed here.
+        // Unpublish only; the filter stays alive. An audio block racing this
+        // either sees nullptr and skips RN2, or sees the old pointer and runs
+        // through a filter that is still valid. Neither can touch freed memory.
         m_txVoiceProcessor->setRnnoise(nullptr);
-        m_rn2Tx.reset();
     }
     saveAetherialTubePreampTxSettings();
     qCDebug(lcAudio) << "AudioEngine: RN2 TX (RNNoise mic pre-amp)" << (on ? "enabled" : "disabled");
@@ -8245,25 +8258,34 @@ void AudioEngine::setRadeMode(bool on)
         // retained from the previous RADE session before publishing the new
         // mode. The resampler belongs to the audio thread; run the reset there,
         // between callbacks, and preserve setRadeMode()'s synchronous contract.
+        //
+        // This reset is best-effort cleanup, never a precondition. Returning
+        // early on a failure here would leave m_radeMode false while
+        // activateRADE() carries on wiring txRawPcmReady, switching the slice
+        // to DIGU/DIGL and driving dax=1 — so onTxAudioReady() would take the
+        // SSB voice branch and put mic audio on remote_audio_tx while the
+        // radio modulates from dax_tx, i.e. key up to no waveform with the UI
+        // insisting RADE is running. A stale resampler tail is a click; a
+        // mode flag that disagrees with the rest of the app is a dead QSO.
         QThread* const ownerThread = thread();
         if (ownerThread && ownerThread != QThread::currentThread()) {
             if (!ownerThread->isRunning()) {
+                // Nothing is draining the resampler, so there is no stale
+                // history to discard in the first place.
                 qCWarning(lcAudio)
-                    << "AudioEngine: cannot enable RADE while audio thread is stopped";
-                return;
-            }
-            const bool invoked = QMetaObject::invokeMethod(
-                this,
-                [this]() {
-                    if (m_txResampler) {
-                        m_txResampler->reset();
-                    }
-                },
-                Qt::BlockingQueuedConnection);
-            if (!invoked) {
+                    << "AudioEngine: skipping RADE TX resampler reset —"
+                       " audio thread is stopped";
+            } else if (!QMetaObject::invokeMethod(
+                           this,
+                           [this]() {
+                               if (m_txResampler) {
+                                   m_txResampler->reset();
+                               }
+                           },
+                           Qt::BlockingQueuedConnection)) {
                 qCWarning(lcAudio)
-                    << "AudioEngine: failed to reset RADE TX resampler";
-                return;
+                    << "AudioEngine: failed to reset RADE TX resampler —"
+                       " entering RADE with its previous filter history";
             }
         } else if (m_txResampler) {
             m_txResampler->reset();
