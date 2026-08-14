@@ -1082,6 +1082,49 @@ int main(int argc, char** argv)
               "two responders: the ambiguity is REPORTED, not resolved by guessing");
         check(!c.backend.model().isKnown(),
               "two responders: and neither identity is adopted");
+
+        // THE DESTINATION HAS TO REVERT AND STAY REVERTED, which the two
+        // assertions above cannot see — both survive the session quietly
+        // drifting back onto one of the responders.
+        //
+        // It really does drift without a guard: the burst issued at the adopted
+        // address is already in flight and carries its own directed 0x19 0x00,
+        // and that reply arrives AFTER the revert. It matches the address we
+        // recorded, so it is not a third responder — and would otherwise fall
+        // straight through to the retarget branch and undo the revert.
+        QTest::qWait(400);
+        c.radio.clearCivLog();
+        QTest::qWait(600);
+        check(c.sentTo(0xA2) == 0,
+              "two responders: and NOTHING further is addressed to the responder "
+              "that answered first - the fallback holds");
+    }
+
+    // ---- THE REPLY THAT DISAGREES WITH ITSELF --------------------------------
+    //
+    // The address arrives twice in one frame — the `from` byte and the payload —
+    // and they agreed on every measured run on both lab radios. They are still
+    // read separately, because a disagreement means something is rewriting
+    // frames between the radio and us, and that is worth knowing before it gets
+    // diagnosed as a wrong address. The payload is preferred: it is what the
+    // command is defined to answer.
+    {
+        // DEAF, so the crafted frame below is the FIRST id reply of the session.
+        // A radio that answered the broadcast normally first would make the
+        // disagreeing frame a SECOND, different address — which is the
+        // two-responder case above, not this one.
+        CivCase c(0xA2, "IC-7760");
+        c.radio.setCivSilent(true);
+        c.backend.connectRadio(c.request());
+        check(waitFor([&] { return c.backend.isConnected(); }),
+              "disagreeing reply: the session comes up");
+        // Hand-built so the two fields differ, which no real radio produced.
+        c.radio.pushCiv({0xFE, 0xFE, kControllerAddress, 0xA2, cmd::kReadId, 0x00,
+                         0x98, kCivEom});
+        check(waitFor([&] { return c.sentTo(0x98) > 0; }, 6000),
+              "disagreeing reply: the PAYLOAD wins over the frame's from byte");
+        check(c.sentTo(0xA2) == 0,
+              "disagreeing reply: and the from byte is NOT what gets addressed");
     }
 
     if (g_failures == 0)

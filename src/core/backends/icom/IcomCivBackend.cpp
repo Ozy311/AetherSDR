@@ -485,6 +485,22 @@ void IcomCivBackend::adoptReportedCivAddress(std::uint8_t reported)
     if (reported == 0)
         return;
 
+    // ONCE AMBIGUOUS, ALWAYS AMBIGUOUS for this session — and this guard is
+    // load-bearing rather than defensive.
+    //
+    // The revert below re-issues the read burst at the seed address, but the
+    // burst sent at the *adopted* address is already in flight and carries its
+    // own directed 0x19 0x00. That reply lands after the revert, matches
+    // m_civReported exactly (so it is not a third address), falls through to the
+    // retarget branch, and quietly puts the session back on the responder we had
+    // just decided we could not trust — undoing the revert with no warning.
+    //
+    // Found by tracing the two-responder test rather than by running it: the
+    // test asserted the identity and the warning, both of which survive the
+    // regression, and passed either way.
+    if (m_civAmbiguous)
+        return;
+
     // TWO DIFFERENT RESPONDERS — adopt NEITHER, and go back to the seed.
     //
     // Broadcast on a point-to-point LAN radio is unambiguous, and both lab
