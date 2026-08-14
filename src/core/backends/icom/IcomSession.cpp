@@ -560,7 +560,18 @@ void IcomSession::onSerialPayload(const QByteArray& packet)
         // everything addressed to it straight back; treating those echoes as
         // radio state makes every command look confirmed the instant it is
         // sent, including the ones the radio goes on to reject with FA.
-        if (frame->to == m_params.civAddress && frame->from == kControllerAddress)
+        //
+        // kBroadcastAddress is in the test as well as our own address because a
+        // 0x19 0x00 sent to 0x00 — the address query that needs no prior
+        // knowledge of who is out there — echoes back as to=0x00, from=0xE0 and
+        // would otherwise be handed up as if the radio had answered. Measured on
+        // an IC-9700 and an IC-705 on 2026-08-14: the echo always arrives first,
+        // ahead of the real reply. It carries no data byte so parseModelIdReply
+        // rejects it anyway, but a frame we sent is never radio state and does
+        // not belong above this line. `from` still has to be OURS for either
+        // test to fire — a radio answering transceive to 0x00 is a real frame.
+        if (frame->from == kControllerAddress
+            && (frame->to == m_params.civAddress || frame->to == kBroadcastAddress))
             continue;
         emit civFrameReady(*frame);
     }
