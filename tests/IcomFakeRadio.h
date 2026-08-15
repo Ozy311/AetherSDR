@@ -215,7 +215,23 @@ public:
     // Defaults are unchanged, so every test written before this one still faces
     // the same IC-705 it always did.
     void setCivAddress(std::uint8_t address) { m_addr = address; }
-    void setDeviceName(std::string name) { m_name = std::move(name); }
+    // The tighter of the two windows the name is copied into: 0x40 in a
+    // 0x90-byte connect grant, against 0x52 in a 0xA8-byte announce.
+    static constexpr std::size_t kMaxNameBytes = 0x90 - 0x40;
+
+    // TRUNCATED, because both carriers std::copy into a fixed offset in a
+    // fixed-size frame with no length check of their own. Every name the suite
+    // uses is a model designation of a handful of characters, so this has never
+    // fired — but a fake radio that scribbles past the end of its own frame
+    // fails as memory corruption somewhere else entirely, which is a debugging
+    // trap rather than a test failure. Truncating is also what a fixed-width
+    // device-name field on a real radio does.
+    void setDeviceName(std::string name)
+    {
+        m_name = std::move(name);
+        if (m_name.size() > kMaxNameBytes)
+            m_name.resize(kMaxNameBytes);
+    }
 
     // A SECOND DEVICE ON THE BUS. Icom's own RS-BA1 server can front a serial
     // CI-V bus carrying another radio, a rotator or an amplifier, and all of
