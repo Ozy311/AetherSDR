@@ -197,26 +197,51 @@ void Hl2TxDsp::processAudioBlock(const std::vector<float>& mono, bool clientLeve
     // hiss, and the result is hard-limited below full scale afterwards, because
     // an ALC that can overshoot is a splatter generator.
     //
-    // Client-leveled audio bypasses the ALC entirely (#4796). A TCI/DAX client
-    // that attenuates its own tone — WSJT-X's Pwr slider is a digital
+    // Client-leveled audio is never given MAKEUP gain (#4796). A TCI/DAX
+    // client that attenuates its own tone — WSJT-X's Pwr slider is a digital
     // attenuator on the audio it streams, not a rig command — must see output
-    // proportional to what it sent. Through the ALC it saw two other things
-    // instead: above the hold threshold its level control was normalized away
-    // to alcTargetPeak, and below it the gain froze at whatever history left
-    // behind, so the same slider position produced RF or none depending on the
-    // path taken to it. Pinning unity here (not just skipping the update)
-    // keeps the reset()-on-unkey contract: the next mic transmission starts
-    // from unity either way.
-    if (m_config.alcEnabled && !clientLeveled) {
+    // proportional to what it sent. Through the ALC's makeup half it saw two
+    // other things instead: above the hold threshold its level control was
+    // normalized away to alcTargetPeak, and below it the gain froze at
+    // whatever history left behind, so the same slider position produced RF or
+    // none depending on the path taken to it.
+    //
+    // It still gets REDUCTION, because that half was never the bug. m_micGain
+    // reaches 10x (+20 dB, Hl2TxLevelPolicy.h) and is applied BEFORE this
+    // block, so a full-scale client with the TX gain slider up arrives ~17 dB
+    // into the hard clamp below — and flat-topping an SSB modulator input is a
+    // splatter generator, which is the one failure mode that harms other
+    // operators rather than the operator who caused it. The clamp is a
+    // backstop, not a level control; it must not become the only thing
+    // standing between a hot client and the band.
+    //
+    // So the bypass is one-sided, expressed as a CEILING on the gain rather
+    // than a branch around the loop: mic audio may be lifted to alcMaxGainDb,
+    // client-leveled audio may not be lifted past unity. Below alcTargetPeak
+    // the ceiling binds, the gain sits at exactly 1.0, and output is
+    // proportional — the whole reported range. Above it the ALC reduces on its
+    // normal 5 ms attack, so the response degrades to smooth limiting instead
+    // of clipping.
+    //
+    // Gating the INCREASE branch instead would have been the smaller edit and
+    // is wrong: once a loud block pulled the gain down, nothing could ever
+    // raise it again within the over, so a client sliding back down would stay
+    // attenuated at whatever the loudest block called for. That is
+    // path-dependent gain — the same class of defect as #4796, mirrored — and
+    // hl2_txdsp_test's recovery case pins it.
+    if (m_config.alcEnabled) {
         float blockPeak = 0.0f;
         for (std::size_t s = 0; s < consumed; ++s)
             blockPeak = std::max(blockPeak, std::fabs(
                 static_cast<float>(m_inBuffer[s] * m_micGain)));
 
         if (blockPeak > 1e-6f) {
+            // The ceiling is the whole of the client-leveled special case.
+            const double ceiling = clientLeveled
+                ? 1.0
+                : std::pow(10.0, m_config.alcMaxGainDb / 20.0);
             const double wanted = m_config.alcTargetPeak / blockPeak;
-            const double maxGain = std::pow(10.0, m_config.alcMaxGainDb / 20.0);
-            const double target = std::min(wanted, maxGain);
+            const double target = std::min(wanted, ceiling);
             // Per-block time constants. Attack when we need LESS gain (the
             // signal got louder) so overshoot is corrected immediately.
             const double blockSec = static_cast<double>(consumed)
@@ -224,9 +249,18 @@ void Hl2TxDsp::processAudioBlock(const std::vector<float>& mono, bool clientLeve
             const bool reducing = target < m_alcGain;
             // Hold the gain through pauses rather than winding it up on room
             // noise. Reduction is never held — see alcHoldBelowDbfs.
+            //
+            // The hold is a MIC-path concern only. It exists to stop makeup
+            // gain chasing room noise between syllables; under a unity ceiling
+            // there is no makeup gain to chase with, and holding would be
+            // actively harmful — it is exactly the mechanism that would strand
+            // a client-leveled transmission at the reduction its loudest block
+            // called for.
             const double holdThreshold =
                 std::pow(10.0, m_config.alcHoldBelowDbfs / 20.0);
-            if (reducing || blockPeak >= holdThreshold) {
+            const bool held = !reducing && !clientLeveled
+                           && blockPeak < holdThreshold;
+            if (!held) {
                 const double tau = reducing ? m_config.alcAttackSec
                                             : m_config.alcReleaseSec;
                 const double a = 1.0 - std::exp(-blockSec / std::max(1e-6, tau));
@@ -234,6 +268,9 @@ void Hl2TxDsp::processAudioBlock(const std::vector<float>& mono, bool clientLeve
             }
         }
     } else {
+        // ALC configured off: unity for every path. The clamp below is then the
+        // only over-level backstop on BOTH the mic and client paths, which is
+        // pre-existing behaviour for an operator who has turned the ALC off.
         m_alcGain = 1.0;
     }
     // Published unconditionally, including when the ALC is off and the answer
