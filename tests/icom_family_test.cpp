@@ -179,6 +179,20 @@ int main(int argc, char** argv)
         }
     }
 
+    // ---- hasNetwork is what the Connect-by-IP chooser filters on ----------
+    //
+    // The connect page lists only radios it can actually dial, so this flag is
+    // now load-bearing for the UI as well as the backend. Pin both sides of the
+    // discriminator: flipping either one silently changes what the operator is
+    // offered, and the IC-7300 / IC-7300MK2 pair is exactly where it is easy to
+    // get wrong — same family name, one USB-only, one with an Ethernet port.
+    check(!icom::modelForCivAddress(0x94)->hasNetwork,
+          "the IC-7300 is CI-V only - it cannot answer a Connect-by-IP session "
+          "directly, so the chooser must not offer it");
+    check(icom::modelForCivAddress(0xB6)->hasNetwork,
+          "the IC-7300MK2 CAN - it has an Ethernet port, and dropping it from "
+          "the chooser would hide the model this backend was validated on");
+
     // The name is FREE TEXT set on the radio, so the match has to survive the
     // ways it is really written.
     check(icom::modelForName("IC-705") != nullptr, "IC-705 resolves");

@@ -2123,6 +2123,20 @@ void ConnectionPanel::populateIcomCivCombo()
     m_manualIcomCivCombo->addItem(tr("Auto-detect (recommended)"),
                                   QStringLiteral("__auto__"));
     for (const auto& model : AetherSDR::icom::knownModels()) {
+        // ONLY RADIOS THIS PAGE CAN ACTUALLY DIAL.
+        //
+        // `hasNetwork` false means CI-V only — a serial port, or Icom's own
+        // RS-BA1 *server* software on a PC acting as a front end. The IC-7300 is
+        // the one such row today, and offering it here would invite an operator
+        // with a USB-only IC-7300 to pick it and get a connect timeout on a page
+        // whose whole premise is "you already know the radio's IP".
+        //
+        // The server-fronted case is not lost: that session's address is still
+        // the radio's 0x94, reachable through `Custom...`. It is the rarer path
+        // and the one where auto-detect by NAME cannot help anyway, because the
+        // handshake names the server rather than the radio behind it.
+        if (!model.hasNetwork)
+            continue;
         const QString name = QString::fromUtf8(model.name.data(),
                                                static_cast<int>(model.name.size()));
         const QString hex =
