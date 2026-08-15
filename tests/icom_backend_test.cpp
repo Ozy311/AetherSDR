@@ -942,6 +942,19 @@ int main(int argc, char** argv)
                 radio.civCommands().begin(), radio.civCommands().end(),
                 [to](const CivFrame& f) { return f.to == to; }));
         }
+        // ...AND WHICH COMMAND went there. sentTo() alone cannot tell "the
+        // reads recovered" from "the scope switches recovered", and after a
+        // retarget those are two different questions with two different
+        // answers - which is exactly how a black panadapter hid behind a
+        // passing test.
+        [[nodiscard]] int sentCmdTo(std::uint8_t to, std::uint8_t command) const
+        {
+            return static_cast<int>(std::count_if(
+                radio.civCommands().begin(), radio.civCommands().end(),
+                [to, command](const CivFrame& f) {
+                    return f.to == to && f.cmd == command;
+                }));
+        }
         [[nodiscard]] bool warnedAbout(const char* fragment) const
         {
             return std::any_of(warnings.begin(), warnings.end(),
@@ -1023,6 +1036,67 @@ int main(int argc, char** argv)
               "model pick: the broadcast reply retargets the session and the "
               "radio answers");
         check(c.sentTo(0xA2) > 1, "model pick: the burst is re-issued at 0xA2");
+    }
+
+    // ---- A NAMED MODEL WHOSE ADDRESS WAS CHANGED ON THE RADIO --------------
+    //
+    // The case auto-detect exists for, and the one every case above misses: the
+    // handshake name RESOLVES - so the session is seeded to 0xA2 and the connect
+    // edge addresses everything there - but the radio actually answers on 0x50,
+    // because someone changed it on the front panel. The cases above either
+    // resolve by name to the right address (no retarget) or resolve by neither
+    // (no model), so nothing yet exercises a live model on a moved address.
+    //
+    // The reads recovering is NOT enough to call this fixed. A retarget moves
+    // the destination, and everything already sent went to a device that is not
+    // there; asserting on frequency alone passes while the panadapter stays
+    // black for the rest of the session.
+    {
+        CivCase c(0x50, "IC-9700");
+        c.backend.connectRadio(c.request());
+        check(waitFor([&] { return c.backend.isConnected(); }),
+              "retarget: the session comes up");
+        check(waitFor([&] { return c.frequencyMHz > 14.0 && c.frequencyMHz < 14.1; }),
+              "retarget: the broadcast reply moves the reads to 0x50 and the "
+              "radio answers");
+        check(c.sentTo(0xA2) > 1,
+              "retarget: the name seed DID address the wrong device first - "
+              "that is the setup for this case, not the defect");
+
+        // THE DISCRIMINATING ASSERTION. 0x27 is the scope pair and an IC-9700
+        // has a scope, so if "started" is latched per SESSION those two frames
+        // exist only at 0xA2: the radio is never told to send sweeps, while
+        // capabilities() goes on advertising a panadapter that cannot fill.
+        // Frequency and mode all arrive, so the session reads as healthy.
+        check(waitFor([&] { return c.sentCmdTo(0x50, cmd::kScope) > 0; }),
+              "retarget: the scope switches are re-sent at 0x50 - 'started' is "
+              "per DESTINATION, and a retarget is a new destination");
+    }
+
+    // ---- AN UNKNOWN NAME IN FRONT OF A MODEL THE TABLE DOES KNOW -----------
+    //
+    // The RS-BA1 shape: the handshake names the SERVER rather than the radio, so
+    // no seed is possible and the burst waits on the broadcast. But the address
+    // that comes back is in kModels - 0xB6 is the IC-7300MK2 - so the model IS
+    // resolvable, and the burst has to be built against THAT model rather than
+    // the conservative fallback the unresolved name left in place.
+    //
+    // 0x26 is the read #4984 added so a radio left in USB-D is not adopted as
+    // plain USB and pushed the rest of the way out of DATA by our first write.
+    // It is gated on hasVfoModeCommand, which only the resolved model sets - so
+    // a burst re-issued before resolution silently drops it, on the one path
+    // where the radio most needs it.
+    {
+        CivCase c(0xB6, "IC-7760");
+        c.backend.connectRadio(c.request());
+        check(waitFor([&] { return c.backend.isConnected(); }),
+              "late model: the session comes up");
+        check(waitFor([&] { return c.frequencyMHz > 14.0 && c.frequencyMHz < 14.1; }, 6000),
+              "late model: broadcast alone finds 0xB6 and the reads land");
+        check(waitFor([&] { return c.sentCmdTo(0xB6, cmd::kVfoMode) > 0; }, 6000),
+              "late model: the DATA-mode read goes out too - the burst is built "
+              "against the model the ADDRESS resolved, not the fallback the "
+              "unrecognised name left behind");
     }
 
     // ---- A MODEL NOT IN THE TABLE ------------------------------------------

@@ -525,20 +525,29 @@ void IcomCivBackend::adoptReportedCivAddress(std::uint8_t reported)
                                "CI-V address, so AetherSDR knows which one to use.")
                     .arg(QString::number(m_civReported, 16).toUpper(),
                          QString::number(reported, 16).toUpper()));
+            // GIVE BACK THE IDENTITY FIRST, which the first responder had
+            // already been allowed to set. Reverting the address alone leaves
+            // the far worse half of the problem in place: capabilities — TX
+            // power ceiling, band ranges, scope geometry — would go on
+            // describing a device we have just decided we cannot identify,
+            // while the frames go somewhere else entirely. Caught by the
+            // two-responder test, which passed on the address assertion alone.
+            //
+            // BEFORE the revert below, because the burst that revert re-issues
+            // is shaped by m_model: reverting the address first would send it
+            // built against the very identity we are withdrawing.
+            m_model = m_modelByName ? m_modelByName : &unknownModel();
+
             // Back to what the operator or the handshake gave us. That is a
             // choice with a reason behind it; "whoever spoke first" is not.
             if (m_session && m_session->civAddress() != m_civSeedAddress) {
                 m_session->setCivAddress(m_civSeedAddress);
                 sendConnectReadBurst();
+                // Same destination argument as the retarget path below: the
+                // switches went to a responder we have just walked away from.
+                m_scopeStarted = false;
+                applyScopeStartup();
             }
-            // AND GIVE BACK THE IDENTITY, which the first responder had already
-            // been allowed to set. Reverting the address alone leaves the far
-            // worse half of the problem in place: capabilities — TX power
-            // ceiling, band ranges, scope geometry — would go on describing a
-            // device we have just decided we cannot identify, while the frames
-            // go somewhere else entirely. Caught by the two-responder test,
-            // which passed on the address assertion alone.
-            m_model = m_modelByName ? m_modelByName : &unknownModel();
             publishCapabilities();
             RadioDelta r;
             r.model = QString::fromUtf8(m_model->name.data(),
@@ -583,10 +592,39 @@ void IcomCivBackend::adoptReportedCivAddress(std::uint8_t reported)
                    << "to the address the radio reported:" << reported;
     m_session->setCivAddress(reported);
 
+    // RESOLVE THE MODEL BEFORE THE BURST, not after it.
+    //
+    // onCivFrame does this same lookup a few lines further on, together with the
+    // publishing that belongs with it - but it runs AFTER this, and the burst
+    // below is not model-neutral: it gates the 0x26 DATA-mode read on
+    // hasVfoModeCommand, which only a resolved model sets. Re-issuing first and
+    // resolving second therefore drops that read on precisely the path that
+    // needs it most - an unrecognised handshake name in front of a radio the
+    // table does know, which is the RS-BA1-server shape this feature exists to
+    // survive. Without the read, a radio left in USB-D is adopted as plain USB
+    // and our first write pushes it the rest of the way out of DATA (#4984).
+    //
+    // Cheap and idempotent: the lookup below repeats it and does the publishing.
+    if (const IcomModel* byAddress = modelForCivAddress(reported))
+        m_model = byAddress;
+
     // The burst either has not run yet (unknown model, waiting on exactly this
     // reply) or ran against an address nobody answered on. Both want it sent at
     // the address that just answered, so there is no branch here.
     sendConnectReadBurst();
+
+    // AND THE SCOPE SWITCHES, for the same reason the burst goes again.
+    //
+    // "Started" was per SESSION, but these are addressed frames, so what it has
+    // to mean is per DESTINATION. A radio whose name resolved had its scope
+    // switched on at the connect edge - addressed to the seed, where by this
+    // function's own premise nobody is listening - and the latch then refused to
+    // send them anywhere else for the rest of the session. Everything else
+    // recovers here, so the session reads as healthy while capabilities() goes
+    // on advertising a panadapter that can never fill: the exact black-panadapter
+    // symptom applyScopeStartup() exists to prevent.
+    m_scopeStarted = false;
+    applyScopeStartup();
 
     // SAY WHAT HAPPENED — but only when it is something the operator could not
     // work out from the radio name and a working panadapter.
@@ -701,8 +739,17 @@ void IcomCivBackend::onSessionConnected(const QString& deviceName)
     //
     // Skipped when the operator TYPED an address: that is a device selection on
     // a possibly-shared bus, and our table lookup does not get to overrule it.
-    if (!m_civAddressPinned && m_modelByName)
+    if (!m_civAddressPinned && m_modelByName) {
         m_session->setCivAddress(m_modelByName->civAddress);
+        // ...AND THIS IS NOW THE SEED. m_civSeedAddress is where the two-
+        // responder path reverts to when it decides no reported address can be
+        // trusted, and its comment there promises "what the operator or the
+        // handshake gave us" - but it was captured in connectRadio() from the
+        // request param and never updated here, so the handshake half was not
+        // true. An ambiguous bus therefore threw away a name-resolved address
+        // that was very likely correct and fell back to the 0xA4 default.
+        m_civSeedAddress = m_modelByName->civAddress;
+    }
 
     // ONE BROADCAST 0x19 0x00 — the actual auto-detect, and the only frame this
     // change adds to the connect edge.

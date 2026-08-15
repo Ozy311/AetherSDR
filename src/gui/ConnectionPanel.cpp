@@ -2221,7 +2221,23 @@ void ConnectionPanel::updateManualFamilyHints()
         // The chooser answers this now. Rebuilt rather than left alone so a
         // settings change made elsewhere in the session is reflected, and
         // because the selection is what decides whether the hex row is showing.
-        populateIcomCivCombo();
+        //
+        // EXCEPT over an address the operator is still typing. This function is
+        // reached from setManualFamily(), which applySavedSourceSelection()
+        // calls when a recent host is picked from the dropdown — so selecting
+        // "Custom...", typing an address and then choosing an IP rebuilt the
+        // chooser from settings, reset it to Auto, hid the row and discarded the
+        // entry with nothing said. The sibling user / password / IP fills below
+        // have always guarded on isEmpty() for exactly this reason; the chooser
+        // is a combo rather than a line edit, so its "unsaved work in progress"
+        // is the Custom hex field standing open with something in it.
+        const bool customEntryInFlight =
+            m_manualIcomCivCombo
+            && m_manualIcomCivCombo->currentData().toString()
+                   == QLatin1String("__custom__")
+            && m_manualIcomCivEdit && !m_manualIcomCivEdit->text().isEmpty();
+        if (!customEntryInFlight)
+            populateIcomCivCombo();
         if (m_manualIpEdit && m_manualIpEdit->text().isEmpty())
             m_manualIpEdit->setText(IcomSettings::lastHost());
         if (m_manualIcomPassEdit && m_manualIcomPassEdit->text().isEmpty()) {
