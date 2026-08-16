@@ -14,6 +14,7 @@
 #include "core/backends/icom/IcomCivBackend.h"
 #include "core/backends/icom/IcomModels.h"
 #include "core/backends/icom/CivCodec.h"
+#include "gui/ExperimentalRadioSupport.h"
 
 #include <QCoreApplication>
 
@@ -47,6 +48,19 @@ int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
     RadioModel model;
+
+    const auto icomNotice = experimentalRadioDescriptor(QStringLiteral("icom"));
+    const auto hl2Notice = experimentalRadioDescriptor(QStringLiteral("hl2"));
+    check(icomNotice && icomNotice->displayName == QStringLiteral("Icom"),
+          "Icom is identified as an experimental radio family");
+    check(hl2Notice && hl2Notice->displayName == QStringLiteral("Hermes-Lite 2"),
+          "Hermes-Lite 2 is identified as an experimental radio family");
+    check(!experimentalRadioDescriptor(QStringLiteral("flex")),
+          "Flex is not marked as an experimental radio family");
+    check(icomNotice
+              && experimentalRadioNoticeText(icomNotice->displayName)
+                     .contains(QStringLiteral("Help \u2192 File an Issue")),
+          "the experimental notice points operators to the issue-reporting workflow");
 
     // ---- the factory selects it ------------------------------------------
     model.connectToRadio(infoFor(QStringLiteral("icom")));

@@ -52,7 +52,7 @@ public:
                                    const QRect& availableGeometry) const;
     void setConnected(bool connected);
     void setStatusText(const QString& text);
-    void probeRadio(const QString& ip);
+    void probeRadio(const QString& ip, bool restoreSavedFamily = false);
 
     // Radio families the "Connect by IP" page can dial. The manual page can no
     // longer guess: a FlexRadio answers TCP/4992 and a Hermes-Lite 2 answers
@@ -277,6 +277,9 @@ private:
 
     QString      m_pendingIcomPassword;
     QString      m_pendingIcomHost;
+    QString      m_pendingIcomResolvedHost;
+    RadioBindSettings m_pendingIcomBindSettings;
+    QHostAddress m_pendingIcomSessionBindAddress;
     QLineEdit*   m_manualIpEdit{nullptr};
     QLabel*      m_manualResultLabel{nullptr};
     QToolButton* m_manualAdvancedToggle{nullptr};

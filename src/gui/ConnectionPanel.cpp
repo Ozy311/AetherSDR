@@ -631,6 +631,7 @@ ConnectionPanel::ConnectionPanel(QWidget* parent)
     manualLayout->setContentsMargins(0, 0, 0, 0);
     manualLayout->setSpacing(8);
     m_manualHintLabel = makeWrappedLabel(QString(), kHintLabelStyle);
+    m_manualHintLabel->setObjectName(QStringLiteral("connectionManualHintLabel"));
     manualLayout->addWidget(m_manualHintLabel);
 
     auto* manualGroup = new QGroupBox("Radio IP address", manualPage);
@@ -1294,6 +1295,9 @@ void ConnectionPanel::clearPendingIcomCredentials()
 {
     m_pendingIcomPassword.clear();
     m_pendingIcomHost.clear();
+    m_pendingIcomResolvedHost.clear();
+    m_pendingIcomBindSettings = RadioBindSettings{};
+    m_pendingIcomSessionBindAddress.clear();
 }
 
 void ConnectionPanel::setConnected(bool connected)
@@ -1311,8 +1315,24 @@ void ConnectionPanel::setConnected(bool connected)
     if (connected && !m_pendingIcomPassword.isEmpty()
         && currentManualFamily() == QLatin1String(kFamilyIcom)) {
         IcomCredentials::save(m_pendingIcomPassword);
-        if (!m_pendingIcomHost.isEmpty())
+        if (!m_pendingIcomHost.isEmpty()) {
             IcomSettings::setLastHost(m_pendingIcomHost);
+            // The routed profile restores the family and source path for this
+            // address at the next launch. Icom cannot be probed anonymously,
+            // so commit it only after the authenticated session proves the
+            // host and credentials together.
+            saveManualProfile(m_pendingIcomHost,
+                              m_pendingIcomBindSettings,
+                              m_pendingIcomSessionBindAddress);
+            if (m_pendingIcomResolvedHost != m_pendingIcomHost) {
+                // MainWindow retains the resolved address in LastRoutedRadioIp.
+                // Mirror the profile under that key as well so a hostname such
+                // as ic-705.local still restores the Icom family at startup.
+                saveManualProfile(m_pendingIcomResolvedHost,
+                                  m_pendingIcomBindSettings,
+                                  m_pendingIcomSessionBindAddress);
+            }
+        }
     }
     if (!connected || !m_pendingIcomPassword.isEmpty()) {
         // Cleared on BOTH edges: a failed attempt must not commit on the next
@@ -2250,20 +2270,19 @@ void ConnectionPanel::updateManualFamilyHints()
     }
 
     if (m_manualHintLabel) {
+        const QString passwordStorageHint = IcomCredentials::persistentStoreAvailable()
+            ? QStringLiteral(
+                  "The password is stored in your operating system keychain, never in the "
+                  "settings file.")
+            : QStringLiteral(
+                  "This build has no QtKeychain support, so the password is kept for this "
+                  "session only.");
         m_manualHintLabel->setText(
             icom
                 ? QStringLiteral(
-                      "Enter the radio address and the network user name and password set on "
-                      "the radio itself. On the radio, Network Control must be ON (IC-705: "
-                      "Menu > Set > WLAN set > Remote settings). The password is stored in "
-                      "your operating system keychain, never in the settings file.\n\n"
-                      "TO TRANSMIT, the radio must also be told to take its modulation from "
-                      "the network. Under Menu > Set > Connectors > MOD Input, set BOTH:\n"
-                      "    \u2022  DATA OFF MOD \u2192 WLAN  (SSB, CW, AM, FM \u2014 voice)\n"
-                      "    \u2022  DATA MOD \u2192 WLAN  (FT8 and other data modes)\n"
-                      "Each covers a different set of modes, so setting only one leaves the "
-                      "other silent. If either is left on MIC or USB the radio ignores the "
-                      "audio AetherSDR sends: it keys, makes no power, and reports no error.")
+                      "Enter the radio address and the network user name and password "
+                      "configured for network control. %1")
+                      .arg(passwordStorageHint)
                 : hl2
                 ? QStringLiteral(
                       "Use this path when discovery broadcasts cannot reach the radio — a VPN, a "
@@ -2276,7 +2295,7 @@ void ConnectionPanel::updateManualFamilyHints()
     }
     if (m_manualIpEdit) {
         m_manualIpEdit->setPlaceholderText(
-            icom ? QStringLiteral("Example: ic-705.local")
+            icom ? QStringLiteral("Example: radio.local or 192.168.1.90")
           : hl2  ? QStringLiteral("Example: 192.168.1.21")
                  : QStringLiteral("Example: 10.0.0.25"));
     }
@@ -2372,22 +2391,23 @@ void ConnectionPanel::onManualAdvancedToggled(bool checked)
     m_manualAdvancedWidget->setVisible(checked);
 }
 
-void ConnectionPanel::probeRadio(const QString& ip)
+void ConnectionPanel::probeRadio(const QString& ip, bool restoreSavedFamily)
 {
     const QString trimmedIp = ip.trimmed();
     if (trimmedIp.isEmpty())
         return;
 
-    // NOT the family, on either branch. By the time we are probing, the Radio
-    // type combo says what the operator wants spoken at this address — whether
-    // they picked it themselves or `activated` restored it when they chose the
-    // address. Letting the saved profile win here would overrule a deliberate
-    // change made after the address was entered.
+    // Interactive and automation probes keep the family currently selected by
+    // the operator. Startup is the exception: it has no current operator
+    // choice, so restoreSavedFamily asks the retained route which wire protocol
+    // belongs to the saved address.
     if (m_manualIpEdit->text().trimmed() != trimmedIp) {
         m_manualIpEdit->setText(trimmedIp);
-        applySavedSourceSelection(trimmedIp, /*restoreFamily=*/false);
+        applySavedSourceSelection(trimmedIp, restoreSavedFamily);
     } else if (m_manualProfileIp != trimmedIp) {
-        applySavedSourceSelection(trimmedIp, /*restoreFamily=*/false);
+        applySavedSourceSelection(trimmedIp, restoreSavedFamily);
+    } else if (restoreSavedFamily) {
+        applySavedSourceSelection(trimmedIp, /*restoreFamily=*/true);
     }
 
     bool staleSelection = false;
@@ -2434,13 +2454,51 @@ void ConnectionPanel::probeRadio(const QString& ip)
             user = IcomSettings::username();
         if (pass.isEmpty())
             pass = IcomCredentials::sessionPassword();
-        if (user.isEmpty() || pass.isEmpty()) {
+        if (user.isEmpty()) {
             resetManualConnectButton();
             setManualMessage(
                 QStringLiteral("An Icom needs the network user name and password set on the "
                                "radio. Check Network Control is ON in the radio's menu, then "
                                "enter the same credentials here."),
                 true);
+            return;
+        }
+        if (pass.isEmpty()) {
+            // Keychain reads are asynchronous. Startup auto-connect reaches
+            // this path on a fixed timer, so relying on the dialog's earlier
+            // best-effort read races a locked or merely slow macOS Keychain.
+            // Finish the read here and resume the same family-selected probe;
+            // the synchronous connect path itself remains keychain-free.
+            const QString requestedHost = trimmedIp;
+            setManualMessage(QStringLiteral("Loading the saved Icom password…"));
+            QPointer<ConnectionPanel> panel(this);
+            IcomCredentials::load(this, [panel, requestedHost](const QString& password) {
+                if (!panel) {
+                    return;
+                }
+                if (panel->currentManualFamily() != QLatin1String(kFamilyIcom)
+                    || !panel->m_manualIpEdit
+                    || panel->m_manualIpEdit->text().trimmed() != requestedHost) {
+                    panel->resetManualConnectButton();
+                    panel->m_manualConnectPending = false;
+                    return;
+                }
+                if (password.isEmpty()) {
+                    panel->resetManualConnectButton();
+                    panel->setManualMessage(
+                        QStringLiteral(
+                            "No saved Icom password is available. Enter the network password "
+                            "set on the radio, then connect once to remember it."),
+                        true);
+                    panel->m_manualConnectPending = false;
+                    return;
+                }
+                if (panel->m_manualIcomPassEdit
+                    && panel->m_manualIcomPassEdit->text().isEmpty()) {
+                    panel->m_manualIcomPassEdit->setText(password);
+                }
+                panel->probeRadio(requestedHost);
+            });
             return;
         }
 
@@ -2520,6 +2578,11 @@ void ConnectionPanel::probeRadio(const QString& ip)
         IcomCredentials::setSessionPassword(pass);
         m_pendingIcomHost = trimmedIp;
         m_pendingIcomPassword = pass;
+        m_pendingIcomBindSettings = bindSettings;
+        m_pendingIcomSessionBindAddress =
+            bindSettings.mode == RadioBindMode::Explicit
+                ? bindSettings.bindAddress
+                : QHostAddress();
 
         // RESOLVE FIRST. QHostAddress parses NUMERIC addresses only — given a
         // host name it yields a null address SILENTLY, and the connect then
@@ -2540,6 +2603,7 @@ void ConnectionPanel::probeRadio(const QString& ip)
             }
             resolved = hostInfo.addresses().first();
         }
+        m_pendingIcomResolvedHost = resolved.toString();
 
         RadioInfo info;
         info.family   = QString::fromLatin1(kFamilyIcom);
@@ -2552,6 +2616,13 @@ void ConnectionPanel::probeRadio(const QString& ip)
         // the restore/persist scope keys off it.
         info.serial   = QStringLiteral("icom:%1").arg(resolved.toString());
         info.nickname = info.model;
+        // Manual Icom sessions use the same retention path as routed Flex and
+        // HL2 sessions. Without this marker MainWindow removes
+        // LastRoutedRadioIp immediately, so the startup checkbox has no host to
+        // reconnect to even though LastConnectedRadioSerial was retained.
+        info.isRouted           = true;
+        info.bindSettings       = bindSettings;
+        info.sessionBindAddress = m_pendingIcomSessionBindAddress;
         rememberManualIp(trimmedIp);
         resetManualConnectButton();
         emit connectRequested(info);
