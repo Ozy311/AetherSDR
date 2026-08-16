@@ -602,6 +602,106 @@ void testFloat48OfflineEntryAvoidsInputQuantization()
                               input.data(), input.size() * sizeof(float)) == 0);
 }
 
+void testCapturedFloat32EntryAvoidsInputQuantization()
+{
+    constexpr int kFrames = 480;
+
+    // Canonical duplicated-mono stereo float, every sample below one Int16 LSB
+    // (1/32768 = 3.05e-5). This is what the host audio engine's float mix
+    // actually holds; it is also precisely what an Int16 ingress cannot carry.
+    // One Int16 LSB is 1/32768 = 3.05e-5, so every value here has to stay
+    // under that or the comparison below is not testing what it claims.
+    // Varying rather than constant, so this is not a degenerate DC case.
+    // Below HALF an LSB (1.53e-5), not merely below one: std::lround puts
+    // anything above the half-LSB point onto +/-1 rather than 0.
+    const auto subLsbSample = [](int frame) {
+        return 1.0e-7f * static_cast<float>((frame % 25) + 1);   // <= 2.5e-6
+    };
+    std::vector<float> canonical(static_cast<size_t>(kFrames) * 2);
+    for (int frame = 0; frame < kFrames; ++frame) {
+        const float sample = subLsbSample(frame);
+        canonical[static_cast<size_t>(frame) * 2] = sample;
+        canonical[static_cast<size_t>(frame) * 2 + 1] = sample;
+    }
+    QByteArray floatBlock(reinterpret_cast<const char*>(canonical.data()),
+                          static_cast<int>(canonical.size() * sizeof(float)));
+
+    TxVoiceProcessor floatProcessor;
+    floatProcessor.setMeasurementCaptureEnabled(true);
+    floatProcessor.prepare(48000, kFrames);
+    const bool floatProcessed = floatProcessor.processCapturedFloat32(floatBlock);
+
+    bool preserved = floatProcessed
+        && floatProcessor.normalizedFloat48Stereo().size()
+               == static_cast<int>(canonical.size() * sizeof(float));
+    if (preserved) {
+        const auto* got = reinterpret_cast<const float*>(
+            floatProcessor.normalizedFloat48Stereo().constData());
+        for (int frame = 0; frame < kFrames && preserved; ++frame) {
+            preserved = got[frame * 2] == canonical[static_cast<size_t>(frame) * 2];
+        }
+    }
+    report("captured float32 entry preserves sub-Int16 mic samples exactly", preserved);
+
+    // The same audio as an Int16 ingress delivers it: the host engine quantizes
+    // its float mix on the way out, so every one of these samples has already
+    // rounded to zero before AetherSDR sees a byte of it.
+    QByteArray int16Block(kFrames * 2 * static_cast<int>(sizeof(int16_t)), '\0');
+    auto* quantized = reinterpret_cast<int16_t*>(int16Block.data());
+    for (int frame = 0; frame < kFrames; ++frame) {
+        const auto q = static_cast<int16_t>(
+            std::lround(static_cast<double>(subLsbSample(frame)) * 32768.0));
+        quantized[frame * 2] = q;
+        quantized[frame * 2 + 1] = q;
+    }
+
+    TxVoiceProcessor int16Processor;
+    int16Processor.setMeasurementCaptureEnabled(true);
+    int16Processor.prepare(48000, kFrames);
+    const bool int16Processed = int16Processor.processCapturedInt16(int16Block);
+    bool floored = int16Processed;
+    if (floored) {
+        const auto* got = reinterpret_cast<const float*>(
+            int16Processor.normalizedFloat48Stereo().constData());
+        for (int frame = 0; frame < kFrames && floored; ++frame) {
+            floored = got[frame * 2] == 0.0f;
+        }
+    }
+    report("Int16 ingress floors those same mic samples to silence", floored);
+}
+
+void testCapturedFloat32MatchesInt16ForRepresentableAudio()
+{
+    // Above the LSB the two routes must agree, or this change would be altering
+    // ordinary audio rather than only what Int16 could not represent.
+    constexpr int kFrames = 480;
+    std::vector<float> canonical(static_cast<size_t>(kFrames) * 2);
+    QByteArray int16Block(kFrames * 2 * static_cast<int>(sizeof(int16_t)), '\0');
+    auto* pcm = reinterpret_cast<int16_t*>(int16Block.data());
+    for (int frame = 0; frame < kFrames; ++frame) {
+        const auto value = static_cast<int16_t>(
+            std::lround(8000.0 * std::sin(0.05 * frame)));
+        pcm[frame * 2] = value;
+        pcm[frame * 2 + 1] = value;
+        const float asFloat = value / 32768.0f;
+        canonical[static_cast<size_t>(frame) * 2] = asFloat;
+        canonical[static_cast<size_t>(frame) * 2 + 1] = asFloat;
+    }
+    QByteArray floatBlock(reinterpret_cast<const char*>(canonical.data()),
+                          static_cast<int>(canonical.size() * sizeof(float)));
+
+    TxVoiceProcessor a;
+    a.prepare(48000, kFrames);
+    TxVoiceProcessor b;
+    b.prepare(48000, kFrames);
+    const bool okFloat = a.processCapturedFloat32(floatBlock);
+    const bool okInt16 = b.processCapturedInt16(int16Block);
+    report("both capture routes process a representable block",
+           okFloat && okInt16);
+    report("float and Int16 routes agree on representable audio",
+           okFloat && okInt16 && floatBlock == int16Block);
+}
+
 void testChannelStripRunsAt48k()
 {
     ClientTube tube;
@@ -1027,6 +1127,8 @@ int main()
     test48kBypassAndMeasurementBoundaries();
     testDeviceRateNormalization();
     testFloat48OfflineEntryAvoidsInputQuantization();
+    testCapturedFloat32EntryAvoidsInputQuantization();
+    testCapturedFloat32MatchesInt16ForRepresentableAudio();
     testChannelStripRunsAt48k();
     testNonFiniteSamplesCannotPoisonEgressSrc();
     testMeasurementCaptureCanBeDisabled();

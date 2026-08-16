@@ -58,15 +58,42 @@ QList<int> primaryRateOrder(TargetOs os, Direction dir, int internalRate)
 // native is Int16; Float is the virtual-driver / Float-only fallback — #1090).
 // Int16-native playback sinks (QSO/Pudu) pass Int16First so they avoid a
 // conversion on normal devices while still falling back to Float.
-QList<SampleFmt> formatOrder(Direction dir, FormatPreference pref)
+QList<SampleFmt> formatOrder(TargetOs os, Direction dir, FormatPreference pref)
 {
     if (pref == FormatPreference::Int16First)
         return {SampleFmt::Int16, SampleFmt::Float32};
     if (pref == FormatPreference::Float32First)
         return {SampleFmt::Float32, SampleFmt::Int16};
-    return dir == Direction::Output
-        ? QList<SampleFmt>{SampleFmt::Float32, SampleFmt::Int16}
-        : QList<SampleFmt>{SampleFmt::Int16, SampleFmt::Float32};
+    if (dir == Direction::Output)
+        return {SampleFmt::Float32, SampleFmt::Int16};
+
+    // Input. Same inversion the 48 kHz strip forced on the RATE ladder, applied
+    // to the FORMAT ladder. Int16-first was right while the DSP island was
+    // Int16: the mic's own samples are integer, so asking for Int16 meant no
+    // conversion anywhere. TxVoiceProcessor is float now, and every host engine
+    // we open through already mixes in float — WASAPI's shared mix is float32 by
+    // construction, and converts to integer only at the app boundary
+    // (learn.microsoft.com/windows/win32/coreaudio/device-formats); PipeWire and
+    // PulseAudio likewise. So Int16 capture buys a quantization on the way in
+    // and processCapturedFloat32() would widen it straight back — a round trip
+    // at the ENTRANCE of a chain whose stated design is "become float once,
+    // quantize once at the 24 kHz transport boundary".
+    //
+    // Int16 stays the next rung, so an Int16-only endpoint negotiates exactly as
+    // it did before.
+    switch (os) {
+    case TargetOs::Windows:
+    case TargetOs::Linux:
+        return {SampleFmt::Float32, SampleFmt::Int16};
+    // macOS deliberately keeps Int16-first. The argument above applies to
+    // CoreAudio too, but this change only measures Windows and Linux, and the
+    // mac input ladder additionally leads with the device's preferredFormat for
+    // BT-HFP / 16k-native mics (#2615 / #2930). Left for a follow-up with real
+    // hardware behind it rather than changed blind.
+    case TargetOs::MacOS:
+        return {SampleFmt::Int16, SampleFmt::Float32};
+    }
+    Q_UNREACHABLE();
 }
 
 bool ladderHas(const QList<FormatCandidate>& ladder, int rate, SampleFmt fmt)
@@ -98,7 +125,7 @@ QList<FormatCandidate> buildLadder(TargetOs os,
                                    FormatPreference pref)
 {
     QList<FormatCandidate> ladder;
-    const QList<SampleFmt> fmts = formatOrder(dir, pref);
+    const QList<SampleFmt> fmts = formatOrder(os, dir, pref);
 
     const auto add = [&](int rate, SampleFmt fmt, const QString& reason) {
         if (rate <= 0) return;

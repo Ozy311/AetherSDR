@@ -179,6 +179,11 @@ public:
     bool hasKiwiSdrAudioSource(const QString& sourceId) const;
     int  txInputSampleRate() const { return m_txInputRate; }
     int  txInputChannelCount() const { return m_txInputChannels; }
+    QAudioFormat::SampleFormat txInputSampleFormat() const { return m_txInputFormat; }
+    // True when the mic hands us the host engine's float mix directly, so the
+    // 48 kHz float voice strip is fed without an Int16 round trip on ingress.
+    bool txInputIsFloat32() const { return m_txInputFormat == QAudioFormat::Float; }
+    int  txInputBytesPerSample() const { return txInputIsFloat32() ? 4 : 2; }
     bool txInputNormalizationTo48k() const;
     bool txRadeResamplingTo24k() const { return m_radeTxNeedsResample; }
     bool rxOutputResamplingActive() const { return m_rxOutputRate.load() != DEFAULT_SAMPLE_RATE; }
@@ -995,6 +1000,10 @@ private:
     bool  m_txInputMono{false};          // TX: legacy convenience mirror of m_txInputChannels == 1
     int   m_txInputChannels{2};          // TX: actual negotiated input channel count
     int   m_txInputRate{24000};          // TX: actual input sample rate
+    // TX: negotiated capture sample format. Float32 keeps the ingress out of
+    // the integer domain entirely; Int16 remains the fallback rung and the
+    // macOS default, so both routes stay live.
+    QAudioFormat::SampleFormat m_txInputFormat{QAudioFormat::Int16};
     TxMicChannelNormalizer::ChannelMode m_txMicChannelMode{
         TxMicChannelNormalizer::ChannelMode::Auto};
     TxMicChannelNormalizer::AutoState m_txMicChannelState;

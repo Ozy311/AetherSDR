@@ -184,8 +184,20 @@ int main()
     // ── Linux mic: 48k first so the TX voice strip skips its ingress SRC ──────
     // The 48 kHz DSP domain makes 48k capture the conversion-free choice; a
     // 24k-capable device must no longer win the first rung.
+    // fellBack=true now: Float32 is rung 0 for the float voice strip, so an
+    // Int16-only mic takes rung 1. It still gets the preferred RATE, and the
+    // engine's own fallback note keys off rate/channels, not this flag.
     runRow({"std mic / Linux / TX -> 48k native", Lin, In, Pan, dev({24000, 48000}, {I}),
-            true, 48000, I, ResamplerKind::PreservePan, 2, false});
+            true, 48000, I, ResamplerKind::PreservePan, 2, true});
+    // Same inversion applied to the FORMAT axis: the voice strip is a float
+    // island, so a device that offers both formats must lead with Float32.
+    runRow({"float-capable mic / Linux / TX -> Float32 first", Lin, In, Pan,
+            dev({24000, 48000}, {F, I}),
+            true, 48000, F, ResamplerKind::PreservePan, 2, false});
+    // ...and an Int16-only mic must still negotiate exactly as it did before.
+    runRow({"int16-only mic / Linux / TX -> still opens Int16", Lin, In, Pan,
+            dev({48000}, {I}),
+            true, 48000, I, ResamplerKind::PreservePan, 2, true});
     // A mic that cannot do 48k still falls back to 24k rather than failing.
     runRow({"24k-only mic / Linux / TX -> falls back to 24k", Lin, In, Pan, dev({24000}, {I}),
             true, 24000, I, ResamplerKind::None, 2, true});
@@ -194,7 +206,32 @@ int main()
     {
         DeviceCaps c;
         c.isFormatSupportedReliable = false;
-        runRow({"std mic / Win / TX -> force 48k probe-at-open", Win, In, Pan, c,
+        // Float32, not Int16, is now the first rung. WASAPI's shared mix is
+        // float32, so this is the format that needs no conversion on ingress
+        // into the 48 kHz float voice strip. Probe-at-open is unchanged: the
+        // engine's open-failure ladder walks Int16 if Float is refused.
+        runRow({"std mic / Win / TX -> force 48k Float32 probe-at-open", Win, In, Pan, c,
+                true, 48000, F, ResamplerKind::PreservePan, 2, false});
+    }
+    // A Windows mic whose shared format really is Int16-only still lands on
+    // Int16 rather than failing to negotiate.
+    runRow({"int16-only mic / Win / TX -> falls back to Int16", Win, In, Pan,
+            dev({48000}, {I}),
+            true, 48000, I, ResamplerKind::PreservePan, 2, true});
+    // macOS: formatOrder() still leads with Int16 there, but a device that
+    // advertises a preferredRate gets its own preferredFormat as rung 0 — which
+    // for any float-capable mic is Float32. That predates this change; what is
+    // new is that AudioEngine no longer discards the rung. Pinned so the
+    // behaviour is a decision on the record rather than a side effect.
+    runRow({"float-capable mic / Mac / TX -> device preferredFormat leads", Mac, In, Pan,
+            dev({48000}, {F, I}),
+            true, 48000, F, ResamplerKind::PreservePan, 2, false});
+    // A mac mic with no preferred rate falls to formatOrder(), which is
+    // Int16-first on macOS.
+    {
+        DeviceCaps c = dev({48000}, {F, I});
+        c.preferredRate = 0;
+        runRow({"no-preference mic / Mac / TX -> Int16 first", Mac, In, Pan, c,
                 true, 48000, I, ResamplerKind::PreservePan, 2, false});
     }
 
