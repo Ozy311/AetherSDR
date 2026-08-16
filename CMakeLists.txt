@@ -729,6 +729,8 @@ set(CORE_SOURCES
     src/core/AcomConnection.cpp
     src/core/SpeProtocol.cpp
     src/core/SpeConnection.cpp
+    src/core/VkampProtocol.cpp
+    src/core/VkampConnection.cpp
     src/core/FirmwareUploader.cpp
     src/core/WaveformInstaller.cpp
     src/core/WaveformUploadState.cpp
@@ -939,6 +941,7 @@ set(GUI_SOURCES
     src/gui/AmpApplet.cpp
     src/gui/AcomApplet.cpp
     src/gui/SpeApplet.cpp
+    src/gui/VkampApplet.cpp
     src/gui/MeterApplet.cpp
     src/gui/ProfileSwitcherApplet.cpp
     src/gui/RadeApplet.cpp
@@ -3118,6 +3121,15 @@ target_include_directories(hl2_rxdsp_test PRIVATE src)
 target_link_libraries(hl2_rxdsp_test PRIVATE aethercore Qt6::Core Qt6::Test)
 add_test(NAME hl2_rxdsp_test COMMAND hl2_rxdsp_test)
 
+# The host-side impulse noise blanker (WDSP ANB) ahead of the demodulator. The
+# HL2 runs no firmware DSP, so this stage is the only noise blanker the radio
+# has and there is no wire traffic to assert against — the test measures the
+# audio instead.
+add_executable(hl2_noise_blanker_test tests/hl2_noise_blanker_test.cpp)
+target_include_directories(hl2_noise_blanker_test PRIVATE src)
+target_link_libraries(hl2_noise_blanker_test PRIVATE aethercore Qt6::Core Qt6::Test)
+add_test(NAME hl2_noise_blanker_test COMMAND hl2_noise_blanker_test)
+
 # AM/SAM come back from WDSP's envelope detector with the carrier as a DC
 # pedestal; the blocker on the audio output must strip it without touching the
 # modes that were already zero-mean, and without its corner creeping up into
@@ -4374,6 +4386,33 @@ target_include_directories(spe_protocol_test PRIVATE src)
 target_link_libraries(spe_protocol_test PRIVATE Qt6::Core)
 add_test(NAME spe_protocol_test COMMAND spe_protocol_test)
 
+add_executable(vkamp_protocol_test
+    tests/vkamp_protocol_test.cpp
+    src/core/VkampProtocol.cpp
+)
+target_include_directories(vkamp_protocol_test PRIVATE src)
+target_link_libraries(vkamp_protocol_test PRIVATE Qt6::Core)
+add_test(NAME vkamp_protocol_test COMMAND vkamp_protocol_test)
+
+# VkampConnection against a stub amp on loopback -- the transport behaviour
+# the pure-codec test above can't reach: the bypass/voltage safety interlock,
+# the reset hold's exclusive claim on the wire, the command rate limiter,
+# hostname resolution for the UDP telemetry port, and TX-gated telemetry
+# expiry. Isolated settings dir per the CMake contract: LogManager pulls in
+# AppSettings.
+add_executable(vkamp_connection_test
+    tests/vkamp_connection_test.cpp
+    src/core/VkampConnection.cpp
+    src/core/VkampProtocol.cpp
+    ${AETHER_SETTINGS_SOURCES}
+    src/core/LogManager.cpp
+    src/core/AsyncLogWriter.cpp
+)
+target_include_directories(vkamp_connection_test PRIVATE src tests)
+target_link_libraries(vkamp_connection_test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
+add_test(NAME vkamp_connection_test COMMAND vkamp_connection_test)
+set_tests_properties(vkamp_connection_test PROPERTIES TIMEOUT 120)
+
 add_executable(ole_compound_file_test
     tests/ole_compound_file_test.cpp
     src/core/OleCompoundFile.cpp
@@ -5310,6 +5349,16 @@ add_executable(radiomodel_pan_id_mapping_test tests/radiomodel_pan_id_mapping_te
 target_include_directories(radiomodel_pan_id_mapping_test PRIVATE src)
 target_link_libraries(radiomodel_pan_id_mapping_test PRIVATE aethercore Qt6::Core Qt6::Test)
 add_test(NAME radiomodel_pan_id_mapping_test COMMAND radiomodel_pan_id_mapping_test)
+
+# CAT/rigctld retune policy (#4497). The pan recenter is radio-side and the only
+# lever is the autopan=0 flag on "slice tune", which the CAT integration suites
+# cannot observe — reverting the recenter arm leaves all three of them green. So
+# the in-span predicate, the seam's rejections, and the fact that an out-of-span
+# target really reaches tuneAndRecenter are pinned here instead.
+add_executable(cat_tune_policy_test tests/cat_tune_policy_test.cpp)
+target_include_directories(cat_tune_policy_test PRIVATE src)
+target_link_libraries(cat_tune_policy_test PRIVATE aethercore Qt6::Core Qt6::Test)
+add_test(NAME cat_tune_policy_test COMMAND cat_tune_policy_test)
 
 # RadioModel audio-mute model-state contract (#4771).
 add_executable(radiomodel_audio_mute_test tests/radiomodel_audio_mute_test.cpp)
@@ -6312,6 +6361,7 @@ set(AETHER_SETTINGS_CONSUMERS
     mini_pan_widget_test
     log_manager_filter_rules_test
     bandplan_voice_labels_test
+    vkamp_connection_test
 )
 foreach(_settings_consumer IN LISTS AETHER_SETTINGS_CONSUMERS)
     if(TARGET ${_settings_consumer})

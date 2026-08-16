@@ -338,6 +338,7 @@ transmit-gated verbs (refused unless `AETHER_AUTOMATION_ALLOW_TX=1` — see
 | | [`get sync`](#get-sync) | Receive-Sync (Auto Assist) state. |
 | | [`get clock`](#get-clock) | AetherClock time-signal decode state (lock, station, decoded UTC, offset, quality). |
 | | [`get wavestats`](#get-wavestats) | WAVE/strip scope paint-cost counters. |
+| | [`get hostnb`](#get-hostnb) | Host-side noise blanker, read from the backend (HL2). |
 | | `get waveforms` | Installed waveform list, WFP state, local D-STAR service/configuration, delivery health/metrics, and recent waveform status reports. |
 | | [`get dax`](#get-dax) | DAX RX channel-ownership table (holders/streams, #3305). |
 | | [`get txtimer`](#get-txtimer) | Status-bar transmit-timer state (visible/running/holding/fading/elapsed). |
@@ -696,6 +697,7 @@ connects).
 | `meters` | — | `{all:[…]}` — every radio meter with `name`, `value`, `unit`, `low`/`high`, `description`, and **`age_ms`** (staleness): a meter that updates has small `age_ms` and a tracking `value`. |
 | `slices` | — | array of all slice snapshots |
 | `slice` | `active` (default) / `tx` / `<sliceId>` | one slice (sliceId, letter, frequency, mode, filterLow/High, rxAntenna, nb/nr/anf + levels, **squelch/squelchLevel, agcMode/agcThreshold, apf/apfLevel**, **adaptiveFilterEnabled/adaptiveMinLowCut/adaptiveMaxHighCut/adaptiveMinSnr/adaptiveResponse/adaptiveSplatter/adaptiveActive** (SSB adaptive RX filter — `adaptiveActive` is the live AUTO-fit state), **linkedTo** (Slice Link peer id, `-1` when unlinked), txSlice, …) |
+| `hostnb` | — (optional property) | HOST-SIDE noise blanker, read from the DSP: `{receivers:[{ddc,panId,on,level,threshold,requestedOn,requestedLevel,hasChain}]}`. **Distinct from `get slice nb`** — that reports the slice model, which is set the instant the button is clicked and stays true even if the intent never reached the DSP. `on`/`level` here are what the WDSP stage actually has; `requestedOn`/`requestedLevel` are what the backend was asked for, reported alongside so the two can be COMPARED. Errors on a radio that does not declare `hasHostNoiseBlanker` rather than returning an empty success. |
 | `clock` | — | AetherClock snapshot: `state`/`stateName` (NoSignal/Acquiring/Locked), `station`/`stationName` (WWV/WWVH/WWVB), `decodedUtc` (ISO-8601, empty until a decode), `offsetMs` (decoded − host at the second edge; positive = host behind broadcast), `lockQuality` (0–100), `sliceId` (bound slice, −1 when stopped), `gpsTimeAvailable`. Validate applet Start/Tune/station-switch actions and lock progress without pixels. |
 | `pans` | — | array of all panadapter snapshots |
 | `pan` | `active` (default) / `<panId>` e.g. `0x40000000` | one pan (centerMhz, bandwidthMhz, min/maxDbm, rxAntenna, rfGain, fps, `transmitInhibited`, `transmitInhibitReason`) |
@@ -1197,6 +1199,58 @@ scope actually consumed, in milliseconds per wall-clock second.
 - Hidden scopes keep counting appends (the data feed stays live) but never
   paint — `paintsPerSec` 0 with a nonzero `appendsPerSec` is the expected
   hidden-widget signature, not a bug.
+
+### `get hostnb`
+The host-side impulse noise blanker, answered by the **backend** rather than by
+the slice model. Only meaningful on a radio that declares
+`hasHostNoiseBlanker` — today the HL2, whose blanker is WDSP's ANB running on
+this host, ahead of the demodulator, because the radio ships raw IQ and has no
+firmware DSP to switch on.
+
+```json
+→ {"cmd":"get","model":"hostnb"}
+← {"ok":true,"model":"hostnb","hostnb":{"receivers":[
+   {"ddc":0,"panId":"0x40000000","on":true,"level":80,"threshold":7.579,
+    "requestedOn":true,"requestedLevel":80,"hasChain":true}]}}
+```
+
+- **Why it is not `get slice nb`.** That field comes from `SliceModel`, which
+  is set the moment the operator clicks NB — it is true whether or not the
+  intent survived the seam. A backend that ignored `setSliceNoiseBlanker`
+  entirely would still report `nb: true` there and look correct.
+- **`on`/`level` are read from the DSP, not from the request.** They are the
+  state the WDSP stage actually holds, read across the thread boundary from
+  `Hl2RxDsp`. `requestedOn`/`requestedLevel` are what the backend was asked
+  for. Reporting both is the point: the request is stored synchronously while
+  the stage is configured through a queued call, so **a mismatch between the
+  pairs is exactly the "the control moves and nothing happens" failure this
+  verb exists to catch.** A readback that echoed the request would certify its
+  own input.
+- Because the seam is asynchronous, the pairs can differ for a few
+  milliseconds right after a toggle. A driver asserts on them settling, not on
+  the first read — `wait_for` rather than a bare `get`.
+- `hasChain` is false for a receiver between rebuilds (a sample-rate change,
+  a reconnect). There is nothing applied then, so `on` reads false rather than
+  flattering the request.
+- `threshold` is what WDSP got, computed from the **applied** level: the 0..100
+  level runs the opposite way from WDSP's trigger (a multiple of the running
+  average magnitude, so **smaller is more aggressive**). Level 0 → 100,
+  level 50 → 20, level 100 → 4.
+- `on`/`level` are **per receiver**, not radio-wide — unlike the notches. Two
+  panadapters on different bands can legitimately want different settings.
+- Errors on a radio that does not declare the capability, rather than returning
+  an empty success that a test could pass against.
+
+**Proving the blanker end to end:**
+
+```
+slice dsp nb on 80          # drive the control the operator drives
+get hostnb                  # DSP agrees: on=true, level=80, threshold≈7.6,
+                            #   and requestedOn/requestedLevel match it
+get slice active nb         # model agrees too
+slice dsp nb off
+get hostnb                  # on=false everywhere
+```
 
 ### `tune`
 Set a slice's frequency in MHz — the most fundamental control the
@@ -2866,6 +2920,51 @@ non-`-120` `rmsDbfs` means audio is arriving, and `rejectBadFcs` climbing while
 `framesAccepted` does not means the decoder is finding structure and losing it
 to bit errors.
 
+### `civ`
+
+Icom CI-V and RS-BA1 session diagnostics. The read-only actions work in an
+observe-only bridge; raw injection remains TX-gated because arbitrary CI-V can
+key or retune the radio.
+
+**`civ session`** reports the media lease independently of UDP link liveness:
+
+```json
+→ {"cmd":"civ","action":"session"}
+← {"ok":true,"civ":"session","result":{
+   "authenticated":true,"connected":true,"streamGranted":true,
+   "lastRenewalResult":"accepted","lastRenewalResponse":"0x00000000",
+   "lastRenewalSequence":42,"nextInnerSequence":43,
+   "tokenRequestId":"0x8f31",
+   "lastAcceptedAgeMs":8123,"pendingRenewals":0,
+   "acceptedRenewals":14,"reissuedTokens":1,"rejectedRenewals":0,
+   "ignoredAuthReplies":0,"ignoredControlPackets":1,
+   "initialMaintenanceMs":30000,"initialMaintenancePending":false,
+   "renewalCadenceMs":60000,"ackGraceMs":3000,"deadSessionMs":80000}}
+```
+
+Use this first when the panadapter, CI-V controls, and audio stop together while
+the outer UDP packet counters still move. A healthy result has a recent accepted
+token, response `0x00000000`, and no growing pending/rejected count. The health
+verb shows the same essentials under **RS-BA1 session**.
+
+The token-request ID is freshly randomized for each login. On an immediate
+reconnect the radio can answer the initial token request with `0xffffffff` and
+a token that must be used to request the streams; wfview follows the same path.
+`lastRenewalResult:"reissued"` distinguishes that valid reconnect exchange
+from the same nonzero response rejecting an established lease renewal.
+
+The first maintenance renewal is sent at 30 seconds because a live immediate
+reconnect grant stopped its media streams around 45 seconds even though the
+ordinary 60-second renewal was later accepted. After that one early renewal,
+the session returns to the wfview/kappanhang 60-second cadence.
+
+**`civ trace [all]`** reads the bounded decoded CI-V frame trace. The default
+omits routine meter traffic; `all` includes it. **`civ send <hex>`** injects
+command bytes through the active Icom session and is reserved for controlled
+hardware tests. Raw RS-BA1 datagram logging is intentionally off by default and
+should only be enabled briefly when these structured diagnostics are
+insufficient.
+
 ### `controls`
 
 The CI-V control and meter registry, joined against what is actually wired.
@@ -3327,7 +3426,7 @@ The complete registry, generated from the `add(...)` table in `AutomationServer.
 | `audioCapture` | — | audioCapture <start\|stop\|status\|read\|probeNr2Stereo\|probeDspStereo> [args] |
 | `txwaterfall` | — | txwaterfall <on\|off> — show keyed TX in the waterfall |
 | `liveness` | — | liveness — per-class data ages and the producer->consumer meter join |
-| `civ` | — | civ <send <hex>\|trace [all]> — raw CI-V inject and frame trace (Icom; send is TX-gated) |
+| `civ` | — | civ <send <hex>\|trace [all]\|session> — CI-V inject, frame trace, or RS-BA1 lease health (Icom; send is TX-gated) |
 | `controls` | — | controls <map\|meters\|scrub [id\|plane]> — the CI-V control and meter registry joined against what is actually wired, and a linkage check that drives every settable control without moving any of them (Icom) |
 | `radiocert` | — | radiocert <tune\|rx\|tx\|meters\|all> [freqMhz] — radio bring-up diagnostic, in dependency order (tx/meters key) |
 | `key` | — | key <ptt on\|off \| mox> — semantic keying (TX-gated) |

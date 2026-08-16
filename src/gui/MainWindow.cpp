@@ -60,6 +60,7 @@
 #include "SMeterWidget.h"
 #include "TunerApplet.h"
 #include "TxApplet.h"
+#include "VkampApplet.h"
 #include "PhoneCwApplet.h"
 #include "PhoneApplet.h"
 #include "EqApplet.h"
@@ -3259,6 +3260,14 @@ void MainWindow::wireRadioSetupDialogSignals(RadioSetupDialog* dlg, const QStrin
         m_flexControlConnected,
         m_flexControlConnected && m_flexControl ? m_flexControl->portName() : QString());
 #endif
+    // VK3AMP hardware variant changed in Peripherals settings -- rescale
+    // the live forward-power gauge to match (see RadioSetupDialog.h's own
+    // doc comment on vkampVariantChanged).
+    connect(dlg, &RadioSetupDialog::vkampVariantChanged, this, [this]() {
+        const int saved = PeripheralSettings::deviceInt(
+            "Vkamp", "Variant", static_cast<int>(Vkamp::Variant::W2000));
+        m_appletPanel->vkampApplet()->setVariant(static_cast<Vkamp::Variant>(saved));
+    });
     // Toggle of SliceLetterDisplay → repaint every slice-letter widget
     // by re-emitting letterChanged on each slice (#2606).
     connect(dlg, &RadioSetupDialog::sliceLetterDisplayModeChanged,
@@ -3649,6 +3658,14 @@ void MainWindow::closeEvent(QCloseEvent* event)
     // reported on Maestro (#3079).
     m_tgxlConn.disconnect();
     m_pgxlConn.disconnect();
+    // Same reasoning applies to the VK3AMP peripheral -- it has no
+    // radio-disconnect handler to ride at all (design doc's own "zero radio
+    // awareness" -- it never learns the app is closing otherwise), so
+    // without this the amp's TCP control socket is torn down implicitly by
+    // ~VkampConnection() as MainWindow's members are destructed, well after
+    // this function returns, leaving the amp holding a stale half-open
+    // connection instead of seeing a clean close.
+    m_vkampConn.disconnect();
 
     // Same event-loop reasoning: the operating-state capture flush normally
     // rides the queued backend disconnected() signal, which never lands
@@ -6977,6 +6994,10 @@ void MainWindow::applyCapabilitiesToUi(bool connected, const RadioCapabilities& 
     // has not claimed it, disconnected included.
     const bool lmsNoiseFilters = !connected || caps.hasLmsNoiseFilters;
     const bool manualNotch = connected && caps.hasManualNotch;
+    // Same non-permissive rule as manualNotch, and for the mirror of its
+    // reason: this one can only ADD the NB button, so a permissive read would
+    // put NB on screen for radios that claim neither capability.
+    const bool hostNoiseBlanker = connected && caps.hasHostNoiseBlanker;
 
     if (m_panStack) {
         for (auto* applet : m_panStack->allApplets()) {
@@ -6989,6 +7010,7 @@ void MainWindow::applyCapabilitiesToUi(bool connected, const RadioCapabilities& 
                 vfo->setHasRadioSideDsp(radioSideDsp);
                 vfo->setHasLmsNoiseFilters(lmsNoiseFilters);
                 vfo->setHasManualNotch(manualNotch);
+                vfo->setHasHostNoiseBlanker(hostNoiseBlanker);
                 // The VFO's filter grid and the RX applet's are two views of one
                 // radio; only the applet was being told what the hardware has.
                 vfo->setRadioFilterWidths(connected ? caps.rxFilterWidthsHz
