@@ -3277,15 +3277,26 @@ void Hl2Backend::setTxFilter(int lowHz, int highHz)
 // fine enough to set by ear and wide enough to cover the range between a headset
 // boom mic and a built-in laptop microphone.
 //
-// WHAT THIS DOES AND DOES NOT BUY, because the ALC sits right behind it:
-// Hl2TxDsp's ALC normalizes each block's peak to alcTargetPeak, so raising mic
-// gain on already-loud speech is largely given back and PEP barely moves. Where
-// it MATTERS is the ALC's hold threshold (alcHoldBelowDbfs, -45 dBFS): below
-// that the ALC deliberately stops lifting, so a microphone quiet enough to sit
-// under it gets no makeup at all and goes out weak. This slider is what carries
-// such a mic over the threshold — which is exactly what setKeying()'s "raise mic
-// gain" diagnostic tells the operator to do, and until now that advice pointed
-// at a control that did nothing on this backend.
+// WHAT THIS DOES AND DOES NOT BUY depends on which path the audio took, because
+// the ALC sits right behind this and is one-sided for client-leveled audio
+// (#4796).
+//
+// MIC PATH: the ALC normalizes each block's peak to alcTargetPeak, so raising
+// mic gain on already-loud speech is largely given back and PEP barely moves.
+// Where it MATTERS is the ALC's hold threshold (alcHoldBelowDbfs, -45 dBFS):
+// below that the ALC deliberately stops lifting, so a microphone quiet enough to
+// sit under it gets no makeup at all and goes out weak. This slider is what
+// carries such a mic over the threshold — which is exactly what setKeying()'s
+// "raise mic gain" diagnostic tells the operator to do, and until that
+// diagnostic existed the advice pointed at a control that did nothing here.
+//
+// CLIENT-LEVELED PATH (TCI/DAX): nothing is given back. The ALC may only reduce,
+// never lift, so this is a straight proportional attenuator all the way up to
+// alcTargetPeak — TX gain 5 is a real -18 dB on the air. The hold threshold does
+// not apply, and neither does the "raise mic gain" diagnostic, which setKeying()
+// gates off for such transmissions. Past the target the ALC limits rather than
+// letting the modulator's clamp flat-top the signal, so the last stretch of
+// travel buys reduced headroom rather than more power.
 //
 // Level 0 mutes outright rather than resolving to -20 dB. A slider at the bottom
 // of its travel means off, and a mic that is merely 20 dB down would still be
@@ -3489,7 +3500,14 @@ IRadioBackend::HealthSnapshot Hl2Backend::healthSnapshot() const
     // in a section whose thesis is "report what the modulator is running",
     // and a constant that silently stops matching the modulator is the row
     // nobody would think to suspect.
-    put("alcHoldBelowDbfs", QStringLiteral("ALC hold threshold (dBFS)"),
+    //
+    // Labelled as mic-path-only since #4796: the hold governs the ALC's MAKEUP
+    // half, and client-leveled (TCI/DAX) audio has no makeup half to hold — its
+    // gain is ceilinged at unity and released freely. A reader debugging a
+    // WSJT-X level problem against this row would otherwise chase a threshold
+    // that was never in their path.
+    put("alcHoldBelowDbfs",
+        QStringLiteral("ALC hold threshold (dBFS, mic path only)"),
         m_alcHoldBelowDbfs);
     put("alcGainDb", QStringLiteral("ALC gain applied (dB)"),
         std::isnan(m_alcGainDb) ? QVariant() : QVariant(m_alcGainDb));

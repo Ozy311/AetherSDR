@@ -534,11 +534,21 @@ int main(int argc, char** argv)
     // total bypass and on the ceiling; it fails ~21 dB wide on an
     // increase-gated ALC.
     //
-    // One continuous transmission: full scale, then -50 dBFS held for four
+    // It is ALSO the discriminator for the other half of the change — the hold
+    // being made mic-path-only (`!clientLeveled` in processAudioBlock's `held`).
+    // THE QUIET LEG IS DELIBERATELY BELOW alcHoldBelowDbfs: -70 dBFS times this
+    // case's 10x mic gain is -50 dBFS at the ALC's measurement point, under the
+    // -45 dBFS hold threshold. Do not raise it. If the hold is left applying to
+    // client-leveled audio, the gain the loud leg pulled down can never be
+    // released again — the transmission strands at -21.41 dB — and with the
+    // quiet leg anywhere above the threshold this case cannot see that at all.
+    // Both wrong shapes fail here and nowhere else in this file.
+    //
+    // One continuous transmission: full scale, then -70 dBFS held for four
     // release time constants. The tail must match the same level keyed fresh.
     {
         constexpr double kSlider100 = 10.0;
-        const auto fresh = modulate(WdspChannel::Mode::Usb, kTone, 0.00316,
+        const auto fresh = modulate(WdspChannel::Mode::Usb, kTone, 0.000316,
                                     kSlider100, 1.5, nullptr, true, nullptr,
                                     /*clientLeveled=*/true);
 
@@ -565,7 +575,7 @@ int main(int argc, char** argv)
             const int fs = cfg.inputSampleRateHz;
             constexpr std::size_t kChunk = 240;
             std::vector<float> chunk(kChunk);
-            const double levels[]  = {1.0, 0.00316};
+            const double levels[]  = {1.0, 0.000316};
             const int    stageSec[] = {1, 2};
             int sample = 0;
             std::size_t afterLoud = 0;

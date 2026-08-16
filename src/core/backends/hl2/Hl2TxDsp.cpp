@@ -255,7 +255,9 @@ void Hl2TxDsp::processAudioBlock(const std::vector<float>& mono, bool clientLeve
             // there is no makeup gain to chase with, and holding would be
             // actively harmful — it is exactly the mechanism that would strand
             // a client-leveled transmission at the reduction its loudest block
-            // called for.
+            // called for. hl2_txdsp_test's limiter-release case pins this: its
+            // quiet leg sits below alcHoldBelowDbfs on purpose, and dropping
+            // the !clientLeveled term here latches that leg at -21.41 dB.
             const double holdThreshold =
                 std::pow(10.0, m_config.alcHoldBelowDbfs / 20.0);
             const bool held = !reducing && !clientLeveled
