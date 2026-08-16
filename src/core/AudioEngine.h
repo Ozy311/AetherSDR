@@ -179,6 +179,11 @@ public:
     bool hasKiwiSdrAudioSource(const QString& sourceId) const;
     int  txInputSampleRate() const { return m_txInputRate; }
     int  txInputChannelCount() const { return m_txInputChannels; }
+    QAudioFormat::SampleFormat txInputSampleFormat() const { return m_txInputFormat; }
+    // True when the mic hands us the host engine's float mix directly, so the
+    // 48 kHz float voice strip is fed without an Int16 round trip on ingress.
+    bool txInputIsFloat32() const { return m_txInputFormat == QAudioFormat::Float; }
+    int  txInputBytesPerSample() const { return txInputIsFloat32() ? 4 : 2; }
     bool txInputNormalizationTo48k() const;
     bool txRadeResamplingTo24k() const { return m_radeTxNeedsResample; }
     bool rxOutputResamplingActive() const { return m_rxOutputRate.load() != DEFAULT_SAMPLE_RATE; }
@@ -995,10 +1000,12 @@ private:
     bool  m_txInputMono{false};          // TX: legacy convenience mirror of m_txInputChannels == 1
     int   m_txInputChannels{2};          // TX: actual negotiated input channel count
     int   m_txInputRate{24000};          // TX: actual input sample rate
-    // TX: actual negotiated input sample format. Int16 is the first ladder rung
-    // for mic capture, but a Float32-only virtual driver legitimately lands on
-    // the Float fallback (#1090), so the support snapshot must report what was
-    // negotiated rather than assume the common case.
+    // TX: actual negotiated input sample format. Float32 now leads the mic
+    // ladder on Windows and Linux, so the 48 kHz float voice strip is fed
+    // without an Int16 round trip; Int16 remains the next rung and the macOS
+    // default, and a Float32-only virtual driver still lands on Float (#1090).
+    // The support snapshot must report what was negotiated rather than assume
+    // either case.
     QAudioFormat::SampleFormat m_txInputFormat{QAudioFormat::Int16};
     TxMicChannelNormalizer::ChannelMode m_txMicChannelMode{
         TxMicChannelNormalizer::ChannelMode::Auto};

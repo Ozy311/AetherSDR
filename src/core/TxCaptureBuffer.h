@@ -34,13 +34,27 @@ struct BoundedRead {
 // Reads at most kMaxReadBytes from a pull-mode capture device, first skipping
 // any residue past kCatchUpThresholdBytes so the block returned is the newest
 // audio the backend holds rather than the oldest.
-BoundedRead readLatestBoundedInt16(QIODevice* device, int inputChannels);
+// bytesPerSample is the NEGOTIATED device sample width (2 for Int16, 4 for
+// Float32). Frame alignment has to follow it: aligning float32 capture to
+// int16 frames lands a trim mid-sample, which slips the interleave and turns
+// into audio that reads as a DSP fault rather than a framing one.
+BoundedRead readLatestBounded(QIODevice* device, int inputChannels, int bytesPerSample);
+
+inline BoundedRead readLatestBoundedInt16(QIODevice* device, int inputChannels)
+{
+    return readLatestBounded(device, inputChannels, static_cast<int>(sizeof(qint16)));
+}
 
 // Same drop-to-latest policy for push mode, where there is no read to bound:
 // macOS hands over everything the capture callback accumulated since the last
 // poll, so a stalled audio thread produces one oversized block. Trims block in
 // place to its newest frame-aligned kMaxReadBytes and returns the bytes
 // dropped (zero when it already fits).
-qint64 trimToLatestBoundedInt16(QByteArray& block, int inputChannels);
+qint64 trimToLatestBounded(QByteArray& block, int inputChannels, int bytesPerSample);
+
+inline qint64 trimToLatestBoundedInt16(QByteArray& block, int inputChannels)
+{
+    return trimToLatestBounded(block, inputChannels, static_cast<int>(sizeof(qint16)));
+}
 
 } // namespace AetherSDR::TxCaptureBuffer

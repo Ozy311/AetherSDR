@@ -232,6 +232,37 @@ bool TxVoiceProcessor::processCapturedInt16(QByteArray& canonicalInputOutput)
         m_inputMono[static_cast<size_t>(frame)] = input[frame * 2] / 32768.0f;
     }
 
+    return processCapturedMono(inputFrames, canonicalInputOutput);
+}
+
+bool TxVoiceProcessor::processCapturedFloat32(QByteArray& canonicalInputOutput)
+{
+    if (!m_prepared || canonicalInputOutput.isEmpty()) {
+        return false;
+    }
+    const int inputFrames = canonicalInputOutput.size()
+        / (kChannels * static_cast<int>(sizeof(float)));
+    if (inputFrames <= 0) {
+        return false;
+    }
+
+    // No scaling and no rounding: the device already handed us the engine's
+    // float mix. This is the single line the whole change exists for — the
+    // Int16 route reaches the same place via /32768.0f, having first been
+    // quantized on the way out of the host audio engine.
+    const auto* input = reinterpret_cast<const float*>(
+        canonicalInputOutput.constData());
+    m_inputMono.resize(static_cast<size_t>(inputFrames));
+    for (int frame = 0; frame < inputFrames; ++frame) {
+        m_inputMono[static_cast<size_t>(frame)] = input[frame * 2];
+    }
+
+    return processCapturedMono(inputFrames, canonicalInputOutput);
+}
+
+bool TxVoiceProcessor::processCapturedMono(int inputFrames,
+                                           QByteArray& transportInt16Output)
+{
     const float* mono48Samples = m_inputMono.data();
     int frames48 = inputFrames;
     if (m_inputResampler) {
@@ -250,7 +281,7 @@ bool TxVoiceProcessor::processCapturedInt16(QByteArray& canonicalInputOutput)
         work[frame * 2] = mono48Samples[frame];
         work[frame * 2 + 1] = mono48Samples[frame];
     }
-    return processWorkBuffer(frames48, canonicalInputOutput);
+    return processWorkBuffer(frames48, transportInt16Output);
 }
 
 bool TxVoiceProcessor::processFloat48(const float* interleavedStereo,

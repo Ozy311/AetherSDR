@@ -104,6 +104,13 @@ public:
     // that this processor will write on the next callback.
     bool processCapturedInt16(QByteArray& canonicalInputOutput);
 
+    // Float32 sibling of processCapturedInt16(). Input is canonical duplicated
+    // mono stereo float32 at the negotiated device rate (what
+    // TxMicChannelNormalizer::canonicalizeFloat32ToMonoStereo produces); output
+    // is the same transport Int16 the Int16 route returns, so nothing
+    // downstream of this call has to know which one ran.
+    bool processCapturedFloat32(QByteArray& canonicalInputOutput);
+
     // Offline/test entry point for audio already in the canonical DSP domain.
     // Input is interleaved stereo float32 at exactly 48 kHz. The caller owns
     // the returned 24 kHz stereo int16 transport block.
@@ -142,6 +149,9 @@ private:
 
     static constexpr uint64_t kDitherSeed = 0x6A09E667F3BCC909ULL;
 
+    // Shared tail of both capture routes: m_inputMono already holds
+    // inputFrames of mono float at the device rate.
+    bool processCapturedMono(int inputFrames, QByteArray& transportInt16Output);
     void processChannelStrip(QByteArray& float48Stereo) noexcept;
     bool processWorkBuffer(int frames48, QByteArray& transportInt16Output);
     int reconcileEgressFrameCounts(int leftFrames, int rightFrames);
