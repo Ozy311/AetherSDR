@@ -181,9 +181,14 @@ int main()
                 true, 16000, I, ResamplerKind::PreservePan, 2, false});
     }
 
-    // ── Linux mic standard: native 24k, no resample ──────────────────────────
-    runRow({"std mic / Linux / TX -> 24k native", Lin, In, Pan, dev({24000, 48000}, {I}),
-            true, 24000, I, ResamplerKind::None, 2, false});
+    // ── Linux mic: 48k first so the TX voice strip skips its ingress SRC ──────
+    // The 48 kHz DSP domain makes 48k capture the conversion-free choice; a
+    // 24k-capable device must no longer win the first rung.
+    runRow({"std mic / Linux / TX -> 48k native", Lin, In, Pan, dev({24000, 48000}, {I}),
+            true, 48000, I, ResamplerKind::PreservePan, 2, false});
+    // A mic that cannot do 48k still falls back to 24k rather than failing.
+    runRow({"24k-only mic / Linux / TX -> falls back to 24k", Lin, In, Pan, dev({24000}, {I}),
+            true, 24000, I, ResamplerKind::None, 2, true});
 
     // ── Windows mic: probe-at-open, 48k first (#2929) ─────────────────────────
     {
