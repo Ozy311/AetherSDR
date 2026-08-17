@@ -745,6 +745,65 @@ void testNonFiniteSamplesCannotPoisonEgressSrc()
            finiteFloatBuffer(processor.transportFloat32Stereo()));
 }
 
+void testNonFiniteCapturedFloatCannotPoisonIngressSrc()
+{
+    // The egress guard above sits INSIDE processWorkBuffer(), which
+    // processCapturedMono() reaches only after running the ingress resampler —
+    // so it cannot protect that resampler's own state. processCapturedInt16()
+    // structurally cannot produce a NaN; the float entry point can, which makes
+    // this the one asymmetry between the two routes.
+    //
+    // Asserting "the output is finite" here would be decoration: the egress
+    // scrub in processWorkBuffer() already guarantees that whether or not the
+    // ingress is sanitized, so such a check can never fail. What a poisoned
+    // ingress SRC actually costs is the audio of every LATER block, so compare
+    // against a control fed the same block already scrubbed — the exact input
+    // the fix turns the poisoned one into. With the fix the two runs are
+    // bit-identical; without it, the poisoned SRC's state diverges.
+    constexpr int kFrames = 240;   // 10 ms at 24 kHz
+    std::vector<float> poison(static_cast<size_t>(kFrames) * 2, 0.1f);
+    std::vector<float> scrubbed = poison;
+    const auto setFrame = [](std::vector<float>& v, size_t frame, float value) {
+        v[frame * 2] = value;
+        v[frame * 2 + 1] = value;
+    };
+    setFrame(poison, 5, std::nanf(""));
+    setFrame(poison, 20, std::numeric_limits<float>::infinity());
+    setFrame(poison, 40, -std::numeric_limits<float>::infinity());
+    setFrame(scrubbed, 5, 0.0f);
+    setFrame(scrubbed, 20, 0.0f);
+    setFrame(scrubbed, 40, 0.0f);
+
+    const auto toBlock = [](const std::vector<float>& v) {
+        return QByteArray(reinterpret_cast<const char*>(v.data()),
+                          static_cast<int>(v.size() * sizeof(float)));
+    };
+    const std::vector<float> clean(static_cast<size_t>(kFrames) * 2, 0.2f);
+
+    TxVoiceProcessor poisonedRun;
+    TxVoiceProcessor controlRun;
+    poisonedRun.prepare(24000, 16384);   // non-48k, so an ingress SRC exists
+    controlRun.prepare(24000, 16384);
+
+    QByteArray a1 = toBlock(poison);
+    QByteArray b1 = toBlock(scrubbed);
+    const bool processed = poisonedRun.processCapturedFloat32(a1)
+        && controlRun.processCapturedFloat32(b1);
+    report("a non-finite captured float block still processes", processed);
+    report("a poisoned block matches its scrubbed twin exactly",
+           poisonedRun.transportFloat32Stereo()
+               == controlRun.transportFloat32Stereo());
+
+    QByteArray a2 = toBlock(clean);
+    QByteArray b2 = toBlock(clean);
+    poisonedRun.processCapturedFloat32(a2);
+    controlRun.processCapturedFloat32(b2);
+    report("the ingress SRC survives a NaN — the NEXT block is unaffected",
+           poisonedRun.transportFloat32Stereo()
+                   == controlRun.transportFloat32Stereo()
+               && finiteFloatBuffer(poisonedRun.transportFloat32Stereo()));
+}
+
 void testMeasurementCaptureCanBeDisabled()
 {
     TxVoiceProcessor processor;
@@ -1131,6 +1190,7 @@ int main()
     testCapturedFloat32MatchesInt16ForRepresentableAudio();
     testChannelStripRunsAt48k();
     testNonFiniteSamplesCannotPoisonEgressSrc();
+    testNonFiniteCapturedFloatCannotPoisonIngressSrc();
     testMeasurementCaptureCanBeDisabled();
     testBlockBoundaryContinuityAndReset();
     testOversizedCaptureBlockIsProcessed();

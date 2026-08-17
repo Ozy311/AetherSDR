@@ -158,6 +158,36 @@ ResamplerKind resamplerKindFor(int deviceRate,
                                ResamplerPolicy policy,
                                int internalRate = kInternalRate);
 
+// ─── WASAPI silent-open recovery ladder (#2929) ──────────────────────────────
+//
+// A separate failure mode from the ladders above, and the reason it needs its
+// own policy: WASAPI can return a NON-NULL QIODevice that then delivers zero
+// bytes for an open the endpoint cannot actually honour. Nothing fails, so the
+// null-open fallback ladder never sees it; a watchdog notices the silence after
+// ~1.5 s and reopens.
+//
+// That recovery used to walk ONE dimension — channel count — because a
+// mono-only USB PnP mic accepting a stereo open was the only known shape. Once
+// capture leads with Float32, the SAMPLE FORMAT becomes a second way to open
+// successfully and receive nothing: an Int16-capable endpoint that accepts a
+// Float open and returns silence would never reach the format it does support
+// (review of PR #5017).
+//
+// The ladder is ordered so the historical behaviour is preserved exactly: mono
+// is still tried before the format changes, because a mono-only mic is the
+// common case and Int16 is the rarer one.
+struct SilentOpenAttempt {
+    SampleFmt fmt = SampleFmt::Float32;
+    int       channels = 2;   // 1 == forced mono
+};
+
+// The full recovery ladder for an initial open of `initialChannels`. Index 0 is
+// the INITIAL attempt (the open the watchdog is currently observing), so a
+// watchdog arms iff `stage + 1 < size()` and stage N>0 is a recovery reopen.
+// Duplicate rungs are collapsed, so a device already clamped to mono yields a
+// shorter ladder rather than retrying an identical open.
+QList<SilentOpenAttempt> silentOpenLadder(int initialChannels);
+
 // The host OS as a TargetOs (the ONE place the real #ifdef lives). The live
 // wrapper passes this; tests pass an explicit value.
 TargetOs hostTargetOs();

@@ -7273,13 +7273,14 @@ bool AudioEngine::startTxStream(const QHostAddress& radioAddress, quint16 radioP
 {
     if (m_audioSource) return true;  // already running
 
-    // WASAPI silent-open recovery (#2929). If the previous open was driven
-    // by the silence watchdog, m_txForceMonoOnNextOpen is true; consume it
-    // here. A fresh (non-watchdog) start re-enables the one-shot retry budget.
-    const bool isWatchdogRetry = m_txForceMonoOnNextOpen;
-    m_txForceMonoOnNextOpen = false;
+    // WASAPI silent-open recovery (#2929). If the previous open was driven by
+    // the silence watchdog, m_txSilentOpenRetryArmed is true; consume it here
+    // and stay on the ladder. A fresh (non-watchdog) start rewinds to stage 0,
+    // which re-enables the whole recovery budget.
+    const bool isWatchdogRetry = m_txSilentOpenRetryArmed;
+    m_txSilentOpenRetryArmed = false;
     if (!isWatchdogRetry) {
-        m_txSilenceRetryDone = false;
+        m_txSilentOpenStage = 0;
     }
     m_txReceivedAnyBytes = false;
 
@@ -7356,10 +7357,36 @@ bool AudioEngine::startTxStream(const QHostAddress& radioAddress, quint16 radioP
     // construction, so Int16 here makes the engine quantize on the way to us
     // and TxVoiceProcessor widen it straight back. Probe-at-open applies as
     // ever: if Float is refused, the fallback ladder below walks Int16.
-    fmt.setSampleFormat(QAudioFormat::Float);
+    //
+    // Both the format and the channel count come from the silent-open recovery
+    // ladder (#2929), because a non-null/no-data open is invisible to the
+    // null-open ladder below and can happen on EITHER dimension. Stage 0 is the
+    // normal open and records the maximumChannelCount() clamp the rest of the
+    // ladder derives from; the watchdog at the end of this function advances the
+    // stage. That is the whole recovery state machine — see
+    // AudioFormatNegotiator::silentOpenLadder().
     const int maxCh = dev.maximumChannelCount();
-    const int initialCh = (isWatchdogRetry || (maxCh > 0 && maxCh < 2)) ? 1 : 2;
-    fmt.setChannelCount(initialCh);
+    if (!isWatchdogRetry) {
+        m_txSilentOpenInitialChannels = (maxCh > 0 && maxCh < 2) ? 1 : 2;
+    }
+    const QList<AudioFormatNegotiator::SilentOpenAttempt> silentLadder =
+        AudioFormatNegotiator::silentOpenLadder(m_txSilentOpenInitialChannels);
+    const int silentStage =
+        qBound(0, m_txSilentOpenStage, static_cast<int>(silentLadder.size()) - 1);
+    const AudioFormatNegotiator::SilentOpenAttempt silentAttempt =
+        silentLadder.at(silentStage);
+    fmt.setSampleFormat(
+        silentAttempt.fmt == AudioFormatNegotiator::SampleFmt::Int16
+            ? QAudioFormat::Int16
+            : QAudioFormat::Float);
+    fmt.setChannelCount(silentAttempt.channels);
+    if (silentStage > 0) {
+        noteTxFallback(
+            QStringLiteral("silent-open recovery stage %1 -> %2ch %3 (#2929)")
+                .arg(silentStage)
+                .arg(silentAttempt.channels)
+                .arg(AudioSummaryLogger::sampleFormatName(fmt.sampleFormat())));
+    }
     noteTxAttempt(fmt);
     formatFound = true;
 #else
@@ -7427,7 +7454,6 @@ bool AudioEngine::startTxStream(const QHostAddress& radioAddress, quint16 radioP
     m_txInputChannels = fmt.channelCount();
     m_txInputFormat = fmt.sampleFormat();
     m_txInputMono = (m_txInputChannels == 1);
-    m_txInputFormat = fmt.sampleFormat();
     m_radeTxNeedsResample = (m_txInputRate != DEFAULT_SAMPLE_RATE);
 
     // Create the RADE path's polyphase resampler for high-quality conversion.
@@ -7575,9 +7601,8 @@ bool AudioEngine::startTxStream(const QHostAddress& radioAddress, quint16 radioP
                                        .arg(AudioSummaryLogger::sampleFormatName(sampleFormat)));
                     m_txInputRate = rate;
                     m_txInputChannels = ch;
-                    m_txInputFormat = fmt.sampleFormat();
-                    m_txInputMono = (m_txInputChannels == 1);
                     m_txInputFormat = sampleFormat;
+                    m_txInputMono = (m_txInputChannels == 1);
                     m_radeTxNeedsResample = (rate != DEFAULT_SAMPLE_RATE);
                     if (m_radeTxNeedsResample) {
                         m_txResampler = std::make_unique<Resampler>(rate, 24000, 16384);
@@ -7631,21 +7656,42 @@ bool AudioEngine::startTxStream(const QHostAddress& radioAddress, quint16 radioP
     // native mono format but Qt's QAudioSource::start() returns a non-null
     // QIODevice for an unsupported stereo open, then delivers zero bytes.
     // The null-open fallback ladder above never sees this case (start did
-    // not return null). One-shot retry as mono if no bytes arrive in 1.5 s.
-    if (!m_txSilenceRetryDone) {
+    // not return null). Retry along the recovery ladder if no bytes arrive
+    // in 1.5 s, and arm only while the ladder has somewhere left to go.
+    //
+    // Recovery walks channel count AND sample format. Forcing Float-first
+    // capture made the format a way to open successfully and receive nothing,
+    // exactly as an unsupported stereo open already was: an Int16-capable
+    // endpoint that accepts a Float open must still reach Int16 rather than
+    // being left permanently silent (review of PR #5017).
+    //
+    // This deliberately arms regardless of WHICH path opened the device. A mono
+    // Float open that returned null, fell into the fallback ladder above and was
+    // reopened as stereo Float can go silent in precisely the same way, and that
+    // reopen must not be the one that escapes the watchdog.
+    if (silentStage + 1 < silentLadder.size()) {
         const quint64 watchdogGen = m_txLifecycleGeneration;
         const QHostAddress watchdogAddr = m_txAddress;
         const quint16 watchdogPort = m_txPort;
-        QTimer::singleShot(1500, this, [this, watchdogGen, watchdogAddr, watchdogPort]() {
+        const int nextStage = silentStage + 1;
+        const AudioFormatNegotiator::SilentOpenAttempt nextAttempt =
+            silentLadder.at(nextStage);
+        QTimer::singleShot(1500, this,
+                           [this, watchdogGen, watchdogAddr, watchdogPort,
+                            nextStage, nextAttempt]() {
             if (!m_audioSource) return;
             if (watchdogGen != m_txLifecycleGeneration) return;
             if (m_audioSource->state() != QAudio::ActiveState) return;
             if (m_txReceivedAnyBytes) return;
             qCWarning(lcAudio) << "AudioEngine: TX source opened but produced no bytes in 1.5 s — "
-                                  "retrying as mono (likely WASAPI mono-only USB mic, #2929)"
-                               << "rate:" << m_txInputRate << "ch:" << m_txInputChannels;
-            m_txSilenceRetryDone = true;
-            m_txForceMonoOnNextOpen = true;
+                                  "retrying (WASAPI silent open, #2929)"
+                               << "rate:" << m_txInputRate
+                               << "ch:" << m_txInputChannels
+                               << "-> stage" << nextStage
+                               << AudioFormatNegotiator::toString(nextAttempt.fmt)
+                               << nextAttempt.channels << "ch";
+            m_txSilentOpenStage = nextStage;
+            m_txSilentOpenRetryArmed = true;
             QMetaObject::invokeMethod(this, [this, watchdogAddr, watchdogPort]() {
                 stopTxStream();
                 startTxStream(watchdogAddr, watchdogPort);

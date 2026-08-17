@@ -218,14 +218,24 @@ int main()
     runRow({"int16-only mic / Win / TX -> falls back to Int16", Win, In, Pan,
             dev({48000}, {I}),
             true, 48000, I, ResamplerKind::PreservePan, 2, true});
-    // macOS: formatOrder() still leads with Int16 there, but a device that
-    // advertises a preferredRate gets its own preferredFormat as rung 0 — which
-    // for any float-capable mic is Float32. That predates this change; what is
-    // new is that AudioEngine no longer discards the rung. Pinned so the
-    // behaviour is a decision on the record rather than a side effect.
-    runRow({"float-capable mic / Mac / TX -> device preferredFormat leads", Mac, In, Pan,
-            dev({48000}, {F, I}),
-            true, 48000, F, ResamplerKind::PreservePan, 2, false});
+    // macOS keeps Int16 capture, and now says so in ONE place. The preferred
+    // rung exists for the RATE (#2615 / #2930); it used to carry the device's
+    // preferredFormat as well, which for any float-capable CoreAudio mic is
+    // Float32 — so while AudioEngine discarded non-Int16 rungs itself the ladder
+    // said "Float" and the behaviour was "Int16". Once the engine honours the
+    // rung, that contradiction becomes real behaviour, so the rung now leads
+    // with the per-OS format order instead (review of #5017).
+    runRow({"float-capable mic / Mac / TX -> Int16 still leads at the preferred rate",
+            Mac, In, Pan, dev({48000}, {F, I}),
+            true, 48000, I, ResamplerKind::PreservePan, 2, false});
+    // ...and a Float32-ONLY Mac mic still opens Float, via the preferredFormat
+    // catch-all rung. This is the case the old engine-side "skip every non-Int16
+    // rung" filter could not serve at all, so the pure ladder is strictly more
+    // capable than what it replaces — as a fallback (fellBack=true), not as the
+    // macOS default.
+    runRow({"float-only mic / Mac / TX -> Float fallback still opens",
+            Mac, In, Pan, dev({48000}, {F}),
+            true, 48000, F, ResamplerKind::PreservePan, 2, true});
     // A mac mic with no preferred rate falls to formatOrder(), which is
     // Int16-first on macOS.
     {
@@ -250,6 +260,68 @@ int main()
     // ── Total failure: device supports nothing usable ────────────────────────
     runRow({"empty reliable device -> negotiation fails", Lin, Out, Pan, dev({}, {F, I}),
             false, 0, F, ResamplerKind::None, 0, false});
+
+    // ── WASAPI silent-open recovery ladder (#2929, extended by #5017) ─────────
+    // The watchdog's decision is a pure function, so the whole state machine —
+    // "a non-null open that then delivers no bytes, repeated until something
+    // works or the ladder runs out" — is walkable headlessly on every runner,
+    // including the Linux ones that compile none of the Windows engine code.
+    {
+        const auto ladder = silentOpenLadder(2);
+        report("silent-open ladder / stereo device has 4 stages",
+               ladder.size() == 4, "size=" + std::to_string(ladder.size()));
+        report("silent-open stage 0 == the initial Float32 stereo open",
+               ladder.size() > 0 && ladder.at(0).fmt == F && ladder.at(0).channels == 2);
+        report("silent-open stage 1 == Float32 mono (#2929 behaviour preserved)",
+               ladder.size() > 1 && ladder.at(1).fmt == F && ladder.at(1).channels == 1);
+        report("silent-open stage 2 == Int16 stereo (the format dimension #5017 added)",
+               ladder.size() > 2 && ladder.at(2).fmt == I && ladder.at(2).channels == 2);
+        report("silent-open stage 3 == Int16 mono",
+               ladder.size() > 3 && ladder.at(3).fmt == I && ladder.at(3).channels == 1);
+    }
+    {
+        // A device already clamped to mono by maximumChannelCount() must not
+        // burn a stage reopening the identical (format, channels) pair.
+        const auto ladder = silentOpenLadder(1);
+        report("silent-open ladder / mono-clamped device dedups to 2 stages",
+               ladder.size() == 2, "size=" + std::to_string(ladder.size()));
+        report("silent-open mono-clamped stage 0 == Float32 mono",
+               ladder.size() > 0 && ladder.at(0).fmt == F && ladder.at(0).channels == 1);
+        report("silent-open mono-clamped stage 1 == Int16 mono",
+               ladder.size() > 1 && ladder.at(1).fmt == I && ladder.at(1).channels == 1);
+    }
+    {
+        // The state machine itself. Model a WASAPI endpoint that ACCEPTS every
+        // open (non-null QIODevice, so the null-open fallback ladder never runs)
+        // but only ever DELIVERS bytes for one (format, channels) pair. Returns
+        // the stage that finally produces audio, or -1 if the mic stays silent.
+        //
+        // This is the regression: before the fix the recovery was a one-shot
+        // bool, so an Int16-only endpoint stalled at stage 1 with the watchdog
+        // already spent — permanently silent with no error anywhere.
+        const auto walk = [](SampleFmt deliversFmt, int deliversCh,
+                             int initialChannels) -> int {
+            const auto ladder = silentOpenLadder(initialChannels);
+            for (int stage = 0; stage < ladder.size(); ++stage) {
+                const auto& attempt = ladder.at(stage);
+                if (attempt.fmt == deliversFmt && attempt.channels == deliversCh)
+                    return stage;   // bytes arrived; watchdog never fires
+                // No bytes in 1.5 s. The watchdog arms iff a rung remains.
+                if (stage + 1 >= ladder.size()) return -1;
+            }
+            return -1;
+        };
+        report("silent open / Int16-only STEREO mic is reached (the P1 fix)",
+               walk(I, 2, 2) == 2, "stage=" + std::to_string(walk(I, 2, 2)));
+        report("silent open / Int16-only MONO mic is reached",
+               walk(I, 1, 2) == 3, "stage=" + std::to_string(walk(I, 1, 2)));
+        report("silent open / mono-only Float mic still recovers in ONE reopen",
+               walk(F, 1, 2) == 1, "stage=" + std::to_string(walk(F, 1, 2)));
+        report("silent open / mono-clamped Int16-only mic is reached",
+               walk(I, 1, 1) == 1, "stage=" + std::to_string(walk(I, 1, 1)));
+        report("silent open / a mic that never delivers terminates instead of looping",
+               walk(F, 7, 2) == -1);
+    }
 
     // ── resamplerKindFor unit checks (the two stereo strategies stay distinct).
     report("resamplerKindFor 24k Pan == None",

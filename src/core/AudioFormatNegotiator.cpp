@@ -117,6 +117,38 @@ ResamplerKind resamplerKindFor(int deviceRate, ResamplerPolicy policy, int inter
     return ResamplerKind::None;
 }
 
+QList<SilentOpenAttempt> silentOpenLadder(int initialChannels)
+{
+    // Stage 0 is the open already in flight, so it must reproduce exactly what
+    // AudioEngine opened: Float32 at whatever channel count survived the
+    // maximumChannelCount() clamp. Everything after it is recovery.
+    const int initial = (initialChannels <= 1) ? 1 : 2;
+
+    QList<SilentOpenAttempt> ladder;
+    const auto add = [&](SampleFmt fmt, int channels) {
+        for (const auto& a : ladder) {
+            if (a.fmt == fmt && a.channels == channels) return;
+        }
+        ladder.append(SilentOpenAttempt{fmt, channels});
+    };
+
+    // Order matters and is deliberate:
+    //   0. the initial open (Float32, clamped channels)
+    //   1. Float32 mono   — the historical #2929 recovery, unchanged. A
+    //                       mono-only mic is the common cause of a silent open,
+    //                       so this must still be the FIRST thing tried.
+    //   2. Int16 at the initial channel count
+    //   3. Int16 mono
+    // Channel count is exhausted before the format changes, so an endpoint that
+    // is merely mono-only recovers in exactly one reopen as it always did; the
+    // format dimension only costs extra reopens on devices that need it.
+    add(SampleFmt::Float32, initial);
+    add(SampleFmt::Float32, 1);
+    add(SampleFmt::Int16, initial);
+    add(SampleFmt::Int16, 1);
+    return ladder;
+}
+
 QList<FormatCandidate> buildLadder(TargetOs os,
                                    Direction dir,
                                    const DeviceCaps& caps,
@@ -141,13 +173,27 @@ QList<FormatCandidate> buildLadder(TargetOs os,
 
     // macOS / preferred-first inputs: the device's own preferred rate leads the
     // ladder so we never force a 16k-native or BT-HFP mic up to 48k (#2930 /
-    // #2615). preferredFormat is honoured here too.
+    // #2615).
+    //
+    // This rung exists for the RATE. Taking caps.preferredFormat with it would
+    // quietly hand macOS a different FORMAT policy than formatOrder() states,
+    // because CoreAudio inputs report Float as their preferred format — so
+    // every Mac mic advertising a preferred rate would capture Float32 while
+    // formatOrder() below still says macOS leads with Int16. That contradiction
+    // was invisible while AudioEngine discarded every non-Int16 rung itself;
+    // once the engine honours the rung, it decides macOS behaviour (review of
+    // PR #5017). Lead with the per-OS format order instead, and let the
+    // preferredFormat catch-all rung at the bottom keep Float32-only endpoints
+    // working — strictly more capable than the engine-side filter it replaces.
     const bool preferredFirst =
         (dir == Direction::Input && os == TargetOs::MacOS && caps.preferredRate > 0);
     if (preferredFirst) {
-        add(caps.preferredRate, caps.preferredFormat,
+        const QString reason =
             caps.isBluetoothHfp ? QStringLiteral("macOS Bluetooth-HFP native rate (#2615)")
-                                : QStringLiteral("macOS mic preferred rate first (#2930)"));
+                                : QStringLiteral("macOS mic preferred rate first (#2930)");
+        for (SampleFmt fmt : fmts) {
+            add(caps.preferredRate, fmt, reason);
+        }
     }
 
     // Main per-OS rate order × format order.

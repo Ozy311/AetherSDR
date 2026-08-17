@@ -918,12 +918,25 @@ private:
     quint64            m_txLifecycleGeneration{0};
     QElapsedTimer      m_txCaptureHealthClock;
     TxCaptureHealthTracker m_txCaptureHealth;
-    // WASAPI silent-open watchdog (#2929): some USB PnP mics report mono-only
-    // capture but Qt accepts an unsupported stereo open and then delivers no
-    // bytes. The watchdog reopens as mono if no bytes arrive within ~1.5 s.
+    // WASAPI silent-open watchdog (#2929): some endpoints accept an open they
+    // cannot honour — Qt returns a non-null QIODevice that then delivers no
+    // bytes. The watchdog reopens along AudioFormatNegotiator::silentOpenLadder()
+    // if nothing arrives within ~1.5 s.
+    //
+    // The ladder walks channel count AND sample format. One bool could express
+    // "mono retry used up" while mono was the only recovery; it cannot express a
+    // position in a multi-rung ladder, which is why a Float-first capture could
+    // strand an Int16-capable mic (review of PR #5017).
     bool               m_txReceivedAnyBytes{false};
-    bool               m_txForceMonoOnNextOpen{false};
-    bool               m_txSilenceRetryDone{false};
+    // Set by the watchdog, consumed by the next startTxStream(): distinguishes a
+    // recovery reopen (advance the ladder) from a fresh start (reset to stage 0).
+    bool               m_txSilentOpenRetryArmed{false};
+    // Index into silentOpenLadder(m_txSilentOpenInitialChannels). 0 == the
+    // initial, non-recovery open.
+    int                m_txSilentOpenStage{0};
+    // Channel count of the stage-0 open, so the ladder stays stable across
+    // reopens even though fmt.channelCount() changes underneath it.
+    int                m_txSilentOpenInitialChannels{2};
 #ifdef Q_OS_MAC
     std::atomic<bool>  m_allowBluetoothTelephonyOutput{false};
 #endif
@@ -1002,10 +1015,13 @@ private:
     int   m_txInputRate{24000};          // TX: actual input sample rate
     // TX: actual negotiated input sample format. Float32 now leads the mic
     // ladder on Windows and Linux, so the 48 kHz float voice strip is fed
-    // without an Int16 round trip; Int16 remains the next rung and the macOS
-    // default, and a Float32-only virtual driver still lands on Float (#1090).
-    // The support snapshot must report what was negotiated rather than assume
-    // either case.
+    // without an Int16 round trip; Int16 remains the next rung there, and stays
+    // the macOS default — the macOS preferred-RATE rung leads with the per-OS
+    // format order rather than the device's preferred format, so CoreAudio
+    // reporting Float does not silently reorder it (AudioFormatNegotiator.cpp).
+    // A Float32-only virtual driver still lands on Float via the preferredFormat
+    // catch-all rung (#1090). The support snapshot must report what was
+    // negotiated rather than assume either case.
     QAudioFormat::SampleFormat m_txInputFormat{QAudioFormat::Int16};
     TxMicChannelNormalizer::ChannelMode m_txMicChannelMode{
         TxMicChannelNormalizer::ChannelMode::Auto};
