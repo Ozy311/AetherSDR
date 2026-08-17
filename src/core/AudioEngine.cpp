@@ -7291,8 +7291,12 @@ bool AudioEngine::startTxStream(const QHostAddress& radioAddress, quint16 radioP
     m_txMicChannelState.reset();
     m_lastTxMicChannelLog.invalidate();
 
-    // TX mic capture uses Int16 — we convert to float32 after capture.
-    // (makeFormat() returns Float for the RX sink, but mic hardware is Int16.)
+    // Seed values only — every platform branch below overrides format, rate and
+    // channel count from its own ladder, so nothing here survives negotiation.
+    // Int16 is no longer the assumed mic format: Windows and Linux lead with
+    // Float32 so the 48 kHz float voice strip is fed without a round trip, and
+    // macOS keeps Int16 (AudioFormatNegotiator::formatOrder). The negotiated
+    // value is recorded in m_txInputFormat.
     QAudioFormat fmt;
     fmt.setSampleRate(DEFAULT_SAMPLE_RATE);
     fmt.setChannelCount(2);
