@@ -368,7 +368,7 @@ public:
     // panadapter reads raw wire order and therefore agrees with the transmitter
     // by construction, while the demodulator applies the receive conjugation and
     // WDSP's sideband selection independently. That distinction is what a whole
-    // bring-up turned on — see HERMES.md 14.6 and 15.5.
+    // bring-up turned on — see docs/HERMES.md 14.6 and 15.5.
     //
     // Default OFF. Turning it on outside a measurement will be unpleasant.
     virtual void setTxAudioMonitor(bool on) { Q_UNUSED(on); }
@@ -577,10 +577,19 @@ public:
     // compressor and EQ before this point. That is deliberate — the TONE button,
     // the microphone and any future source all reach the air through ONE path,
     // so what the operator monitors is what gets transmitted.
-    virtual void submitTxAudio(const QByteArray& int16Stereo, int sampleRateHz)
+    //
+    // `clientLeveled` is true when the audio came from an external TCI/DAX
+    // client rather than the mic chain or the engine's own generators. The
+    // sender of such audio has already applied its own level control, so a
+    // host-modulating backend must not run makeup gain (ALC) over it (#4796).
+    // No default argument — defaults on virtuals bind statically, and the
+    // override a caller actually reaches would quietly diverge from it.
+    virtual void submitTxAudio(const QByteArray& int16Stereo, int sampleRateHz,
+                               bool clientLeveled)
     {
         Q_UNUSED(int16Stereo);
         Q_UNUSED(sampleRateHz);
+        Q_UNUSED(clientLeveled);
     }
 
     // ---- diagnostics ----

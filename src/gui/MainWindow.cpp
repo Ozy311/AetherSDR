@@ -1682,8 +1682,9 @@ MainWindow::MainWindow(QWidget* parent)
     // agree with what actually goes on the air. A Flex radio modulates on the
     // radio side and ignores this.
     connect(m_audio, &AudioEngine::txFinalMonitorPcmReady,
-            this, [this](const QByteArray& pcm) {
-        m_radioModel.submitTxAudio(pcm, AudioEngine::DEFAULT_SAMPLE_RATE);
+            this, [this](const QByteArray& pcm, bool clientLeveled) {
+        m_radioModel.submitTxAudio(pcm, AudioEngine::DEFAULT_SAMPLE_RATE,
+                                   clientLeveled);
     });
     connect(&m_radioModel.transmitModel(), &TransmitModel::moxChanged,
             m_qsoRecorder, &QsoRecorder::onMoxChanged);
@@ -1981,6 +1982,28 @@ MainWindow::MainWindow(QWidget* parent)
                 m_audio->stopRxStream();
             });
             m_radioModel.removeRxAudioStream();
+        }
+
+        // On Icom this CLICK -- and only a click -- asks the radio to switch
+        // DATA OFF MOD: the network source while on, and whatever the operator
+        // had before we first touched it while off. DATA MOD is deliberately
+        // left alone, since digital-mode routing is independent operator state.
+        //
+        // Guarded on the connection for the same reason the audio calls below
+        // are: with no session the write is dropped anyway, and all a
+        // disconnected click could still do is raise the unverified-model
+        // advisory about a radio that is not there.
+        const RadioCapabilities caps = m_radioModel.backendCapabilities();
+        if (m_radioModel.isConnected()) {
+            m_radioModel.setPcAudioEnabled(on);
+        }
+        if (m_radioModel.isConnected() && caps.takesTxAudioOverSeam
+            && !caps.hostModulates) {
+            if (on && !m_audio->isTxStreaming()) {
+                audioStartTx(m_radioModel.radioAddress(), 4991);
+            } else if (!on && m_audio->isTxStreaming()) {
+                audioStopTx();
+            }
         }
     });
     // Master volume — title bar slider routes through applyMasterVolume()
@@ -2535,6 +2558,15 @@ MainWindow::~MainWindow()
 {
     ShutdownTrace destructorTrace("main_window.destructor_body");
     qApp->removeEventFilter(this);
+
+    // The qApp::focusChanged lambda (MainWindow_Shortcuts.cpp) runs
+    // releaseSliderShortcutLease(), which touches m_shortcutManager and the
+    // m_sliderShortcutLease* members. Those are value members, so they are gone
+    // by the time the QWidget base destructor's deleteChildren() clears focus on
+    // a focused child and re-emits focusChanged. QObject's context auto-disconnect
+    // only fires in ~QObject, which is later still. Sever it here (#4857).
+    QObject::disconnect(qApp, &QApplication::focusChanged, this, nullptr);
+
     preparePanadapterUiForShutdown();
 
     // KiwiSDR profile clients are QObject children, but their disconnect path emits
@@ -8332,7 +8364,7 @@ void MainWindow::refreshCwDecodeState()
     const bool anyOn = rxOn || txOn;
 
     auto* s = activeSlice();
-    const bool isCw = s && (s->mode() == "CW" || s->mode() == "CWL");
+    const bool isCw = s && isCwMode(s->mode());
 
     // Panel is visible only in CW receive mode — the operator's CW
     // text view is anchored to a CW slice's panadapter.  TX-side
@@ -9336,7 +9368,7 @@ void MainWindow::updateKeyerAvailability()
     const bool hasVoiceKeyer = m_radioModel.hasVoiceKeyer();
 
     const bool txIsCw  = hasCwKeyer
-                         && (txMode == "CW" || txMode == "CWL");
+                         && isCwMode(txMode);
     // Voice-mode test through the shared predicate: the ASR block below asks
     // the same question of a DIFFERENT slice, and one list keeps the two from
     // drifting on which modes count (VoiceModeGate.h).

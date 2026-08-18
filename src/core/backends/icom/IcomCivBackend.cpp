@@ -26,6 +26,7 @@ Q_LOGGING_CATEGORY(lcIcomPan, "aether.icom.pan")
 // Link health. Separate from the pan category because the one thing anyone
 // wants to switch on after a hang is the stall warning, and nothing else.
 Q_LOGGING_CATEGORY(lcIcomLink, "aether.icom.link")
+Q_LOGGING_CATEGORY(lcIcomScheduler, "aether.icom.scheduler")
 
 // Which CI-V address we ended up talking to, and why. Its own category because
 // a wrong address is SILENT — the radio simply never answers — so when the
@@ -34,10 +35,27 @@ Q_LOGGING_CATEGORY(lcIcomLink, "aether.icom.link")
 // meter traffic alongside it.
 Q_LOGGING_CATEGORY(lcIcomAddr, "aether.icom.address")
 
+// EVERY CI-V FRAME, both directions, as hex.
+//
+// The in-memory ring behind `civ trace` already recorded these, but it dies
+// with the backend — disconnect and the evidence is gone, which is exactly
+// when you want it. A log category survives the session and can be read after
+// the fact.
+//
+// This is the difference between three indistinguishable failures: the query
+// was never sent, the radio never answered, or the answer arrived and our
+// decode rejected it. Diagnosing a mode-reporting bug without it means
+// inferring from published state, which cannot tell those apart.
+Q_LOGGING_CATEGORY(lcIcomCiv, "aether.icom.civ")
+
 // Metering is examined this often; the MeterPoller decides what is actually
-// due. Deliberately faster than the fastest meter interval so a due meter is
-// not delayed by up to a whole tick.
-constexpr int kMeterTickMs = 40;
+// due. This is ALSO the scheduler's pump, which is why it is 10 ms and not the
+// 40 ms the meter intervals alone would justify: IcomCivScheduler releases at
+// most one frame per kSlotMs (25 ms), and a tick slower than the slot would
+// stretch the effective dispatch interval to tick + slot. At 10 ms the pump
+// costs a `due()` scan and one takeNext() on an empty queue, and the slot —
+// not this timer — remains what paces the wire.
+constexpr int kMeterTickMs = 10;
 // Transport counters publish on a FIXED cadence, not on receive: "nothing
 // arrived this second" is the observation the heartbeat's alarm path waits for,
 // and a backend that emits only on receive can never report its own silence.
@@ -59,6 +77,23 @@ QByteArray floatBytes(const std::vector<float>& v)
 IcomCivBackend::IcomCivBackend(QObject* parent)
     : IRadioBackend(parent), m_model(&unknownModel())
 {
+    // MONOTONIC, NOT WALL CLOCK. Every timestamp in this file measures an
+    // INTERVAL — a dispatch slot, a reply timeout, a poll period, a stall
+    // threshold, a frame's age in the trace — and none is ever reported as an
+    // absolute time. Wall clock was therefore never the right source, and once
+    // every CI-V producer runs through one scheduler it is an actively
+    // dangerous one: a backward step (an NTP correction after suspend/resume
+    // being the realistic case) makes every `now - then` negative at once, so
+    // the dispatch slot never opens, the in-flight read never times out, and
+    // the stall detector never warns. That is a silent, total command-plane
+    // freeze — meters, controls, PTT poll and operator writes alike —
+    // recoverable only by reconnecting. QElapsedTimer cannot step backwards.
+    m_clock.start();
+}
+
+qint64 IcomCivBackend::nowMs() const
+{
+    return m_clock.elapsed();
 }
 
 IcomCivBackend::~IcomCivBackend() = default;
@@ -182,6 +217,7 @@ RadioCapabilities IcomCivBackend::capabilities() const
     // II/III says the client must not re-assert them. This backend READS state
     // at connect; it never pushes a restored one.
     c.clientSettingsDomains = {};
+    c.extensionNamespaces << QStringLiteral("icom");
 
     return c;
 }
@@ -336,11 +372,24 @@ void IcomCivBackend::connectRadio(const RadioConnectRequest& request)
 
 void IcomCivBackend::disconnectRadio()
 {
-    // TUNE temporarily replaces the ordinary RF-power setpoint. Restore it
-    // while the command path still exists; clearing the sentinel first left
-    // the physical radio at tune power after an operator disconnect.
-    if (m_tuning && m_session && m_connected)
-        setTune(false, m_preTuneTxPowerPercent);
+    // Teardown is not allowed to wait for an ordinary outstanding read.  Drop
+    // all background work, fail-safe unkey on every connected disconnect, and
+    // restore the operator's RF-power setpoint if TUNE had borrowed it.  These
+    // are response-free emergency dispatches so both datagrams reach the
+    // session before its sockets close; no state is optimistically adopted.
+    if (m_session && m_connected) {
+        m_civScheduler.reset();
+        queueEmergencyWriteNoReply(cmdSetPtt(m_session->civAddress(), false), "ptt");
+        if (m_tuning && m_preTuneTxPowerPercent >= 0) {
+            queueEmergencyWriteNoReply(
+                cmdSetLevel(m_session->civAddress(), level::kRfPower,
+                            percentToLevelRaw(m_preTuneTxPowerPercent)),
+                "level.rfPower");
+        }
+        const qint64 now = nowMs();
+        pumpCiv(now);
+        pumpCiv(now);
+    }
 
     for (QTimer** t : {&m_meterTimer, &m_linkTimer, &m_civDetectTimer}) {
         if (*t) {
@@ -356,6 +405,11 @@ void IcomCivBackend::disconnectRadio()
     m_rxResampler.reset();
     m_scope.reset();
     m_meters.reset();
+    m_civScheduler.reset();
+    m_schedulerTimeoutsReported = 0;
+    serviceSchedulerWaiters(nowMs());
+    m_pendingPttIntent.reset();
+    m_pendingPttUntilMs = 0;
     // The radio keeps its own DSP state across our sessions and we have not
     // read it back, so "unknown" is the only honest starting point — carrying
     // the last session's belief would suppress the first command that matters.
@@ -369,6 +423,7 @@ void IcomCivBackend::disconnectRadio()
     m_controlsValueKnown.clear();
     m_controlsSeen.clear();
     m_controlsSent.clear();
+    m_controlsScheduled.clear();
     m_framesObserved = 0;
     // The CI-V address resolution is per-session for the same reason: the
     // operator can move to a different radio, or change the address on this one,
@@ -391,9 +446,8 @@ bool IcomCivBackend::isConnected() const { return m_connected; }
 
 // The connect-edge read burst.
 //
-// MOVED HERE VERBATIM from onSessionConnected — not one frame added, removed or
-// reordered inside it. It is a function for two reasons and neither of them is
-// pacing:
+// Kept as one named snapshot so every connect and address retarget enters the
+// same scheduler path:
 //
 //   * a radio whose NAME we do not recognise has to learn its CI-V address from
 //     the broadcast reply before there is a correct address to burst at, and
@@ -402,9 +456,9 @@ bool IcomCivBackend::isConnected() const { return m_connected; }
 //     radio actually reported is the only thing that recovers the session, and
 //     it is cheap because it happens at most once per connect.
 //
-// ⛔ DO NOT re-pace or re-order this. RFC #4983 attributes an unrecoverable CI-V
-// command-plane stall to request bunching and names a burst of this shape as the
-// bunching it exists to fix. That work is the scheduler's, not this function's.
+// The order below expresses startup preference only. IcomCivScheduler paces the
+// frames, coalesces duplicates, and keeps this snapshot from becoming the
+// connect-edge burst called out by RFC #4983.
 void IcomCivBackend::sendConnectReadBurst()
 {
     if (!m_session)
@@ -421,9 +475,13 @@ void IcomCivBackend::sendConnectReadBurst()
     // Still DIRECTED, alongside the broadcast the caller sent: this one confirms
     // that the address we are actually using has something behind it, which the
     // broadcast cannot tell us on a bus with more than one device.
-    m_session->sendCiv(cmdReadId(m_session->civAddress()));
-    m_session->sendCiv(cmdReadFrequency(m_session->civAddress()));
-    m_session->sendCiv(cmdReadMode(m_session->civAddress()));
+    const auto queueStartupRead = [this](const std::vector<std::uint8_t>& frame) {
+        queueRead(frame, semanticKey(frame), IcomCivScheduler::Priority::Maintenance);
+    };
+    queueRead(cmdReadId(m_session->civAddress()), "identity.directed",
+              IcomCivScheduler::Priority::Maintenance);
+    queueStartupRead(cmdReadFrequency(m_session->civAddress()));
+    queueStartupRead(cmdReadMode(m_session->civAddress()));
     // ...AND WHETHER THAT MODE IS A DATA MODE. 04 answers USB for both USB and
     // USB-D, so without this a radio the operator left in USB-D was adopted as
     // plain USB at every connect — the mode indicator, the passband and the
@@ -432,17 +490,20 @@ void IcomCivBackend::sendConnectReadBurst()
     // DATA. 26 00 reports mode, DATA and filter together, so it also corrects
     // the 04 above if the two ever disagree.
     if (m_model->hasVfoModeCommand)
-        m_session->sendCiv(cmdReadVfoMode(m_session->civAddress()));
+        queueStartupRead(cmdReadVfoMode(m_session->civAddress()));
 
-    // ASK WHERE THE RADIO TAKES ITS MODULATION FROM. Not cosmetic: if this is
-    // not WLAN, everything else about transmit can be perfect and the operator
-    // still gets zero output. Diagnosing it from the outside means noticing
-    // that a keyed radio with healthy audio counters makes no power, which is
-    // exactly the dead end this avoids.
-    m_session->sendCiv(cmdReadSetting(m_session->civAddress(),
-                                      setting::kDataOffModInput));
-    m_session->sendCiv(cmdReadSetting(m_session->civAddress(),
-                                      setting::kDataModInput));
+    // ASK WHERE THE RADIO TAKES ITS MODULATION FROM, using this model's own
+    // guide. The SET-menu numbers and enum values differ even between the
+    // IC-705 and IC-7300MK2, so an unknown model is deliberately left unread.
+    if (const auto mod = modulationProfileFor(*m_model)) {
+        for (int item : {mod->dataOffInputItem, mod->dataInputItem,
+                         mod->usbLevelItem, mod->accessoryLevelItem,
+                         mod->networkLevelItem}) {
+            if (item >= 0) {
+                queueStartupRead(cmdReadSetting(m_session->civAddress(), item));
+            }
+        }
+    }
 
     // ADOPT THE RADIO'S OWN LEVELS. Constitution II/III says an Icom is
     // authoritative over its operating state and the client must never push a
@@ -458,7 +519,7 @@ void IcomCivBackend::sendConnectReadBurst()
                                level::kMicGain, level::kCompLevel, level::kMonitor,
                                level::kNrLevel, level::kNbLevel,
                                level::kNotchPos, level::kRf, level::kVoxGain})
-        m_session->sendCiv(cmdReadLevel(m_session->civAddress(), which));
+        queueStartupRead(cmdReadLevel(m_session->civAddress(), which));
 
     // ...and the switches, which have the same problem: the applet toggles all
     // read "off" on a radio that may have NR or the compressor running.
@@ -466,18 +527,19 @@ void IcomCivBackend::sendConnectReadBurst()
                             func::kNoiseBlanker, func::kAutoNotch,
                             func::kManualNotch,
                             func::kCompressor, func::kMonitorFn, func::kVox})
-        m_session->sendCiv(cmdReadFunction(m_session->civAddress(), fn));
+        queueStartupRead(cmdReadFunction(m_session->civAddress(), fn));
 
     // The attenuator is NOT sub-addressed, so it needs its own read rather than
     // a slot in the loop above.
-    m_session->sendCiv(cmdReadAttenuator(m_session->civAddress()));
+    queueStartupRead(cmdReadAttenuator(m_session->civAddress()));
     // RIT / XIT and the antenna tuner. All four were write-only: the controls
     // opened at OUR defaults, so an operator who set RIT on the radio and
     // reconnected saw zero on a rig that was still offset.
     for (std::uint8_t sub : {tuneOffset::kFrequency, tuneOffset::kRitOnOff,
                              tuneOffset::kXitOnOff})
-        m_session->sendCiv(cmdReadTuneOffset(m_session->civAddress(), sub));
-    m_session->sendCiv(cmdReadTuner(m_session->civAddress()));}
+        queueStartupRead(cmdReadTuneOffset(m_session->civAddress(), sub));
+    queueStartupRead(cmdReadTuner(m_session->civAddress()));
+}
 
 // The radio answered 0x19 0x00. Decide whether to believe it, and where that
 // leaves the destination.
@@ -546,8 +608,14 @@ void IcomCivBackend::adoptReportedCivAddress(std::uint8_t reported)
 
             // Back to what the operator or the handshake gave us. That is a
             // choice with a reason behind it; "whoever spoke first" is not.
-            if (m_session && m_session->civAddress() != m_civSeedAddress) {
-                m_session->setCivAddress(m_civSeedAddress);
+            // Discard everything queued for the responder we no longer trust,
+            // including a directed identity read that may already be in flight.
+            // The replacement snapshot below is the only work allowed to
+            // survive the destination change.
+            m_civScheduler.reset();
+            if (m_session) {
+                if (m_session->civAddress() != m_civSeedAddress)
+                    m_session->setCivAddress(m_civSeedAddress);
                 sendConnectReadBurst();
                 // Same destination argument as the retarget path below: the
                 // switches went to a responder we have just walked away from.
@@ -594,6 +662,10 @@ void IcomCivBackend::adoptReportedCivAddress(std::uint8_t reported)
     // and the radio has just said otherwise about itself — which it is entitled
     // to do, because the address is changeable on the radio's own front panel
     // and nothing on our side can know that.
+    // No queued or in-flight command addressed to the old destination can be
+    // reused after this point. In particular, semantic read coalescing must not
+    // mistake an old-address startup read for the replacement snapshot.
+    m_civScheduler.reset();
     qCInfo(lcIcomAddr) << "retargeting CI-V from" << Qt::hex << m_session->civAddress()
                    << "to the address the radio reported:" << reported;
     m_session->setCivAddress(reported);
@@ -772,17 +844,19 @@ void IcomCivBackend::onSessionConnected(const QString& deviceName)
     //
     // SENT ONCE PER CONNECT. Never polled, never retried on a timer — see the
     // bounded wait below and RFC #4983.
-    if (!m_civAddressPinned)
-        m_session->sendCiv(cmdReadId(kBroadcastAddress));
+    if (!m_civAddressPinned) {
+        queueRead(cmdReadId(kBroadcastAddress), "identity.broadcast",
+                  IcomCivScheduler::Priority::Maintenance);
+    }
 
-    // THE COMMON PATH'S TIMING IS UNCHANGED.
+    // THE COMMON PATH STARTS WITHOUT AN AUTO-DETECT WAIT.
     //
     // Whenever the name resolved — both lab radios and all seven models in
-    // kModels — the address is already right, so the burst goes out now exactly
-    // as it did before and the broadcast above rides alongside it as a
+    // kModels — the address is already right, so the snapshot is admitted now
+    // and the broadcast above leads it through the shared scheduler as a
     // correction path. Only a radio whose name we do not recognise waits, and
-    // only for as long as it takes to learn where to send the burst; sending it
-    // to a guessed address first would be twenty frames to nobody.
+    // only for as long as it takes to learn where to send the snapshot; sending
+    // it to a guessed address first would be twenty frames to nobody.
     if (m_civAddressPinned || m_modelByName) {
         sendConnectReadBurst();
     } else {
@@ -802,7 +876,6 @@ void IcomCivBackend::onSessionConnected(const QString& deviceName)
         });
         m_civDetectTimer->start(kCivDetectTimeoutMs);
     }
-
     applyScopeStartup();
 
     // CONNECTED FIRST, then the state.
@@ -919,6 +992,10 @@ void IcomCivBackend::onSessionConnected(const QString& deviceName)
     connect(m_linkTimer, &QTimer::timeout, this, &IcomCivBackend::onLinkTick);
     m_linkTimer->start(kLinkTickMs);
 
+    // Start the first snapshot request now.  Every remaining startup/control/
+    // meter request leaves through the same paced writer on timer ticks.
+    pumpCiv(nowMs());
+
 
 }
 
@@ -926,6 +1003,24 @@ void IcomCivBackend::onSessionDisconnected(const QString& reason)
 {
     const bool was = m_connected;
     m_connected = false;
+
+    // UNKNOWN IS THE ONLY HONEST STARTING POINT for anything the radio told
+    // us, and this object outlives the session: the same backend serves the
+    // next connect, and a radio swap in one process reaches a DIFFERENT radio.
+    // Carrying these over meant Radio Health could print the previous radio's
+    // MOD levels beside the new radio's selection, and a surviving
+    // m_lastModInputWarning silently swallowed a warning that was still true
+    // in the new session because it happened to read the same.
+    m_dataOffModInput = -1;
+    m_dataModInput = -1;
+    m_usbModLevelPercent = -1;
+    m_accessoryModLevelPercent = -1;
+    m_networkModLevelPercent = -1;
+    m_micGainReported = false;
+    m_pcAudioEnabled.reset();
+    m_dataOffModRestore.reset();
+    m_lastModInputWarning.clear();
+
     if (was)
         emit disconnected();
     if (!reason.isEmpty())
@@ -934,80 +1029,56 @@ void IcomCivBackend::onSessionDisconnected(const QString& reason)
 
 void IcomCivBackend::checkModInput()
 {
-    // Report ONCE both answers are in, and only when something is actually
-    // wrong. A warning that fires on a correctly configured radio is one the
-    // operator learns to scroll past (CERTIFICATION.md 1.28).
-    if (m_dataOffModInput < 0 || m_dataModInput < 0)
+    const auto mod = modulationProfileFor(*m_model);
+    if (!mod)
         return;
-
-    // ONLY a radio with Wi-Fi has a WLAN modulation source to select.
-    //
-    // The 1A 05 item numbers (118/119) and the value table below are read from
-    // ONE model's CI-V Reference Guide and sent to every Icom, but each model
-    // numbers its own SET menu and its own enum. On an IC-9700 — LAN only, no
-    // Wi-Fi — both items were set correctly on the front panel and the radio
-    // answered 0x01, which this table calls "USB". So either 118/119 are not
-    // MOD Input on that model, or 0x01 IS its network source; either way
-    // demanding 0x03 asks for a setting the radio cannot offer, and the warning
-    // could never be satisfied by any front-panel action.
-    //
-    // Reported by an operator with the radio in front of them (2026-08-05): set
-    // to LAN on both, warned anyway, every session. A check that fires on a
-    // correctly configured radio is worse than no check — it is the one the
-    // operator learns to scroll past, and it trains them past the real ones.
-    //
-    // Staying silent here loses nothing that was working: the warning was
-    // WRONG on this radio, not merely noisy. Re-enable per model once the
-    // mapping is confirmed against that model's own guide (the same bar
-    // IcomModel::verified sets for the rest of the table).
-    // Note this also silences the check on an UNIDENTIFIED radio, since
-    // kUnknown carries hasWifi=false. That is the right outcome, though for a
-    // second reason: kUnknown is also hasTransmit=false, and a radio this
-    // client will not let key has no modulation path to warn about. Warning
-    // there would be advice about a transmission that cannot happen, decoded
-    // through a value table not known to apply to that model.
-    if (!m_model->hasWifi)
-        return;
-
-    const bool voiceOk = m_dataOffModInput == setting::kModWlan;
-    const bool dataOk  = m_dataModInput == setting::kModWlan;
-    if (voiceOk && dataOk)
-        return;
-
-    auto name = [](int v) -> QString {
-        switch (v) {
-        case setting::kModMic:    return QStringLiteral("MIC");
-        case setting::kModUsb:    return QStringLiteral("USB");
-        case setting::kModMicUsb: return QStringLiteral("MIC+USB");
-        case setting::kModWlan:   return QStringLiteral("WLAN");
-        default:                  return QStringLiteral("unknown(%1)").arg(v);
+    const auto name = [&mod](int value) {
+        for (const ModulationInputChoice& choice : mod->choices) {
+            if (choice.value == value) {
+                return QString::fromUtf8(choice.label.data(),
+                                         static_cast<int>(choice.label.size()));
+            }
         }
+        return QStringLiteral("unknown(%1)").arg(value);
     };
 
     QStringList wrong;
-    if (!voiceOk)
-        wrong << QStringLiteral("voice modes take modulation from %1")
+    // ONLY THE "ON" DIRECTION IS THE CLIENT'S BUSINESS. PC Audio on and
+    // DATA OFF MOD somewhere else is a real fault: the radio keys and puts no
+    // modulation on the air. PC Audio OFF makes no claim at all — the operator
+    // is then free to route voice from MIC, USB, ACC or anything else, and
+    // asserting an expected value there would be the client telling a working
+    // radio it is misconfigured.
+    if (m_pcAudioEnabled && *m_pcAudioEnabled && m_dataOffModInput >= 0
+        && m_dataOffModInput != mod->networkOnlyValue) {
+        wrong << QStringLiteral("PC Audio is on but DATA OFF MOD is %1")
                      .arg(name(m_dataOffModInput));
-    if (!dataOk)
-        wrong << QStringLiteral("data modes take modulation from %1")
+    }
+    if (m_dataMode && m_dataModInput >= 0
+        && m_dataModInput != mod->networkOnlyValue) {
+        wrong << QStringLiteral("DATA MOD is %1, so generated digital audio is ignored")
                      .arg(name(m_dataModInput));
+    }
+    if (wrong.isEmpty()) {
+        m_lastModInputWarning.clear();
+        return;
+    }
 
-    // A configurationWarning, NOT a connectionError: this is advice about a
-    // radio that is otherwise working perfectly. connectionError is fatal to
-    // every consumer — RadioModel starts its reconnect timer on it — so raising
-    // it here dropped the session ~4 ms after the CI-V stream came live and
-    // reconnected into the same check forever. The operator saw a radio that
-    // would not stay connected and a message about a menu setting, with no way
-    // to tell that the message WAS the disconnect.
-    //
-    // It still reaches the operator; it just no longer costs them the session.
-    emit configurationWarning(
-        QStringLiteral("The radio is not listening to network audio — %1. "
-                       "AetherSDR's transmit audio will be ignored and the radio "
-                       "will key at zero output. On the radio: MENU > SET > "
-                       "Connectors > MOD Input > set DATA OFF MOD and DATA MOD "
-                       "to WLAN.")
-            .arg(wrong.join(QStringLiteral(", "))));
+    // NAME THE REMEDY, because this client deliberately will not apply it
+    // unasked: DATA OFF MOD is the radio's to persist (Constitution III), so
+    // the fix has to come from the operator. Without the second sentence the
+    // advisory describes a fault and leaves them to guess that the button they
+    // already have is what corrects it.
+    const QString warning =
+        QStringLiteral("Icom modulation input: %1. Toggle PC Audio off and on to "
+                       "select it, or set it on the radio's front panel "
+                       "(MENU > SET > Connectors > MOD Input). Check Radio Health "
+                       "for the reported source and level.")
+            .arg(wrong.join(QStringLiteral(", ")));
+    if (warning != m_lastModInputWarning) {
+        m_lastModInputWarning = warning;
+        emit configurationWarning(warning);
+    }
 }
 
 void IcomCivBackend::applyScopeStartup()
@@ -1023,8 +1094,10 @@ void IcomCivBackend::applyScopeStartup()
     m_scopeStarted = true;
     // BOTH switches. Enabling only 0x27 0x10 turns the scope on the radio's own
     // screen and sends us nothing — the number-one "black panadapter" cause.
-    m_session->sendCiv(cmdScopeOnOff(m_session->civAddress(), true));
-    m_session->sendCiv(cmdScopeDataOutput(m_session->civAddress(), true));
+    queueWrite(cmdScopeOnOff(m_session->civAddress(), true), "scope.on",
+               IcomCivScheduler::Priority::Maintenance, false);
+    queueWrite(cmdScopeDataOutput(m_session->civAddress(), true), "scope.output",
+               IcomCivScheduler::Priority::Maintenance, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,7 +1128,9 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame)
         return;
     }
 
-    noteControlSeen(frame.cmd, frame.sub, frame.hasSub);
+    const qint64 frameAtMs = nowMs();
+    ++m_framesObserved;
+    m_lastInboundCivAtMs = frameAtMs;
 
     // PAST THE SCOPE RETURN, so sweeps never enter the ring. Re-serialised
     // rather than captured raw because the parsed frame is what we have here,
@@ -1068,20 +1143,39 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame)
         if (frame.hasSub)
             flat.push_back(frame.sub);
         flat.insert(flat.end(), frame.data.begin(), frame.data.end());
-        traceCiv(/*outbound=*/false, flat);
+        const bool routine = frame.cmd == cmd::kMeter
+            || (frame.cmd == cmd::kControl && frame.hasSub && frame.sub == control::kPtt);
+        traceCiv(/*outbound=*/false, flat, routine);
     }
+
+    // A bus echo is not a reply. IcomSession normally removes it, but keep the
+    // scheduler from retiring an identity transaction if an echo reaches this
+    // seam: the echoed 19 00 has the same command shape as the real answer.
+    if (frame.cmd == cmd::kReadId && frame.from == kControllerAddress)
+        return;
+
+    const IcomCivScheduler::Observation observation =
+        m_civScheduler.observe(frame, frameAtMs);
+    // Identity can retarget the CI-V destination. Do not dispatch the next
+    // queued startup frame until adoptReportedCivAddress() has either confirmed
+    // the address or discarded all work aimed at the old one.
+    const bool identityReply = frame.cmd == cmd::kReadId;
+    if (!identityReply)
+        pumpCiv(frameAtMs);
+    const bool isPttState = frame.cmd == cmd::kControl && frame.hasSub
+        && frame.sub == control::kPtt && !frame.data.empty();
+    if (observation == IcomCivScheduler::Observation::Stale && !isPttState) {
+        qCWarning(lcIcomScheduler)
+            << "suppressed stale CI-V completion" << frame.cmd << frame.sub;
+        if (identityReply)
+            pumpCiv(frameAtMs);
+        return;
+    }
+
+    noteControlSeen(frame.cmd, frame.sub, frame.hasSub);
 
     switch (frame.cmd) {
     case cmd::kReadId: {
-        // NOT OUR OWN ECHO. CI-V is a bus and the radio echoes back every frame
-        // it carried, so the first 0x19 0x00 seen after a broadcast is always
-        // the one we sent — measured on both lab radios, echo before reply,
-        // every run. IcomSession's filter drops it and this is the second line
-        // of that defence: the echo carries no data byte, so parseModelIdReply
-        // rejects it too, but "a frame from 0xE0 is ours" is the rule that will
-        // still hold when someone adds a 0x19 form that does carry one.
-        if (frame.from == kControllerAddress)
-            return;
         if (auto addr = parseModelIdReply(frame)) {
             // THE ADDRESS ARRIVES TWICE — in the frame's `from` byte and in the
             // payload — and they agreed on every measured run. Prefer the
@@ -1099,8 +1193,10 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame)
             // AMBIGUOUS BUS: two devices answered with different addresses, so
             // neither one's identity can be trusted either. Leave m_model where
             // the name put it.
-            if (m_civAmbiguous)
+            if (m_civAmbiguous) {
+                pumpCiv(frameAtMs);
                 return;
+            }
             if (const IcomModel* m = modelForCivAddress(*addr)) {
                 m_model = m;
                 // The span limits and scope geometry are model facts, so they
@@ -1142,6 +1238,7 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame)
                                         static_cast<int>(m_model->name.size()));
             emit radioChanged(r);
         }
+        pumpCiv(frameAtMs);
         return;
     }
 
@@ -1195,7 +1292,9 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame)
         // transient false DIGU/DIGL (or false voice mode) until 26 answered.
         // Command 26 is the single authoritative publication for these models.
         if (frame.cmd == cmd::kSetModeTrx && m_session && m_model->hasVfoModeCommand) {
-            m_session->sendCiv(cmdReadVfoMode(m_session->civAddress()));
+            const auto read = cmdReadVfoMode(m_session->civAddress());
+            queueRead(read, semanticKey(read), IcomCivScheduler::Priority::Maintenance);
+            pumpCiv(nowMs());
         } else if (!m_model->hasVfoModeCommand) {
             // This model has no verified DATA readback. An ordinary mode frame
             // can only justify an ordinary mode claim.
@@ -1242,6 +1341,7 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame)
         }
         case level::kMicGain: {
             m_micGainPercent = pct;
+            m_micGainReported = true;
             TransmitDelta t; t.micLevel = pct;
             emit transmitChanged(t);
             return;
@@ -1441,12 +1541,7 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame)
         if (st->filter != 0)
             m_filter = st->filter;
         publishModeState();
-        // NOT a modulation-source re-check. checkModInput() reads DATA OFF MOD
-        // and DATA MOD together and warns if either is wrong, so its answer
-        // does not depend on which of the two the radio is currently in — but
-        // its usefulness did: until this decoded, "DATA MOD is set to WLAN"
-        // could be true while the radio sat in DATA OFF and modulated from the
-        // microphone anyway. That gap closes here, by the mode being right.
+        checkModInput();
         return;
     }
 
@@ -1455,13 +1550,28 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame)
         if (!frame.hasSub || frame.sub != 0x05 || frame.data.size() < 3)
             return;
         const int item = decodeBcdByte(frame.data[0]) * 100 + decodeBcdByte(frame.data[1]);
-        const int value = frame.data[2];
-        if (item == setting::kDataOffModInput)
-            m_dataOffModInput = value;
-        else if (item == setting::kDataModInput)
-            m_dataModInput = value;
-        else
+        const auto mod = modulationProfileFor(*m_model);
+        if (!mod)
             return;
+        if (item == mod->dataOffInputItem) {
+            m_dataOffModInput = frame.data[2];
+        } else if (item == mod->dataInputItem) {
+            m_dataModInput = frame.data[2];
+        } else {
+            const auto raw = decodeLevel(std::span(frame.data).subspan(2));
+            if (!raw)
+                return;
+            const int pct = levelRawToPercent(*raw);
+            if (item == mod->usbLevelItem) {
+                m_usbModLevelPercent = pct;
+            } else if (item == mod->accessoryLevelItem) {
+                m_accessoryModLevelPercent = pct;
+            } else if (item == mod->networkLevelItem) {
+                m_networkModLevelPercent = pct;
+            } else {
+                return;
+            }
+        }
         checkModInput();
         return;
     }
@@ -1490,7 +1600,7 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame)
         if (!raw)
             return;
 
-        m_meters.markAnswered(spec->id, QDateTime::currentMSecsSinceEpoch());
+        m_meters.markAnswered(spec->id, nowMs());
         const double value = meterValue(spec->id, *raw,
                                         s9ReferenceFor(m_frequencyHz),
                                         m_model ? m_model->civAddress : 0xA4);
@@ -1518,6 +1628,46 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame)
     case cmd::kControl: {
         if (frame.hasSub && frame.sub == control::kPtt && !frame.data.empty()) {
             const bool keyed = frame.data[0] != 0;
+            // A read can already be on the wire when the operator keys.  Its
+            // pre-write OFF answer then arrives after the newer ON request.
+            // During the bounded confirmation window only the requested value
+            // may confirm the intent; a contradictory value is diagnostic
+            // history, not a newer state transition.  Once the window expires,
+            // the next fresh radio report wins again (Constitution II).
+            //
+            // ONE DIRECTION ONLY — suppression applies while the pending intent
+            // is KEY ON, never while it is key off.  The two directions are not
+            // symmetric risks.  Swallowing a stale OFF after a key-on request
+            // costs a transmission (the captured FT8 failure).  Swallowing an
+            // unexpected ON after an unkey request costs the operator any
+            // indication that the radio is still on the air — when the unkey was
+            // lost, refused, or overridden at the front panel, that report is
+            // the only thing that says so.  RFC #4983 states the rule directly:
+            // "Explicit PTT OFF and fail-safe unkey are never suppressed by a
+            // key-on transition guard", and Constitution VI wants every path
+            // that can transmit to fail closed.
+            if (m_pendingPttIntent) {
+                const bool confirmsIntent = keyed == *m_pendingPttIntent;
+                const bool guarding = *m_pendingPttIntent
+                    && !confirmsIntent && frameAtMs < m_pendingPttUntilMs;
+                if (guarding) {
+                    qCWarning(lcIcomScheduler)
+                        << "suppressed contradictory PTT state during confirmation"
+                        << "reported" << keyed << "intent" << *m_pendingPttIntent;
+                    return;
+                }
+                if (!confirmsIntent && !*m_pendingPttIntent) {
+                    // The radio says it is keyed while we asked it to stop.
+                    // Publish it and say so — this is the fail-closed path.
+                    qCWarning(lcIcomScheduler)
+                        << "radio reports KEYED after an unkey request; "
+                           "publishing radio truth";
+                }
+                m_pendingPttIntent.reset();
+                m_pendingPttUntilMs = 0;
+            } else if (observation == IcomCivScheduler::Observation::Stale) {
+                return;
+            }
             // ON CHANGE ONLY. This is the answer to a poll that runs four times
             // a second, and it used to republish the transmit state on every
             // one of them — a 4 Hz stream of "the radio is transmitting" events
@@ -1635,8 +1785,12 @@ void IcomCivBackend::onAudio(const std::vector<float>& mono)
     emit sliceAudioFrameReady(sliceId(), stereo24k);
 }
 
-void IcomCivBackend::submitTxAudio(const QByteArray& int16Stereo, int sampleRateHz)
+void IcomCivBackend::submitTxAudio(const QByteArray& int16Stereo, int sampleRateHz,
+                                   bool clientLeveled)
 {
+    // The flag is the HL2's concern: this backend ships PCM to a radio that
+    // runs its own transmit processing, so there is no host ALC here to bypass.
+    Q_UNUSED(clientLeveled);
     if (!m_session || !m_connected)
         return;
 
@@ -1730,34 +1884,245 @@ void IcomCivBackend::submitTxAudio(const QByteArray& int16Stereo, int sampleRate
 // Intents DOWN
 // ---------------------------------------------------------------------------
 
+std::string IcomCivBackend::semanticKey(std::span<const std::uint8_t> frame) const
+{
+    const std::optional<CivFrame> parsed = parseFrame(frame);
+    if (!parsed) {
+        return {};
+    }
+    switch (parsed->cmd) {
+    case cmd::kSetFreqTrx:
+    case cmd::kReadFreq:
+    case cmd::kSetFreq:
+        return "frequency";
+    case cmd::kSetModeTrx:
+    case cmd::kReadMode:
+    case cmd::kSetMode:
+    case cmd::kVfoMode:
+        return "mode";
+    default:
+        break;
+    }
+    if (parsed->cmd == cmd::kControl && parsed->hasSub) {
+        if (parsed->sub == control::kPtt) {
+            return "ptt";
+        }
+        if (parsed->sub == control::kTuner) {
+            return "tuner";
+        }
+    }
+    std::string key = "civ." + std::to_string(parsed->cmd);
+    if (parsed->hasSub) {
+        key += "." + std::to_string(parsed->sub);
+    }
+    // SET-menu reads share 1A 05 but name their leaf in the first two data
+    // bytes.  Keep the leaves separate so one startup query cannot coalesce a
+    // different setting merely because their outer command matches.
+    if (parsed->cmd == cmd::kSetting && parsed->hasSub && parsed->data.size() >= 2) {
+        key += "." + std::to_string(parsed->data[0]);
+        key += "." + std::to_string(parsed->data[1]);
+    }
+    return key;
+}
+
+std::optional<std::vector<std::uint8_t>>
+IcomCivBackend::confirmationFor(std::span<const std::uint8_t> frame) const
+{
+    const std::optional<CivFrame> parsed = parseFrame(frame);
+    if (!parsed || parsed->data.empty()) {
+        return std::nullopt;
+    }
+    const std::uint8_t addr = m_session ? m_session->civAddress() : 0xA4;
+    switch (parsed->cmd) {
+    case cmd::kSetFreq:
+        return cmdReadFrequency(addr);
+    case cmd::kSetMode:
+        return cmdReadMode(addr);
+    case cmd::kVfoMode:
+        return cmdReadVfoMode(addr);
+    case cmd::kLevel:
+    case cmd::kFunction:
+    case cmd::kControl:
+    case cmd::kTuneOffset:
+        if (parsed->hasSub) {
+            return buildFrameSub(addr, parsed->cmd, parsed->sub);
+        }
+        break;
+    case cmd::kSetting:
+        if (parsed->hasSub && parsed->sub == 0x05 && parsed->data.size() >= 3) {
+            const int item = decodeBcdByte(parsed->data[0]) * 100
+                + decodeBcdByte(parsed->data[1]);
+            return cmdReadSetting(addr, item);
+        }
+        break;
+    case cmd::kAttenuator:
+        return cmdReadAttenuator(addr);
+    default:
+        break;
+    }
+    return std::nullopt;
+}
+
+void IcomCivBackend::queueRead(const std::vector<std::uint8_t>& frame,
+                               const std::string& key,
+                               IcomCivScheduler::Priority priority,
+                               qint64 notBeforeMs)
+{
+    const std::optional<CivFrame> parsed = parseFrame(frame);
+    if (!parsed) {
+        return;
+    }
+    IcomCivScheduler::Request request;
+    request.frame = frame;
+    request.key = key.empty() ? semanticKey(frame) : key;
+    request.priority = priority;
+    request.expectsReply = true;
+    request.replyCmd = parsed->cmd;
+    request.replyHasSub = parsed->hasSub;
+    request.replySub = parsed->sub;
+    request.notBeforeMs = notBeforeMs;
+    m_civScheduler.enqueue(std::move(request), nowMs());
+}
+
+void IcomCivBackend::queueWrite(const std::vector<std::uint8_t>& frame,
+                                const std::string& key,
+                                IcomCivScheduler::Priority priority,
+                                bool supersedes)
+{
+    IcomCivScheduler::Request request;
+    request.frame = frame;
+    request.key = key.empty() ? semanticKey(frame) : key;
+    request.priority = priority;
+    request.expectsReply = true;
+    request.acceptsGenericReply = true;
+    request.supersedes = supersedes;
+    m_civScheduler.enqueue(std::move(request), nowMs());
+}
+
+void IcomCivBackend::queueEmergencyWriteNoReply(const std::vector<std::uint8_t>& frame,
+                                                const std::string& key)
+{
+    IcomCivScheduler::Request request;
+    request.frame = frame;
+    request.key = key.empty() ? semanticKey(frame) : key;
+    request.priority = IcomCivScheduler::Priority::Emergency;
+    request.supersedes = true;
+    request.coalesce = false;
+    m_civScheduler.enqueue(std::move(request), nowMs());
+}
+
+void IcomCivBackend::pumpCiv(qint64 nowMs)
+{
+    if (!m_session || !m_connected) {
+        serviceSchedulerWaiters(nowMs);
+        return;
+    }
+    const std::optional<IcomCivScheduler::Dispatch> dispatch = m_civScheduler.takeNext(nowMs);
+    if (!dispatch) {
+        serviceSchedulerWaiters(nowMs);
+        return;
+    }
+    // ROUTINE = the high-rate loops only.  `>= Ptt` also swept up Control and
+    // Maintenance, which hid the startup snapshot and the scope on/output
+    // writes from the default `civ trace` — the frames behind the documented
+    // number-one "black panadapter" cause. Before the scheduler every outbound
+    // frame was shown; keep it that way for everything but the pollers.
+    const bool routineDispatch = dispatch->priority == IcomCivScheduler::Priority::Ptt
+        || dispatch->priority == IcomCivScheduler::Priority::ActiveMeter;
+    traceCiv(/*outbound=*/true, dispatch->frame, routineDispatch);
+    if (dispatch->supersedes) {
+        if (dispatch->frame.size() > 5) {
+            noteControlSent(dispatch->frame[4], dispatch->frame[5], true);
+        } else if (dispatch->frame.size() > 4) {
+            noteControlSent(dispatch->frame[4], 0, false);
+        }
+    }
+    if (dispatch->frame.size() > 4) {
+        QString hex;
+        for (std::size_t i = 4; i + 1 < dispatch->frame.size(); ++i) {
+            hex += QStringLiteral("%1 ").arg(dispatch->frame[i], 2, 16, QLatin1Char('0'));
+        }
+        m_lastOutboundCiv = hex.trimmed();
+        m_lastOutboundCivAtMs = nowMs;
+    }
+    m_session->sendCiv(dispatch->frame);
+    serviceSchedulerWaiters(nowMs);
+}
+
+QVariantMap IcomCivBackend::schedulerDiagnostics() const
+{
+    const IcomCivScheduler::Stats stats = m_civScheduler.stats();
+    QVariantMap out;
+    out.insert(QStringLiteral("idle"), m_civScheduler.idle());
+    out.insert(QStringLiteral("slotMs"), IcomCivScheduler::kSlotMs);
+    out.insert(QStringLiteral("readTimeoutMs"), IcomCivScheduler::kReadTimeoutMs);
+    out.insert(QStringLiteral("queueDepth"), static_cast<qulonglong>(stats.queueDepth));
+    out.insert(QStringLiteral("readInFlight"), stats.readInFlight);
+    out.insert(QStringLiteral("inFlightKey"), QString::fromStdString(stats.inFlightKey));
+    out.insert(QStringLiteral("queued"), static_cast<qulonglong>(stats.queued));
+    out.insert(QStringLiteral("dispatched"), static_cast<qulonglong>(stats.dispatched));
+    out.insert(QStringLiteral("coalesced"), static_cast<qulonglong>(stats.coalesced));
+    out.insert(QStringLiteral("replies"), static_cast<qulonglong>(stats.replies));
+    out.insert(QStringLiteral("staleReplies"), static_cast<qulonglong>(stats.staleReplies));
+    out.insert(QStringLiteral("timeouts"), static_cast<qulonglong>(stats.timeouts));
+    out.insert(QStringLiteral("pendingPttIntent"), m_pendingPttIntent.has_value());
+    if (m_pendingPttIntent) {
+        out.insert(QStringLiteral("pttIntent"), *m_pendingPttIntent);
+        // REMAINING, not a deadline. The backend's clock is monotonic since
+        // construction, so the absolute value means nothing to a consumer;
+        // "how much longer can this suppress a contradictory report" is the
+        // question anyone reads this field to answer.
+        out.insert(QStringLiteral("pttIntentRemainingMs"),
+                   std::max<qint64>(0, m_pendingPttUntilMs - nowMs()));
+    }
+    return out;
+}
+
+void IcomCivBackend::serviceSchedulerWaiters(qint64 nowMs)
+{
+    // COLLECT, ERASE, THEN EMIT. extensionResult is a direct connection, so a
+    // slot that registers another waiter would reallocate the vector under an
+    // iterator we are still holding. Finishing all mutation first makes the
+    // re-entrant case merely queue more work instead of corrupting the walk.
+    std::vector<quint64> ready;
+    for (auto it = m_schedulerWaiters.begin(); it != m_schedulerWaiters.end();) {
+        if (!m_civScheduler.idle() && nowMs < it->deadlineMs) {
+            ++it;
+            continue;
+        }
+        ready.push_back(it->requestId);
+        it = m_schedulerWaiters.erase(it);
+    }
+    if (ready.empty())
+        return;
+    QVariantMap result = schedulerDiagnostics();
+    result.insert(QStringLiteral("timedOut"), !m_civScheduler.idle());
+    for (quint64 requestId : ready)
+        emit extensionResult(requestId, result);
+}
+
 void IcomCivBackend::sendUserCommand(const std::vector<std::uint8_t>& frame)
 {
     if (!m_session || !m_connected)
         return;
-    // Tell the scheduler a real command just went out, so metering yields and
-    // the command is not stuck behind a queue of polls.
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    m_meters.noteUserCommand(now);
-    m_controlPollQuietUntilMs = now + kControlPollQuietMs;
-    traceCiv(/*outbound=*/true, frame);
-    // Record WHICH registry row this frame belongs to. Byte 4 is the command and
-    // byte 5 the subcommand when the row has one — the same layout buildFrame
-    // writes. This is what turns the registry's declared wiring into an observed
-    // fact: `controls.map` can then say a row claims to be sent AND has been.
-    if (frame.size() > 5)
-        noteControlSent(frame[4], frame[5], true);
-    else if (frame.size() > 4)
-        noteControlSent(frame[4], 0, false);
-    // Remembered for the stall warning in onLinkTick: what was the radio last
-    // asked to do before it went quiet.
-    if (frame.size() > 4) {
-        QString hex;
-        for (std::size_t i = 4; i + 1 < frame.size(); ++i)
-            hex += QStringLiteral("%1 ").arg(frame[i], 2, 16, QLatin1Char('0'));
-        m_lastOutboundCiv = hex.trimmed();
-        m_lastOutboundCivAtMs = QDateTime::currentMSecsSinceEpoch();
+    const qint64 now = nowMs();
+    const std::string key = semanticKey(frame);
+    const std::optional<CivFrame> parsed = parseFrame(frame);
+    if (parsed) {
+        noteControlScheduled(parsed->cmd, parsed->sub, parsed->hasSub);
     }
-    m_session->sendCiv(frame);
+    const bool failSafeUnkey = parsed && parsed->cmd == cmd::kControl
+        && parsed->hasSub && parsed->sub == control::kPtt
+        && !parsed->data.empty() && parsed->data.front() == 0;
+    queueWrite(frame, key, failSafeUnkey ? IcomCivScheduler::Priority::Emergency
+                                        : IcomCivScheduler::Priority::Operator);
+    if (const auto confirmation = confirmationFor(frame)) {
+        // Let the radio apply the write before asking.  The confirmation has
+        // the same semantic generation, while any read already on the wire is
+        // older and will be rejected by observe().
+        queueRead(*confirmation, key, IcomCivScheduler::Priority::Operator, now + 60);
+    }
+    pumpCiv(now);
 }
 
 void IcomCivBackend::setSliceFrequency(int, double hz)
@@ -1848,13 +2213,12 @@ void IcomCivBackend::setSliceMode(int, const QString& mode)
         sendUserCommand(cmdSetMode(addr, *civ, m_filter));
     }
     // CONFIRM. Everything above is a request; only the radio's own answer is
-    // state (Constitution II). This read is what corrects the optimistic
-    // publish below if the radio refused or altered the change — a mode with no
-    // DATA variant, a band where the radio will not enter it. One extra frame
-    // on the operator's own mode change, not a new poll.
-    if (m_session && m_model->hasVfoModeCommand)
-        m_session->sendCiv(cmdReadVfoMode(addr));
-
+    // state (Constitution II). sendUserCommand queues that confirmation read
+    // itself, at Operator priority and one generation ahead of any poll already
+    // on the wire, and it is what corrects the optimistic publish below if the
+    // radio refused or altered the change — a mode with no DATA variant, a band
+    // where the radio will not enter it. One extra frame on the operator's own
+    // mode change, not a new poll.
     // PUBLISH THE PASSBAND NOW, from the mode we just commanded.
     //
     // Waiting for the radio to report the mode back is not good enough: the
@@ -1906,12 +2270,11 @@ void IcomCivBackend::setSliceFilter(int, int lowHz, int highHz)
         sendUserCommand(cmdSetVfoMode(addr, m_mode, m_dataMode, filter));
     else
         sendUserCommand(cmdSetMode(addr, m_mode, filter));
-    // A write is intent; the radio's own reply is state. This also corrects the
-    // optimistic passband below if the radio clamps or refuses the requested
-    // slot while CI-V Transceive is disabled.
-    if (m_session && m_model->hasVfoModeCommand)
-        m_session->sendCiv(cmdReadVfoMode(addr));
-
+    // A write is intent; the radio's own reply is state. sendUserCommand
+    // schedules that readback itself now (confirmationFor maps 26 -> read 26,
+    // 06 -> read 04), so it also corrects the optimistic passband below if the
+    // radio clamps or refuses the requested slot while CI-V Transceive is off.
+    //
     // PUBLISH THE PASSBAND NOW, for the same reason setSliceMode does: the
     // radio's mode report only comes back if CI-V Transceive is on, and the
     // operator who just clicked a filter button is owed an immediate answer.
@@ -2129,6 +2492,7 @@ void IcomCivBackend::setSpeechProcessor(bool on, int level)
 void IcomCivBackend::setMicGain(int gainPercent)
 {
     m_micGainPercent = gainPercent;
+    m_micGainReported = true;
     sendUserCommand(cmdSetLevel(m_session ? m_session->civAddress() : 0xA4,
                                 level::kMicGain, percentToLevelRaw(gainPercent)));
 }
@@ -2261,10 +2625,8 @@ void IcomCivBackend::setAtu(bool start)
 {
     sendUserCommand(cmdSetTuner(m_session ? m_session->civAddress() : 0xA4,
                                 start ? 0x02 : 0x00));
-    // Ask what it did. The radio does not report the outcome unprompted, and
-    // "tuning" is a transient the operator needs to see end.
-    if (m_session)
-        m_session->sendCiv(cmdReadTuner(m_session->civAddress()));
+    // sendUserCommand queues a readback after the radio has applied the write;
+    // that confirmation is also what lets the transient tuning state settle.
 }
 
 void IcomCivBackend::setSliceSquelch(int, bool on, int level)
@@ -2303,6 +2665,8 @@ void IcomCivBackend::setKeying(bool key)
 {
     if (!m_model->hasTransmit)
         return;   // an unknown radio is not advertised as transmit-capable
+    m_pendingPttIntent = key;
+    m_pendingPttUntilMs = nowMs() + 1000;
     sendUserCommand(cmdSetPtt(m_session ? m_session->civAddress() : 0xA4, key));
     // PUBLISH IT. Setting m_keyed silently here and leaving the announcement to
     // the poll does not work now that the poll only speaks on change: our own
@@ -2405,10 +2769,17 @@ void IcomCivBackend::noteControlSent(std::uint8_t cmd, std::uint8_t sub, bool ha
     });
 }
 
+void IcomCivBackend::noteControlScheduled(std::uint8_t cmd, std::uint8_t sub,
+                                          bool hasSub)
+{
+    forEachSpecForFrame(cmd, sub, hasSub, [this](const icom::ControlSpec& c) {
+        const QString id = QString::fromUtf8(c.id.data(), static_cast<int>(c.id.size()));
+        m_controlsScheduled.insert(id);
+    });
+}
+
 void IcomCivBackend::noteControlSeen(std::uint8_t cmd, std::uint8_t sub, bool hasSub)
 {
-    ++m_framesObserved;
-    m_lastInboundCivAtMs = QDateTime::currentMSecsSinceEpoch();
     forEachSpecForFrame(cmd, sub, hasSub, [this](const icom::ControlSpec& c) {
         const QString id = QString::fromUtf8(c.id.data(), static_cast<int>(c.id.size()));
         m_controlsSeen.insert(id);
@@ -2506,7 +2877,7 @@ QVariantList IcomCivBackend::meterMap() const
     const auto sv = [](std::string_view v) {
         return QString::fromUtf8(v.data(), static_cast<int>(v.size()));
     };
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const qint64 now = nowMs();
 
     QVariantList out;
     for (const auto& m : meterSpecs()) {
@@ -2577,6 +2948,7 @@ QVariantMap IcomCivBackend::controlScrub(const QString& filter)
 
         ++checked;
         m_controlsSent.remove(id);
+        m_controlsScheduled.remove(id);
 
         // DRIVE IT THROUGH THE SEAM, with a value that changes nothing.
         //
@@ -2586,7 +2958,9 @@ QVariantMap IcomCivBackend::controlScrub(const QString& filter)
         // rearranged.
         const bool driven = scrubDrive(c);
         const bool onWire = m_controlsSent.contains(id);
-        if (onWire)
+        const bool scheduled = m_controlsScheduled.contains(id);
+        const bool linked = onWire || scheduled;
+        if (linked)
             ++reached;
         else if (!driven)
             ++skipped;
@@ -2600,13 +2974,18 @@ QVariantMap IcomCivBackend::controlScrub(const QString& filter)
                           : QStringLiteral("%1").arg(c.cmd, 2, 16, QLatin1Char('0')));
         r.insert(QStringLiteral("seamVerb"), sv(c.seamVerb));
         r.insert(QStringLiteral("reachedWire"), onWire);
+        r.insert(QStringLiteral("reachedScheduler"), scheduled);
         r.insert(QStringLiteral("status"),
-                 onWire    ? QStringLiteral("LINKED")
+                 linked    ? QStringLiteral("LINKED")
                  : !driven ? QStringLiteral("NOT-TESTED")
                            : QStringLiteral("BROKEN"));
         r.insert(QStringLiteral("verdict"),
                  onWire
                      ? QStringLiteral("the seam verb put this command on the wire")
+                 : scheduled
+                     ? QStringLiteral("the seam verb admitted this exact command to the CI-V "
+                                      "scheduler; wait for `civ scheduler` idle with no new "
+                                      "timeout to prove dispatch and readback")
                  : !driven
                      ? QStringLiteral("no safe way to re-assert this without changing "
                                       "the operator's setting — not a fault, not a pass")
@@ -2623,7 +3002,8 @@ QVariantMap IcomCivBackend::controlScrub(const QString& filter)
     out.insert(QStringLiteral("note"),
                QStringLiteral("Each control is re-asserted at its CURRENT value, so nothing "
                               "on the radio moves. PTT, the antenna tuner and power-off are "
-                              "never scrubbed."));
+                              "never scrubbed. Scheduler admission is reported separately "
+                              "from physical dispatch; finish the proof with `civ scheduler`."));
     return out;
 }
 
@@ -2675,6 +3055,22 @@ bool IcomCivBackend::scrubDrive(const icom::ControlSpec& c)
     if (id == QLatin1String("agc"))      { setSliceAgc(slice, m_agcMode, 0); return true; }
     if (id == QLatin1String("tx.power")) { setTxPower(m_txPowerPercent); return true; }
     if (id == QLatin1String("mic.gain")) { setMicGain(m_micGainPercent); return true; }
+    if (id == QLatin1String("mod.input.dataoff")) {
+        // Re-assert the CURRENT selection, which is the whole scrub contract:
+        // the question is whether the intent reaches the wire, not whether the
+        // radio obeys. Falls through to NOT-TESTED on a model with no verified
+        // SET-menu map, or before the readback has landed — there is no safe
+        // value to send in either case, and inventing one would move the
+        // operator's radio.
+        const auto mod = modulationProfileFor(*m_model);
+        if (!mod || m_dataOffModInput < 0)
+            return false;
+        sendUserCommand(cmdWriteSetting(
+            m_session ? m_session->civAddress() : m_model->civAddress,
+            mod->dataOffInputItem,
+            static_cast<std::uint8_t>(m_dataOffModInput)));
+        return true;
+    }
     if (id == QLatin1String("monitor") || id == QLatin1String("monitor.level")) {
         m_monitorSent = -1;
         setTxMonitor(m_monitorOn, m_monitorLevelPercent);
@@ -2798,7 +3194,8 @@ bool IcomCivBackend::scrubDrive(const icom::ControlSpec& c)
     return false;
 }
 
-void IcomCivBackend::traceCiv(bool outbound, std::span<const std::uint8_t> frame)
+void IcomCivBackend::traceCiv(bool outbound, std::span<const std::uint8_t> frame,
+                              bool routine)
 {
     QString hex;
     hex.reserve(static_cast<int>(frame.size()) * 3);
@@ -2807,14 +3204,54 @@ void IcomCivBackend::traceCiv(bool outbound, std::span<const std::uint8_t> frame
             hex += QLatin1Char(' ');
         hex += QStringLiteral("%1").arg(b, 2, 16, QLatin1Char('0'));
     }
-    m_civTrace.push_back({QDateTime::currentMSecsSinceEpoch(), outbound, hex});
+    m_civTrace.push_back({nowMs(), outbound, routine, hex});
     while (m_civTrace.size() > kCivTraceMax)
         m_civTrace.pop_front();
+
+    // Also to the log, which outlives the backend. Decode the command and
+    // subcommand alongside the raw bytes: `1a 06` means nothing to a reader
+    // scanning a log, and the whole point of switching this on is to answer
+    // "did the 1A 06 query go out, and did the radio answer it".
+    if (lcIcomCiv().isDebugEnabled()) {
+        // THE TWO CALL SITES PASS DIFFERENT LAYOUTS, so the command index is a
+        // parameter and not an assumption:
+        //
+        //   TX (sendUserCommand) — the raw wire frame from buildFrame:
+        //       FE FE <to> <from> <cmd> [<sub>] <data…> FD   -> cmd at 4
+        //   RX (onCivFrame)      — re-serialised, envelope deliberately dropped
+        //       <cmd> [<sub>] <data…>                        -> cmd at 0
+        //
+        // Reading index 4 for both printed a payload byte as the command on
+        // every received frame, and silently printed NOTHING for any RX frame
+        // shorter than five bytes — which is most of them. `1a 06 01 01`, the
+        // reply this whole category was added to make visible, is four bytes
+        // and came out undecorated. Exactly the wrong-but-plausible output the
+        // comment below warns about, in the direction that was not checked.
+        const int cmdIdx = outbound ? 4 : 0;
+        QString tag;
+        if (frame.size() > static_cast<std::size_t>(cmdIdx)) {
+            const std::uint8_t c = frame[cmdIdx];
+            tag = QStringLiteral(" cmd=%1").arg(c, 2, 16, QLatin1Char('0'));
+            // Which commands carry a subcommand is a per-command fact, and
+            // commandHasSubcommand() is the single list parseFrame() decodes
+            // by. Keeping a second copy here would let the two drift, and a
+            // drift would label command 0x05's first frequency digit as a
+            // subcommand — the wrong-but-plausible output this tag exists to
+            // avoid.
+            if (frame.size() > static_cast<std::size_t>(cmdIdx) + 1
+                && commandHasSubcommand(c)) {
+                tag += QStringLiteral(" sub=%1")
+                           .arg(frame[cmdIdx + 1], 2, 16, QLatin1Char('0'));
+            }
+        }
+        qCDebug(lcIcomCiv).noquote().nospace()
+            << (outbound ? "TX -> " : "RX <- ") << hex << tag;
+    }
 }
 
 QVariantList IcomCivBackend::civTrace(bool includeRoutine) const
 {
-    const std::int64_t now = QDateTime::currentMSecsSinceEpoch();
+    const std::int64_t now = nowMs();
     QVariantList out;
     for (const auto& e : m_civTrace) {
         // ROUTINE POLL TRAFFIC IS HIDDEN BY DEFAULT, and this was learned by
@@ -2825,11 +3262,8 @@ QVariantList IcomCivBackend::civTrace(bool includeRoutine) const
         //
         // Hidden, not dropped: `civ trace all` still returns them, because
         // "the meters stopped answering" is itself a diagnosis and needs them.
-        if (!includeRoutine && !e.outbound) {
-            if (e.hex.startsWith(QLatin1String("15 "))
-                || e.hex.startsWith(QLatin1String("1c 00"))) {
-                continue;
-            }
+        if (!includeRoutine && e.routine) {
+            continue;
         }
         QVariantMap m;
         // AGE, not a wall clock. The consumer is an agent correlating a reply
@@ -2912,6 +3346,75 @@ void IcomCivBackend::invokeExtension(const QString& ns, const QString& verb, qui
         emit extensionResult(requestId, true);
         return;
     }
+    // TWO VERBS, because there are two different things to say about PC Audio
+    // and only one of them is a command.
+    //
+    // `audio.pc.state` is an OBSERVATION — the client's local audio routing is
+    // on or off. It is what the connect edge publishes, and it exists so
+    // checkModInput() can advise ("PC Audio is on but DATA OFF MOD is MIC")
+    // without the client writing anything. Replaying a client-persisted value
+    // onto DATA OFF MOD at connect is what Constitution III forbids in as many
+    // words: the radio persists that register itself, so a client that pushes
+    // its remembered copy back hands the operator two sources of truth that
+    // fight on every reconnect.
+    //
+    // `audio.pc` is a REQUEST, and only an operator click issues it.
+    // Principle II allows exactly that — a user action is a request to the
+    // radio — which is why the write lives here and nowhere else.
+    if (verb == QLatin1String("audio.pc.state")) {
+        m_pcAudioEnabled = arg.toBool();
+        checkModInput();
+        if (requestId != 0) {
+            emit extensionResult(requestId, true);
+        }
+        return;
+    }
+    if (verb == QLatin1String("audio.pc")) {
+        const auto mod = modulationProfileFor(*m_model);
+        if (!mod) {
+            // Reachable only from an operator click now that the connect edge
+            // publishes state instead of commanding. A warning that answers a
+            // request the radio cannot honour is the useful kind — unlike the
+            // once-per-session one on a correctly configured radio, which is
+            // the one the operator learns to scroll past.
+            const QString reason = QStringLiteral(
+                "PC Audio cannot select DATA OFF MOD for this Icom model: "
+                "its model-specific SET-menu map is not verified.");
+            emit configurationWarning(reason);
+            if (requestId != 0) {
+                emit extensionError(requestId, reason);
+            }
+            return;
+        }
+        const bool on = arg.toBool();
+        // CAPTURE WHATEVER IS ABOUT TO BE OVERWRITTEN, every time rather than
+        // only once. This is the last moment the operator's own selection is
+        // observable — after the write the readback reports what we put there.
+        //
+        // Re-capturing matters because the register is theirs between clicks:
+        // an operator who turns PC Audio off and then moves DATA OFF MOD to ACC
+        // on the front panel must get ACC back next time, not the USB the
+        // session opened on. The link-tick poll keeps m_dataOffModInput current,
+        // so the value here is the radio's, not a stale belief.
+        //
+        // The network source is never captured: putting THAT back on "off"
+        // would leave PC Audio off with the radio still listening to the
+        // network, which is the state where nothing modulates at all.
+        if (m_dataOffModInput >= 0 && m_dataOffModInput != mod->networkOnlyValue) {
+            m_dataOffModRestore = m_dataOffModInput;
+        }
+        m_pcAudioEnabled = on;
+        const auto value = static_cast<std::uint8_t>(
+            on ? mod->networkOnlyValue
+               : m_dataOffModRestore.value_or(mod->micValue));
+        sendUserCommand(cmdWriteSetting(
+            m_session ? m_session->civAddress() : m_model->civAddress,
+            mod->dataOffInputItem, value));
+        if (requestId != 0) {
+            emit extensionResult(requestId, true);
+        }
+        return;
+    }
     if (verb == QLatin1String("controls.map")) {
         emit extensionResult(requestId, controlMap());
         return;
@@ -2922,6 +3425,24 @@ void IcomCivBackend::invokeExtension(const QString& ns, const QString& verb, qui
     }
     if (verb == QLatin1String("controls.scrub")) {
         emit extensionResult(requestId, controlScrub(arg.toString().trimmed()));
+        return;
+    }
+    if (verb == QLatin1String("civ.scheduler.status")) {
+        emit extensionResult(requestId, schedulerDiagnostics());
+        return;
+    }
+    if (verb == QLatin1String("civ.scheduler.wait-idle")) {
+        int timeoutMs = arg.toMap().value(QStringLiteral("timeoutMs"), 3000).toInt();
+        if (!arg.canConvert<QVariantMap>()) {
+            timeoutMs = arg.toInt();
+            if (timeoutMs <= 0) {
+                timeoutMs = 3000;
+            }
+        }
+        timeoutMs = std::clamp(timeoutMs, 0, 10000);
+        m_schedulerWaiters.push_back(
+            SchedulerWaiter{requestId, nowMs() + timeoutMs});
+        serviceSchedulerWaiters(nowMs());
         return;
     }
     if (verb == QLatin1String("civ.trace")) {
@@ -3027,7 +3548,7 @@ void IcomCivBackend::onMeterTick()
 {
     if (!m_session || !m_connected)
         return;
-    const std::int64_t now = QDateTime::currentMSecsSinceEpoch();
+    const std::int64_t now = nowMs();
 
     // ASK THE RADIO WHETHER IT IS TRANSMITTING, rather than assuming we are the
     // only thing that can key it.
@@ -3040,8 +3561,9 @@ void IcomCivBackend::onMeterTick()
     // report, and it is a receive-side blindness rather than a metering bug.
     if (m_session && now - m_lastPttPollMs >= kPttPollMs) {
         m_lastPttPollMs = now;
-        m_session->sendCiv(buildFrameSub(m_session->civAddress(), cmd::kControl,
-                                         control::kPtt));
+        const auto frame = buildFrameSub(m_session->civAddress(), cmd::kControl,
+                                         control::kPtt);
+        queueRead(frame, "ptt", IcomCivScheduler::Priority::Ptt);
     }
 
     for (MeterId id : m_meters.due(now)) {
@@ -3051,8 +3573,10 @@ void IcomCivBackend::onMeterTick()
         // Deliberately NOT sendUserCommand(): a meter poll must not reset the
         // scheduler's own user-command guard, or metering would permanently
         // suppress itself.
-        m_session->sendCiv(cmdReadMeter(m_session->civAddress(), spec->sub));
+        const auto frame = cmdReadMeter(m_session->civAddress(), spec->sub);
+        queueRead(frame, semanticKey(frame), IcomCivScheduler::Priority::ActiveMeter);
     }
+    pumpCiv(now);
 }
 
 void IcomCivBackend::onLinkTick()
@@ -3076,6 +3600,15 @@ void IcomCivBackend::onLinkTick()
     m_link = out;
     emit linkStatsUpdated(out);
 
+    const IcomCivScheduler::Stats schedulerStats = m_civScheduler.stats();
+    if (schedulerStats.timeouts > m_schedulerTimeoutsReported) {
+        qCWarning(lcIcomScheduler)
+            << "CI-V read timeout; scheduler recovered"
+            << "timeouts" << schedulerStats.timeouts
+            << "queueDepth" << schedulerStats.queueDepth;
+        m_schedulerTimeoutsReported = schedulerStats.timeouts;
+    }
+
     // ---- CI-V STALL DETECTION ------------------------------------------
     //
     // The UDP transport can be perfectly healthy while the COMMAND PLANE is
@@ -3092,46 +3625,67 @@ void IcomCivBackend::onLinkTick()
     // warning that repeats every second is one nobody reads.
     if (!m_connected)
         return;
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const qint64 now = nowMs();
 
-    // CI-V transceive does not announce most knob/switch changes. Poll small,
-    // rotating groups so front-panel state reaches the UI without a ten-frame
-    // burst, and yield briefly after operator writes so reconciliation cannot
-    // immediately overtake intent. RFC #4983 centralizes this policy later.
+    // CI-V Transceive is a low-latency hint, not a subscription. Queue bounded
+    // reconciliation groups; the scheduler turns them into one paced stream,
+    // coalesces duplicates and lets an operator command overtake all of them.
     const std::uint8_t addr = m_session->civAddress();
-    if (now >= m_controlPollQuietUntilMs) {
-        switch (m_controlPollPhase++ % 6) {
-        case 0:
-            m_session->sendCiv(cmdReadLevel(addr, level::kRf));
-            if (!m_tuning)
-                m_session->sendCiv(cmdReadLevel(addr, level::kRfPower));
-            m_session->sendCiv(cmdReadLevel(addr, level::kMicGain));
-            break;
-        case 1:
-            for (std::uint8_t which : {level::kMonitor, level::kVoxGain,
-                                       level::kNotchPos})
-                m_session->sendCiv(cmdReadLevel(addr, which));
-            break;
-        case 2:
-            for (std::uint8_t which : {level::kNrLevel, level::kNbLevel})
-                m_session->sendCiv(cmdReadLevel(addr, which));
-            for (std::uint8_t fn : {func::kMonitorFn, func::kVox})
-                m_session->sendCiv(cmdReadFunction(addr, fn));
-            break;
-        case 3:
-            for (std::uint8_t fn : {func::kAutoNotch, func::kManualNotch,
-                                    func::kNoiseReduce, func::kNoiseBlanker})
-                m_session->sendCiv(cmdReadFunction(addr, fn));
-            break;
-        case 4:
-            m_session->sendCiv(cmdReadFunction(addr, func::kPreamp));
-            m_session->sendCiv(cmdReadAttenuator(addr));
-            break;
-        default:
-            m_session->sendCiv(cmdReadTuner(addr));
-            break;
+    const auto queueControl = [this](const std::vector<std::uint8_t>& frame) {
+        queueRead(frame, semanticKey(frame), IcomCivScheduler::Priority::Control);
+    };
+    const int phase = ++m_controlPollPhase;
+
+    // Switches whose front-panel state must feel live. NR/NB were the measured
+    // failure: Transceive sometimes announced them and sometimes did not.
+    for (std::uint8_t fn : {func::kAutoNotch, func::kManualNotch,
+                            func::kNoiseReduce, func::kNoiseBlanker}) {
+        queueControl(cmdReadFunction(addr, fn));
+    }
+
+    if (phase % 2 == 0) {
+        queueControl(cmdReadFrequency(addr));
+        queueControl(m_model->hasVfoModeCommand ? cmdReadVfoMode(addr)
+                                                : cmdReadMode(addr));
+        for (std::uint8_t fn : {func::kMonitorFn, func::kVox}) {
+            queueControl(cmdReadFunction(addr, fn));
         }
     }
+
+    if (phase % 3 == 0) {
+        for (std::uint8_t which : {level::kRf, level::kMicGain, level::kMonitor,
+                                   level::kVoxGain, level::kNotchPos,
+                                   level::kNrLevel, level::kNbLevel}) {
+            queueControl(cmdReadLevel(addr, which));
+        }
+        if (!m_tuning) {
+            queueControl(cmdReadLevel(addr, level::kRfPower));
+        }
+        for (std::uint8_t fn : {func::kPreamp, func::kAgc}) {
+            queueControl(cmdReadFunction(addr, fn));
+        }
+        queueControl(cmdReadAttenuator(addr));
+        queueControl(cmdReadTuner(addr));
+        for (std::uint8_t sub : {tuneOffset::kFrequency, tuneOffset::kRitOnOff,
+                                 tuneOffset::kXitOnOff}) {
+            queueControl(cmdReadTuneOffset(addr, sub));
+        }
+    }
+    // SET-menu changes can originate on the front panel. Refresh slowly: they
+    // are troubleshooting state, not interactive controls, and share this CI-V
+    // stream with tuning and meters.
+    if (phase % 12 == 0) {
+        if (const auto mod = modulationProfileFor(*m_model)) {
+            for (int item : {mod->dataOffInputItem, mod->dataInputItem,
+                             mod->usbLevelItem, mod->accessoryLevelItem,
+                             mod->networkLevelItem}) {
+                if (item >= 0) {
+                    queueControl(cmdReadSetting(addr, item));
+                }
+            }
+        }
+    }
+    pumpCiv(now);
     if (m_lastInboundCivAtMs <= 0) {
         m_lastInboundCivAtMs = now;   // start the clock at the first tick
         return;
@@ -3170,33 +3724,59 @@ IRadioBackend::HealthSnapshot IcomCivBackend::healthSnapshot() const
                     QStringLiteral("0x%1").arg(m_model->civAddress, 2, 16, QLatin1Char('0')));
     h.labels.insert(QStringLiteral("civ"), QStringLiteral("CI-V address"));
 
-    // WHERE THE RADIO TAKES ITS MODULATION FROM. On a health readout because
-    // "keys but makes no power" has no other visible cause: the audio counters
-    // climb, the meters are fresh, and the modulator is listening elsewhere.
-    if (m_dataOffModInput >= 0 || m_dataModInput >= 0) {
-        auto name = [](int v) -> QString {
-            switch (v) {
-            case setting::kModMic:    return QStringLiteral("MIC");
-            case setting::kModUsb:    return QStringLiteral("USB");
-            case setting::kModMicUsb: return QStringLiteral("MIC+USB");
-            case setting::kModWlan:   return QStringLiteral("WLAN");
-            default:                  return QStringLiteral("?");
+    // WHERE THE RADIO TAKES ITS MODULATION FROM, plus the level of every source
+    // named by that selection. These are separate rows because DATA OFF and
+    // DATA are independent radio-owned settings; folding them together hid the
+    // exact half responsible for a keyed-but-silent transmission.
+    if (const auto mod = modulationProfileFor(*m_model)) {
+        const auto describe = [this, &mod](int value) {
+            const ModulationInputChoice* selected = nullptr;
+            for (const ModulationInputChoice& choice : mod->choices) {
+                if (choice.value == value) {
+                    selected = &choice;
+                    break;
+                }
             }
+            if (!selected) {
+                return QStringLiteral("unknown (%1)").arg(value);
+            }
+            QString result = QString::fromUtf8(selected->label.data(),
+                                               static_cast<int>(selected->label.size()));
+            QStringList levels;
+            const auto addLevel = [&levels](const QString& name, int percent) {
+                levels << (percent >= 0 ? QStringLiteral("%1 %2%").arg(name).arg(percent)
+                                        : QStringLiteral("%1 not reported").arg(name));
+            };
+            if ((selected->sources & ModSourceMic) != 0U) {
+                addLevel(QStringLiteral("MIC Gain"),
+                         m_micGainReported ? m_micGainPercent : -1);
+            }
+            if ((selected->sources & ModSourceUsb) != 0U) {
+                addLevel(QStringLiteral("USB MOD Level"), m_usbModLevelPercent);
+            }
+            if ((selected->sources & ModSourceAccessory) != 0U) {
+                addLevel(QStringLiteral("ACC MOD Level"), m_accessoryModLevelPercent);
+            }
+            if ((selected->sources & ModSourceNetwork) != 0U) {
+                const QString name = m_model->hasWifi ? QStringLiteral("WLAN MOD Level")
+                                                       : QStringLiteral("LAN MOD Level");
+                addLevel(name, m_networkModLevelPercent);
+            }
+            if (!levels.isEmpty()) {
+                result += QStringLiteral(" — ") + levels.join(QStringLiteral(", "));
+            }
+            return result;
         };
-        // The verdict, like the warning in checkModInput(), is only meaningful
-        // on a radio that HAS a WLAN source. Elsewhere show the raw values and
-        // pass no judgement: an IC-9700 set correctly to LAN reads back 0x01
-        // here, and appending "NOT WLAN" to that is telling the operator their
-        // working radio is misconfigured.
-        const bool ok = !m_model->hasWifi
-                        || (m_dataOffModInput == setting::kModWlan
-                            && m_dataModInput == setting::kModWlan);
-        h.values.insert(QStringLiteral("modinput"),
-                        QStringLiteral("%1 voice / %2 data%3")
-                            .arg(name(m_dataOffModInput), name(m_dataModInput),
-                                 ok ? QString() : QStringLiteral("  — NOT WLAN")));
-        h.labels.insert(QStringLiteral("modinput"), QStringLiteral("MOD Input"));
-        h.order << QStringLiteral("modinput");
+        if (m_dataOffModInput >= 0) {
+            h.values.insert(QStringLiteral("dataoffmod"), describe(m_dataOffModInput));
+            h.labels.insert(QStringLiteral("dataoffmod"), QStringLiteral("DATA OFF MOD"));
+            h.order << QStringLiteral("dataoffmod");
+        }
+        if (m_dataModInput >= 0) {
+            h.values.insert(QStringLiteral("datamod"), describe(m_dataModInput));
+            h.labels.insert(QStringLiteral("datamod"), QStringLiteral("DATA MOD"));
+            h.order << QStringLiteral("datamod");
+        }
     }
     h.order << QStringLiteral("civ");
 

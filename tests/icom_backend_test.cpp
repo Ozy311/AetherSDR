@@ -18,13 +18,17 @@
 #include "core/backends/icom/IcomCivBackend.h"
 
 #include <QCoreApplication>
+#include <QLoggingCategory>
 #include <QSignalSpy>
+#include <QStringList>
 #include <QTest>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <span>
 #include <cstdio>
+#include <cstring>
 
 using namespace AetherSDR;
 using namespace AetherSDR::icom;
@@ -62,6 +66,34 @@ static bool movesPttOrTuner(const CivFrame& f)
         && !f.data.empty();
 }
 
+// ---------------------------------------------------------------------------
+// CI-V trace capture
+//
+// traceCiv writes the decoded `cmd=`/`sub=` tag ONLY to qCDebug — the in-memory
+// ring stores raw hex. So the tag can only be asserted by capturing log output,
+// which is why this needs a message handler rather than a getter.
+// ---------------------------------------------------------------------------
+static QStringList g_civLines;
+static bool g_capturing = false;
+static QtMessageHandler g_prevHandler = nullptr;
+
+static void civCapture(QtMsgType type, const QMessageLogContext& ctx, const QString& msg)
+{
+    if (g_capturing && ctx.category && std::strcmp(ctx.category, "aether.icom.civ") == 0)
+        g_civLines << msg;
+    if (g_prevHandler)
+        g_prevHandler(type, ctx, msg);
+}
+
+// The most recent captured line beginning with `prefix`, or a null string.
+static QString lastLineStartingWith(const QString& prefix)
+{
+    for (auto it = g_civLines.crbegin(); it != g_civLines.crend(); ++it)
+        if (it->startsWith(prefix))
+            return *it;
+    return {};
+}
+
 int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
@@ -88,6 +120,11 @@ int main(int argc, char** argv)
     SliceDelta lastSliceState;
     TransmitDelta lastTransmitState;
     std::vector<QString> publishedModes;
+    // Every mox edge in order. The PTT confirmation window is defined by which
+    // transitions it lets through, so the SEQUENCE is the assertion, not the
+    // final value — a suppressed-then-corrected state and a never-suppressed
+    // one both end up in the same place.
+    std::vector<bool> moxPublications;
     const auto mergeSlice = [&lastSliceState](const SliceDelta& d) {
         if (d.nr) lastSliceState.nr = d.nr;
         if (d.nb) lastSliceState.nb = d.nb;
@@ -122,6 +159,7 @@ int main(int argc, char** argv)
         if (d.transmitFreq) lastTransmitState.transmitFreq = d.transmitFreq;
         if (d.atuEnabled) lastTransmitState.atuEnabled = d.atuEnabled;
         if (d.atuStatusRaw) lastTransmitState.atuStatusRaw = d.atuStatusRaw;
+        if (d.mox) { lastTransmitState.mox = d.mox; moxPublications.push_back(*d.mox); }
     });
 
     QSignalSpy connectedSpy(&backend, &IRadioBackend::connected);
@@ -142,6 +180,29 @@ int main(int argc, char** argv)
     backend.connectRadio(req);
     check(waitFor([&] { return backend.isConnected(); }), "the backend connects");
     check(connectedSpy.count() == 1, "and emits connected() exactly once");
+
+    quint64 schedulerRequestId = 9000;
+    const auto waitSchedulerIdle = [&](int timeoutMs = 5000) {
+        QSignalSpy replySpy(&backend, &IRadioBackend::extensionResult);
+        const quint64 requestId = ++schedulerRequestId;
+        QVariantMap arg;
+        arg.insert(QStringLiteral("timeoutMs"), timeoutMs);
+        backend.invokeExtension(QStringLiteral("icom"),
+                                QStringLiteral("civ.scheduler.wait-idle"),
+                                requestId, arg);
+        QVariantMap result;
+        const bool replied = waitFor([&] {
+            for (const QList<QVariant>& reply : replySpy) {
+                if (reply.at(0).toULongLong() == requestId) {
+                    result = reply.at(1).toMap();
+                    return true;
+                }
+            }
+            return false;
+        }, timeoutMs + 500);
+        return replied && result.value(QStringLiteral("idle")).toBool()
+            && !result.value(QStringLiteral("timedOut")).toBool();
+    };
 
     // ---- capability -------------------------------------------------------
     const RadioCapabilities caps = backend.capabilities();
@@ -180,6 +241,10 @@ int main(int argc, char** argv)
           "the backend ASKS the radio what it is (0x19 0x00) rather than assuming");
     check(backend.model().name == "IC-705", "and resolves the IC-705");
     check(backend.model().verified, "whose capability numbers are tier-1 verified");
+    check(waitSchedulerIdle(),
+          "connect-time radio-authoritative state converges through the scheduler");
+    const SliceDelta connectedSliceState = lastSliceState;
+    const TransmitDelta connectedTransmitState = lastTransmitState;
 
     // ---- THE AUDIO CONTRACT (TCI / WSJT-X) --------------------------------
     //
@@ -295,7 +360,7 @@ int main(int argc, char** argv)
 
         // UNKEYED: nothing may reach the radio.
         for (int i = 0; i < 20; ++i)
-            backend.submitTxAudio(pcm, 24000);
+            backend.submitTxAudio(pcm, 24000, /*clientLeveled=*/false);
         QTest::qWait(120);
         check(radio.audioPacketsFromClient() == before,
               "transmit audio is DROPPED while unkeyed");
@@ -303,8 +368,13 @@ int main(int argc, char** argv)
         // KEYED: the same buffers must arrive.
         radio.clearCivLog();
         backend.setKeying(true);
+        check(waitFor([&] {
+                  return std::any_of(radio.civCommands().begin(), radio.civCommands().end(),
+                                     movesPttOrTuner);
+              }, 1000),
+              "the keyed intent reaches the radio through the scheduler");
         for (int i = 0; i < 20; ++i)
-            backend.submitTxAudio(pcm, 24000);
+            backend.submitTxAudio(pcm, 24000, /*clientLeveled=*/false);
         QTest::qWait(200);
         const int keyed = radio.audioPacketsFromClient();
         check(keyed > before, "and flows once keyed");
@@ -321,16 +391,144 @@ int main(int argc, char** argv)
               "scrub's 'never keys' check is not vacuous");
 
         backend.setKeying(false);
+        check(waitSchedulerIdle(), "unkey and its radio confirmation complete");
 
         // ...and stops again on unkey, rather than draining a backlog into the
         // next transmission.
         QTest::qWait(120);
         const int afterUnkey = radio.audioPacketsFromClient();
         for (int i = 0; i < 20; ++i)
-            backend.submitTxAudio(pcm, 24000);
+            backend.submitTxAudio(pcm, 24000, /*clientLeveled=*/false);
         QTest::qWait(120);
         check(radio.audioPacketsFromClient() == afterUnkey,
               "and stops again on unkey");
+    }
+
+    // ---- THE PTT CONFIRMATION WINDOW, IN BOTH DIRECTIONS ------------------
+    //
+    // RFC #4983's captured FT8 failure and its explicit counter-rule live here.
+    // The window is what lets a newer key-on intent outlive an older poll's OFF
+    // answer; it must NOT also let a client's unkey request outlive the radio
+    // saying it is still transmitting.
+    {
+        // (a) THE CAPTURED FAILURE. Key on, then have the radio insist it is
+        //     still RX — exactly the pre-key poll answer arriving late. The
+        //     model must not follow it back to RX inside the window.
+        backend.setKeying(false);
+        check(waitSchedulerIdle(), "PTT fixture starts unkeyed");
+        moxPublications.clear();
+
+        radio.m_pttOverride = false;         // radio keeps answering "RX"
+        backend.setKeying(true);
+        QTest::qWait(600);                   // several 250 ms fallback polls
+        check(std::find(moxPublications.begin(), moxPublications.end(), false)
+                  == moxPublications.end(),
+              "a contradictory PTT OFF is suppressed while a key-on intent is "
+              "pending — the captured FT8 transmit-audio teardown");
+        check(lastTransmitState.mox.value_or(false),
+              "and the model stays keyed for the operator who asked to transmit");
+
+        // The window is BOUNDED. Past it the radio wins again (Constitution II),
+        // otherwise a client belief outlives the hardware indefinitely.
+        QTest::qWait(700);
+        check(!lastTransmitState.mox.value_or(true),
+              "once the 1 s window expires the radio's own report wins again");
+
+        // (b) THE DIRECTION THAT MUST NEVER BE SUPPRESSED. Ask to unkey while
+        //     the radio insists it is transmitting — a lost or refused unkey.
+        //     Swallowing this is the one failure that leaves an operator on the
+        //     air with a UI that says otherwise (Constitution VI fails closed).
+        radio.m_pttOverride = true;
+        moxPublications.clear();
+        backend.setKeying(false);
+        check(waitFor([&] {
+                  return std::find(moxPublications.begin(), moxPublications.end(),
+                                   true) != moxPublications.end();
+              }, 1000),
+              "a radio reporting KEYED after an unkey request is published "
+              "immediately, NOT suppressed by the confirmation window");
+        check(lastTransmitState.mox.value_or(false),
+              "and the model shows the transmitter that is actually on the air");
+
+        radio.m_pttOverride.reset();
+        backend.setKeying(false);
+        check(waitFor([&] { return !lastTransmitState.mox.value_or(true); }, 2000),
+              "an obedient radio then unkeys normally");
+        check(waitSchedulerIdle(), "PTT fixture drains");
+    }
+
+    // ── PC AUDIO OWNS DATA OFF MOD ONLY WHEN THE OPERATOR CLICKS ─────────
+    //
+    // DATA OFF MOD (1A 05 item 0118 on this radio) is a SET-menu register the
+    // RADIO persists. Constitution III therefore forbids the client replaying
+    // its own remembered PC Audio flag onto it at connect — and the register is
+    // four-valued while the button is two-valued, so "off" has to put back what
+    // the operator had rather than assuming MIC. Both were live defects; both
+    // are pinned here.
+    //
+    // The fake starts at USB (0x01), the ordinary setting for an operator with
+    // a rig interface on the USB port. A fake already sitting on WLAN could not
+    // tell "PC Audio put it back" from "PC Audio never touched it".
+    {
+        const auto writesTo118 = [](const std::vector<CivFrame>& log) {
+            std::vector<int> values;
+            for (const CivFrame& f : log) {
+                // A WRITE is the three-byte form. The two-byte form is a read,
+                // and counting those would make this assertion vacuous.
+                if (f.cmd == cmd::kSetting && f.hasSub && f.sub == 0x05
+                    && f.data.size() == 3
+                    && decodeBcdByte(f.data[0]) * 100 + decodeBcdByte(f.data[1]) == 118) {
+                    values.push_back(f.data[2]);
+                }
+            }
+            return values;
+        };
+
+        check(waitSchedulerIdle(), "the connect burst drains before the check");
+        check(writesTo118(radio.civCommands()).empty(),
+              "CONNECT WRITES NOTHING to DATA OFF MOD — the client publishes its "
+              "PC Audio state, it does not replay it onto radio-owned config "
+              "(Constitution III)");
+        check(radio.setting(118) == 0x01,
+              "so the operator's own USB selection survives the connect");
+        check(waitFor([&] {
+                  return backend.healthSnapshot().values.contains(
+                      QStringLiteral("dataoffmod"));
+              }, 3000),
+              "and the client ADOPTED it — Radio Health reports DATA OFF MOD");
+
+        // The observation verb is not a back door to the write.
+        radio.clearCivLog();
+        backend.invokeExtension(QStringLiteral("icom"),
+                                QStringLiteral("audio.pc.state"), 0, true);
+        check(waitSchedulerIdle(), "the state publication settles");
+        check(writesTo118(radio.civCommands()).empty(),
+              "publishing PC Audio state writes nothing either");
+
+        // An operator CLICK is a request, and Principle II allows exactly that.
+        radio.clearCivLog();
+        backend.invokeExtension(QStringLiteral("icom"),
+                                QStringLiteral("audio.pc"), 0, true);
+        check(waitSchedulerIdle(), "the PC Audio ON request converges");
+        check(writesTo118(radio.civCommands()) == std::vector<int>{0x03},
+              "a click selects WLAN (0x03) on an IC-705");
+        check(radio.setting(118) == 0x03, "and the radio holds it");
+
+        // ...and OFF restores what was captured, NOT a hardcoded MIC. This is
+        // the assertion that fails if the restore is dropped: MIC is 0x00 and
+        // the operator's USB is 0x01, so the two cannot be confused.
+        radio.clearCivLog();
+        backend.invokeExtension(QStringLiteral("icom"),
+                                QStringLiteral("audio.pc"), 0, false);
+        check(waitSchedulerIdle(), "the PC Audio OFF request converges");
+        check(writesTo118(radio.civCommands()) == std::vector<int>{0x01},
+              "turning PC Audio off puts back the operator's USB (0x01) — NOT a "
+              "hardcoded MIC, which would destroy their rig-interface routing "
+              "with no undo");
+        check(radio.setting(118) == 0x01, "and the radio ends where it started");
+        check(radio.setting(119) == 0x03,
+              "DATA MOD is never written by PC Audio — digital routing stays "
+              "radio-authoritative");
     }
 
     // TUNE temporarily borrows the RF-power register. Releasing it must put
@@ -338,12 +536,12 @@ int main(int argc, char** argv)
     // changes the next voice/data transmission (and the UI follows the poll).
     {
         backend.setTxPower(37);
-        QTest::qWait(80);
+        check(waitSchedulerIdle(), "ordinary RF power converges before TUNE");
         radio.clearCivLog();
         backend.setTune(true, 10);
-        QTest::qWait(80);
+        check(waitSchedulerIdle(), "temporary TUNE drive and tuner state converge");
         backend.setTune(false);
-        QTest::qWait(120);
+        check(waitSchedulerIdle(), "TUNE release and RF-power restore converge");
 
         std::vector<int> powerWrites;
         for (const CivFrame& f : radio.civCommands()) {
@@ -374,8 +572,8 @@ int main(int argc, char** argv)
     // a read that is issued and whose reply is dropped looks exactly like a read
     // that was never issued.
     {
-        const SliceDelta sl = lastSliceState;
-        const TransmitDelta tx = lastTransmitState;
+        const SliceDelta sl = connectedSliceState;
+        const TransmitDelta tx = connectedTransmitState;
 
         check(sl.nr.value_or(false), "NR ON is adopted from the radio");
         check(sl.nb.value_or(false), "NB ON is adopted");
@@ -493,6 +691,7 @@ int main(int argc, char** argv)
         backend.setSliceFilter(0, -1800, 0);   // 1.8 kHz — the SSB ladder's FIL3
         check(waitFor([&] { return radio.m_filter == 3; }),
               "the filter request reaches the radio and selects FIL3");
+        check(waitSchedulerIdle(), "the filter write's compound readback completes");
         check(radio.m_dataOn,
               "and leaves it IN DATA — a filter button must not silently take an "
               "FT8 operator back to microphone audio");
@@ -567,7 +766,7 @@ int main(int argc, char** argv)
         backend.setTxPower(10);
         backend.setMicGain(10);
         backend.setTxMonitor(true, 10);
-        QTest::qWait(150);
+        check(waitSchedulerIdle(), "percentage control writes and confirmations converge");
 
         const auto rawFor = [&](std::uint8_t sub) -> std::optional<int> {
             const auto& frames = radio.civCommands();
@@ -597,17 +796,38 @@ int main(int argc, char** argv)
     // stopped answering after 16 02 02" is a bug report; "the radio stopped
     // answering" is a guess.
     {
+        const auto periodicallyRead = [&](std::uint8_t command, std::uint8_t sub) {
+            return std::any_of(radio.civCommands().begin(), radio.civCommands().end(),
+                               [=](const CivFrame& f) {
+                return f.cmd == command && f.hasSub && f.sub == sub && f.data.empty();
+            });
+        };
+
+        // Prove reconciliation while CI-V is healthy. Once replies stop, each
+        // transaction is deliberately bounded by the timeout; a silence test
+        // should not require the scheduler to spray every register into a
+        // black hole merely to prove those reads exist.
+        radio.clearCivLog();
+        check(waitFor([&] {
+                  return periodicallyRead(cmd::kFunction, func::kNoiseReduce)
+                      && periodicallyRead(cmd::kFunction, func::kNoiseBlanker)
+                      && periodicallyRead(cmd::kLevel, level::kNrLevel)
+                      && periodicallyRead(cmd::kLevel, level::kNbLevel);
+              }, 5000),
+              "NR/NB state and levels are periodically reconciled while CI-V is live");
+
         radio.clearCivLog();
         radio.setCivSilent(true);
 
         // A command the radio receives and does not answer.
         backend.setPanPreamp(QStringLiteral("0"), 1);
-        QTest::qWait(150);
-        check(std::any_of(radio.civCommands().begin(), radio.civCommands().end(),
-                          [](const CivFrame& f) {
-                              return f.cmd == cmd::kFunction && f.hasSub
-                                  && f.sub == func::kPreamp;
-                          }),
+        check(waitFor([&] {
+                  return std::any_of(radio.civCommands().begin(), radio.civCommands().end(),
+                                     [](const CivFrame& f) {
+                                         return f.cmd == cmd::kFunction && f.hasSub
+                                             && f.sub == func::kPreamp;
+                                     });
+              }, 1000),
               "a deaf radio still RECEIVES — the command reached it");
 
         // The detector needs its own threshold to elapse with no inbound frame.
@@ -626,21 +846,6 @@ int main(int argc, char** argv)
         check(backend.isConnected(),
               "and isConnected() still reports true — the lie the detector exists "
               "to break");
-
-        const auto periodicallyRead = [&](std::uint8_t command, std::uint8_t sub) {
-            return std::any_of(radio.civCommands().begin(), radio.civCommands().end(),
-                               [=](const CivFrame& f) {
-                return f.cmd == command && f.hasSub && f.sub == sub && f.data.empty();
-            });
-        };
-        check(periodicallyRead(cmd::kFunction, func::kNoiseReduce),
-              "NR state is periodically read instead of relying on CI-V transceive");
-        check(periodicallyRead(cmd::kFunction, func::kNoiseBlanker),
-              "NB state is periodically read instead of relying on CI-V transceive");
-        check(periodicallyRead(cmd::kLevel, level::kNrLevel),
-              "NR level is periodically reconciled too");
-        check(periodicallyRead(cmd::kLevel, level::kNbLevel),
-              "NB level is periodically reconciled too");
 
         radio.setCivSilent(false);
         QTest::qWait(300);
@@ -756,10 +961,15 @@ int main(int argc, char** argv)
     {
         radio.clearCivLog();
         const QVariantMap res = backend.controlScrub(QString());
-        QTest::qWait(200);
+        check(waitSchedulerIdle(), "the full control scrub drains through the scheduler");
         const auto& sent = radio.civCommands();
 
         check(!res.contains(QStringLiteral("error")), "the scrub runs on a live session");
+        check(res.value(QStringLiteral("broken")).toInt() == 0,
+              "scheduler admission keeps the synchronous scrub from falsely "
+              "reporting queued controls as broken");
+        check(res.value(QStringLiteral("linked")).toInt() > 0,
+              "the scrub reports controls admitted to the scheduler as linked");
 
         // 1. THE MIRROR MUST HOLD THE RADIO'S VALUE, NOT OUR DEFAULT.
         //
@@ -801,7 +1011,7 @@ int main(int argc, char** argv)
         // this is the nr/nb/anf/notch sentinel rule, generalised.
         const bool touchedAtten = std::any_of(sent.begin(), sent.end(),
                                               [](const CivFrame& f) {
-            return f.cmd == cmd::kAttenuator;
+            return f.cmd == cmd::kAttenuator && !f.data.empty();
         });
         check(!touchedAtten,
               "a control the radio never reported is NOT driven — re-asserting an "
@@ -855,6 +1065,91 @@ int main(int argc, char** argv)
         QObject::disconnect(conn);
     }
 
+    // ---- the CI-V trace tag decodes the RIGHT byte in BOTH directions -------
+    //
+    // The two call sites hand traceCiv DIFFERENT layouts, and the tag decoder
+    // has to follow:
+    //
+    //   TX (sendUserCommand) — the raw wire frame from buildFrame:
+    //       FE FE <to> <from> <cmd> [<sub>] <data…> FD    -> cmd at index 4
+    //   RX (onCivFrame)      — re-serialised, envelope deliberately dropped:
+    //       <cmd> [<sub>] <data…>                         -> cmd at index 0
+    //
+    // Reading index 4 for both is the defect this guards: on RX it printed a
+    // PAYLOAD byte as the command, and printed nothing at all for frames
+    // shorter than five bytes — which is most of them.
+    //
+    // These assertions are falsifiable by construction: restore the old
+    // `frame[4]` / `size() >= 5` form and the RX cases below fail, because
+    // 1A 06 01 01 is four bytes (no tag at all) and a frequency reply puts a
+    // BCD digit pair where the command was assumed to be.
+    {
+        QLoggingCategory::setFilterRules(QStringLiteral("aether.icom.civ.debug=true"));
+        g_prevHandler = qInstallMessageHandler(civCapture);
+        g_capturing = true;
+
+        // RX, SHORT FRAME — the 1A 06 DATA-flag reply. Four bytes once the
+        // envelope is stripped, so the old `size() >= 5` guard skipped it
+        // silently. This is the exact reply the category was added to make
+        // visible (the radio never volunteers it), so "no tag" is the whole
+        // failure rather than a cosmetic one.
+        g_civLines.clear();
+        radio.pushCiv({0xFE, 0xFE, kControllerAddress, kIc705Addr,
+                       cmd::kSetting, 0x06, 0x01, 0x01, kCivEom});
+        QTest::qWait(120);
+        {
+            const QString line = lastLineStartingWith(QStringLiteral("RX <- 1a 06"));
+            check(!line.isNull(), "the 1A 06 DATA-flag reply reaches the CI-V trace");
+            check(line.contains(QStringLiteral("cmd=1a")),
+                  "and a four-byte RX frame is TAGGED — the old size()>=5 guard "
+                  "dropped the tag on the very reply this category exists for");
+            check(line.contains(QStringLiteral("sub=06")),
+                  "with the subcommand read from index 1, not index 5");
+        }
+
+        // RX, LONG FRAME — a frequency report. Six bytes, so the old guard
+        // PASSED and produced a confidently wrong label: for 14.074 MHz the
+        // BCD payload puts 0x14 at index 4, which is cmd::kLevel, so a
+        // frequency reply was printed as "cmd=14 sub=00" — a level command.
+        // Plausible, wrong, and aimed at someone who switched this on because
+        // they no longer trust their reading of the code.
+        g_civLines.clear();
+        radio.pushCiv({0xFE, 0xFE, kControllerAddress, kIc705Addr,
+                       cmd::kReadFreq, 0x00, 0x40, 0x07, 0x14, 0x00, kCivEom});
+        QTest::qWait(120);
+        {
+            const QString line = lastLineStartingWith(QStringLiteral("RX <- 03"));
+            check(!line.isNull(), "the frequency report reaches the CI-V trace");
+            check(line.contains(QStringLiteral("cmd=03")),
+                  "a frequency reply is tagged as READ-FREQUENCY, not as the "
+                  "level command its BCD payload happens to spell at index 4");
+            check(!line.contains(QStringLiteral("sub=")),
+                  "and read-frequency carries no subcommand, so none is invented");
+        }
+
+        // TX — unchanged behaviour, asserted so the RX fix cannot silently
+        // break the direction that was already right. The raw wire frame keeps
+        // its envelope, so the command really is at index 4 here. AF gain is
+        // command 14 SUB 01, which is a subcommand-bearing frame — the case
+        // where a wrong index would show.
+        g_civLines.clear();
+        backend.setSliceAudioGain(0, 42);
+        QTest::qWait(120);
+        {
+            // The scheduler keeps draining unrelated commands during the wait,
+            // so select the AF-gain frame rather than whichever TX happened last.
+            const QString line =
+                lastLineStartingWith(QStringLiteral("TX -> fe fe a4 e0 14 01"));
+            check(!line.isNull(), "the outbound frame reaches the CI-V trace");
+            check(line.contains(QStringLiteral("cmd=14")) && line.contains(QStringLiteral("sub=01")),
+                  "a TX frame still decodes from index 4/5, past the envelope");
+        }
+
+        g_capturing = false;
+        qInstallMessageHandler(g_prevHandler);
+        QLoggingCategory::setFilterRules(QString());
+    }
+
     // ---- health -----------------------------------------------------------
     {
         const auto h = backend.healthSnapshot();
@@ -904,9 +1199,9 @@ int main(int argc, char** argv)
     // An operator disconnect while TUNE is active must unkey and restore the
     // borrowed RF-power register before the serial command path disappears.
     backend.setTxPower(37);
-    QTest::qWait(80);
+    check(waitSchedulerIdle(), "disconnect fixture's ordinary power converges");
     backend.setTune(true, 10);
-    QTest::qWait(80);
+    check(waitSchedulerIdle(), "disconnect fixture reaches active TUNE");
     radio.clearCivLog();
     backend.disconnectRadio();
     QTest::qWait(100);
@@ -1043,8 +1338,7 @@ int main(int argc, char** argv)
         c.backend.connectRadio(r);
         check(waitFor([&] { return c.backend.isConnected(); }),
               "wrong pin: the session still comes up - the RS-BA1 transport is fine");
-        QTest::qWait(300);
-        check(c.sentTo(0xA4) > 1,
+        check(waitFor([&] { return c.sentTo(0xA4) > 1; }, 6000),
               "wrong pin: the reads go where the operator said, not where the "
               "radio is");
         check(c.frequencyMHz == 0.0,
@@ -1093,9 +1387,10 @@ int main(int argc, char** argv)
         check(waitFor([&] { return c.frequencyMHz > 14.0 && c.frequencyMHz < 14.1; }),
               "retarget: the broadcast reply moves the reads to 0x50 and the "
               "radio answers");
-        check(c.sentTo(0xA2) > 1,
-              "retarget: the name seed DID address the wrong device first - "
-              "that is the setup for this case, not the defect");
+        check(c.sentTo(0xA2) == 0,
+              "retarget: the broadcast identity probe leads the scheduler, so "
+              "the queued snapshot for the stale name-derived address is "
+              "discarded before it reaches the wire");
 
         // THE DISCRIMINATING ASSERTION. 0x27 is the scope pair and an IC-9700
         // has a scope, so if "started" is latched per SESSION those two frames

@@ -7,7 +7,7 @@ if(POLICY CMP0156)
     cmake_policy(SET CMP0156 NEW)
 endif()
 
-project(AetherSDR VERSION 26.8.2 LANGUAGES C CXX)
+project(AetherSDR VERSION 26.8.3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -611,7 +611,7 @@ set(CORE_SOURCES
     src/core/backends/hl2/MetisProtocol.cpp  # aetherd HL2 Phase 1a (HPSDR Protocol 1)
     src/core/backends/hl2/MetisClient.cpp    # aetherd HL2 Phase 1a (UDP wire + RX ingest)
     src/core/backends/hl2/Hl2EmergencyStop.cpp # release the radio from a signal handler
-    src/core/backends/hl2/Hl2Receivers.cpp   # per-receiver index-space map (HERMES.md §12.5)
+    src/core/backends/hl2/Hl2Receivers.cpp   # per-receiver index-space map (docs/HERMES.md §12.5)
     src/core/backends/hl2/Hl2Spectrum.cpp    # aetherd HL2 Phase 1a (FFT panadapter, FFTW)
     src/core/backends/hl2/Hl2RxDsp.cpp       # aetherd HL2 Phase 1a (IQ -> WdspChannel demod + spectrum)
     src/core/backends/hl2/Hl2TxDsp.cpp       # SSB transmit chain (TX audio -> baseband IQ)
@@ -626,6 +626,7 @@ set(CORE_SOURCES
     src/core/backends/icom/IcomScope.cpp     # IcomCIV Phase 2 (0x27 waveform -> panadapter)
     src/core/backends/icom/IcomAudio.cpp     # IcomCIV Phase 3 (codecs + the 1364/556 split)
     src/core/backends/icom/IcomMeters.cpp    # IcomCIV Phase 4 (calibration + poll scheduler)
+    src/core/backends/icom/IcomCivScheduler.cpp # RFC #4983 shared CI-V pacing + causality
     src/core/backends/icom/IcomModels.cpp    # IcomCIV Phase 5 (per-model capability table)
     src/core/backends/icom/IcomControls.cpp  # the CI-V control registry (controls.map / controls.scrub)
     src/core/backends/icom/IcomCivBackend.cpp # IcomCIV (IRadioBackend impl)

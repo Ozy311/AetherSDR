@@ -77,7 +77,70 @@ if((UNIX OR WIN32) AND ENABLE_DSTAR)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_digital_voice_waveform_no_args.cmake
     )
 
+    # These targets opt IN to ASan+UBSan locally, so a developer running them
+    # by hand gets the checks without configuring anything.
+    #
+    # STAND DOWN when the build is already being compiled under a sanitizer of
+    # its own. ASan and TSan are mutually exclusive — `cc1plus: error:
+    # '-fsanitize=thread' is incompatible with '-fsanitize=address'` — so
+    # adding ASan unconditionally here breaks the TSan CI job at COMPILE time,
+    # and it breaks it for the whole repo, not just these 13 targets: the job
+    # never gets far enough to run anything. That is what took thread-sanitizer
+    # coverage to zero for ten consecutive weekly runs (issue #4360).
+    #
+    # Keyed off the flags actually arriving from the environment, but matched
+    # against a DELIBERATELY NARROW list of sanitizer names — see the last
+    # paragraph for why it cannot be "any sanitizer". The list is thread,
+    # memory and hwaddress: the three that cannot coexist with address. A new
+    # sanitizer that also conflicts has to be added here; the alternation is
+    # the whole contract, so keep it and the message below in step.
+    #
+    # BOTH language flags are checked. Most of these targets are C, but Qt's
+    # AUTOMOC generates a C++ TU (mocs_compilation.cpp) for each of them —
+    # CMAKE_AUTOMOC is ON globally — and that generated file is the one CI
+    # actually dies on, compiled by c++ with CMAKE_CXX_FLAGS. Today's workflow
+    # sets only CXXFLAGS, so CXX alone would be enough; checking CFLAGS too
+    # means a job that sets only CFLAGS does not quietly reintroduce this.
+    #
+    # ONLY A CONFLICTING SANITIZER DISARMS THIS, not any sanitizer at all.
+    # The distinction is load-bearing and the naive test gets it backwards:
+    # sanitizers.yml sets CXXFLAGS but never CFLAGS, so on the ASAN job a
+    # blanket "an external sanitizer is present" test would stand this opt-in
+    # down and nothing would replace it for the C sources — the .c files would
+    # silently lose the ASan coverage this helper exists to give them, in the
+    # one job that currently reports real results. ASan+UBSan arriving from the
+    # environment is what we add anyway, so there is nothing to stand down for;
+    # only a sanitizer that cannot coexist with address (thread, memory,
+    # hwaddress) forces the retreat.
+    #
+    # `[a-z,]*` matches neither `-` nor `=` nor space, which is what keeps the
+    # alternation from over-reaching: `-fno-sanitize=thread` has no
+    # `-fsanitize=` substring, `-fsanitize=kernel-address` stops at the hyphen,
+    # and `-fsanitize=address` does not contain `hwaddress`. Reordered lists
+    # (`-fsanitize=undefined,thread`) still match.
+    set(_aether_dv_external_sanitizer OFF)
+    foreach(_aether_dv_flags "${CMAKE_CXX_FLAGS}" "${CMAKE_C_FLAGS}")
+        if(_aether_dv_flags MATCHES "-fsanitize=[a-z,]*(thread|memory|hwaddress)")
+            set(_aether_dv_external_sanitizer ON)
+        endif()
+    endforeach()
+    if(_aether_dv_external_sanitizer)
+        message(STATUS
+            "Digital-voice tests: a conflicting sanitizer "
+            "(thread/memory/hwaddress) is in the C/CXX flags — not adding "
+            "ASan+UBSan, they cannot coexist")
+    endif()
+    # Cached so the function does not depend on its caller's scope: today every
+    # call site is in this file, but a function reading a plain variable set
+    # elsewhere would silently re-arm if it were ever called from another
+    # directory scope.
+    set(AETHER_DV_EXTERNAL_SANITIZER "${_aether_dv_external_sanitizer}"
+        CACHE INTERNAL "A conflicting sanitizer arrived in CMAKE_{C,CXX}_FLAGS")
+
     function(aether_enable_digital_voice_test_sanitizers target)
+        if(AETHER_DV_EXTERNAL_SANITIZER)
+            return()
+        endif()
         if(NOT WIN32 AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
             target_compile_options(${target} PRIVATE
                 -fsanitize=address,undefined
@@ -347,6 +410,13 @@ add_executable(icom_civ_test
     src/core/backends/icom/CivCodec.cpp)
 target_include_directories(icom_civ_test PRIVATE src)
 add_test(NAME icom_civ_test COMMAND icom_civ_test)
+
+add_executable(icom_civ_scheduler_test
+    tests/icom_civ_scheduler_test.cpp
+    src/core/backends/icom/IcomCivScheduler.cpp
+    src/core/backends/icom/CivCodec.cpp)
+target_include_directories(icom_civ_scheduler_test PRIVATE src)
+add_test(NAME icom_civ_scheduler_test COMMAND icom_civ_scheduler_test)
 
 add_executable(icom_scope_test
     tests/icom_scope_test.cpp
@@ -842,6 +912,21 @@ add_test(NAME waterfall_rate_test COMMAND waterfall_rate_test)
 add_executable(display_status_gate_test tests/display_status_gate_test.cpp)
 target_include_directories(display_status_gate_test PRIVATE src)
 add_test(NAME display_status_gate_test COMMAND display_status_gate_test)
+
+# Slippy-map cylindrical-world math plus QGraphicsView camera constraints.
+# Drives a real QGVMap, so it needs the offscreen platform; never touches the
+# tile network.
+add_executable(map_wrap_test tests/map_wrap_test.cpp)
+target_link_libraries(map_wrap_test PRIVATE
+    qgeoview
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Network
+)
+add_test(NAME map_wrap_test COMMAND map_wrap_test)
+set_tests_properties(map_wrap_test PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 # Frameless-window geometry restore (#4328) — blob parse + the caption-free
 # re-clamp.  Windows-only in effect, but the logic is pure, so it is pinned on
@@ -2617,6 +2702,13 @@ target_include_directories(panadapter_dbm_range_test PRIVATE src)
 target_link_libraries(panadapter_dbm_range_test PRIVATE aethercore Qt6::Core)
 set_target_properties(panadapter_dbm_range_test PROPERTIES AUTOMOC ON)
 add_test(NAME panadapter_dbm_range_test COMMAND panadapter_dbm_range_test)
+
+# wirePanadapter() can see the placeholder SpectrumWidget more than once. The
+# helper keeps one timer/path per widget while retaining separate per-pan timers.
+add_executable(owned_single_shot_timer_test tests/owned_single_shot_timer_test.cpp)
+target_include_directories(owned_single_shot_timer_test PRIVATE src)
+target_link_libraries(owned_single_shot_timer_test PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME owned_single_shot_timer_test COMMAND owned_single_shot_timer_test)
 
 # The bridge preserves dragAt, target-tune, memory-recall, and authenticated
 # positional requests across its bare and JSON protocol forms.
