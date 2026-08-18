@@ -3491,7 +3491,7 @@ lands.
 The complete registry, generated from the `add(...)` table in `AutomationServer.cpp` by `tools/gen_bridge_docs.py`. CI fails if this drifts from the code.
 
 <!-- BEGIN GENERATED VERB TABLE (tools/gen_bridge_docs.py) -->
-<!-- Do not edit by hand — run tools/gen_bridge_docs.py. 65 verbs. -->
+<!-- Do not edit by hand — run tools/gen_bridge_docs.py. 67 verbs. -->
 
 | Verb | Aliases | Description |
 |---|---|---|
@@ -3512,6 +3512,8 @@ The complete registry, generated from the `add(...)` table in `AutomationServer.
 | `contextMenu` | — | contextMenu <target> [x y] — Qt context-menu path |
 | `rightClick` | — | rightClick <target> [x y] — mousePressEvent menu path |
 | `hitTest` | `hittest` | hitTest <target> [x y] — read-only widget-owner probe |
+| `doubleClick` | `doubleclick`, `dblClick` | doubleClick <target> [x y] — double-click a widget (centre by default) |
+| `doubleClickAt` | `doubleclickat`, `dblClickAt` | doubleClickAt <x> <y> \| doubleClickAt <target> <x> <y> — coordinate double-click |
 | `clickAt` | `clickat` | clickAt <x> <y> \| clickAt <target> <x> <y> — TX-guarded coordinate click |
 | `invoke` | — | invoke <target> <action> [value…] — drive a control (TX-guarded) |
 | `get` | — | get <model> [selector] [property] — live model snapshot; get eqstats [selector] [reset] reports Client EQ paint/cache counters |

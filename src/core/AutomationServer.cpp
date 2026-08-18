@@ -2901,6 +2901,32 @@ const std::vector<AutomationServer::VerbSpec>& AutomationServer::verbRegistry()
                 return s.doHitTest(a.target, a.value);
             });
 
+        add("doubleClick", {QStringLiteral("doubleclick"), QStringLiteral("dblClick")},
+            "doubleClick <target> [x y] — double-click a widget (centre by default)",
+            parseTargetXY,
+            [](AutomationServer& s, A& a, QLocalSocket*) -> QJsonObject {
+                return s.doDoubleClick(a.target, a.value);
+            });
+
+        add("doubleClickAt", {QStringLiteral("doubleclickat"), QStringLiteral("dblClickAt")},
+            "doubleClickAt <x> <y> | doubleClickAt <target> <x> <y> — coordinate double-click",
+            [](const QList<QByteArray>& p, A& a) -> QJsonObject {
+                // Same overload rule as clickAt: a numeric first token means
+                // the global form, anything else names a target.
+                bool firstIsNumber = false;
+                vtok(p, 1).toInt(&firstIsNumber);
+                if (firstIsNumber) {
+                    a.value = vtok(p, 1) + QLatin1Char(' ') + vtok(p, 2);
+                } else {
+                    a.target = vtok(p, 1);
+                    a.value = vtok(p, 2) + QLatin1Char(' ') + vtok(p, 3);
+                }
+                return {};
+            },
+            [](AutomationServer& s, A& a, QLocalSocket*) -> QJsonObject {
+                return s.doClickAt(a.target, a.value, ClickKind::Double);
+            });
+
         add("clickAt", {QStringLiteral("clickat")},
             "clickAt <x> <y> | clickAt <target> <x> <y> — TX-guarded coordinate click",
             [](const QList<QByteArray>& p, A& a) -> QJsonObject {
@@ -9201,6 +9227,30 @@ QJsonObject AutomationServer::doContextMenu(const QString& target,
 // panadapter menu is position-sensitive and lives behind a real right-button
 // press, so QContextMenuEvent does not reach it. Post a right-button press onto
 // the GUI loop and leave the menu's nested event loop to dumpTree/invoke.
+QJsonObject AutomationServer::doDoubleClick(const QString& target,
+                                           const QString& value)
+{
+    if (target.isEmpty())
+        return err(QStringLiteral("doubleClick requires a target widget"));
+
+    // Coordinates are optional here (unlike clickAt, whose contract requires
+    // them): a double-click is aimed at a control, and its centre is the
+    // point a person would hit. Resolve it so the shared clickAt path still
+    // receives explicit coordinates and applies every guard it normally does.
+    QString coords = value.trimmed();
+    if (coords.isEmpty()) {
+        QWidget* w = resolveWidget(target);
+        if (!w)
+            return err(QStringLiteral("widget not found: ") + target);
+        if (!w->isVisible())
+            return err(QStringLiteral("refused: '") + target
+                       + QStringLiteral("' is not visible"));
+        const QPoint c = w->rect().center();
+        coords = QString::number(c.x()) + QLatin1Char(' ') + QString::number(c.y());
+    }
+    return doClickAt(target, coords, ClickKind::Double);
+}
+
 QJsonObject AutomationServer::doRightClick(const QString& target,
                                            const QString& value) const
 {
@@ -9289,7 +9339,8 @@ QJsonObject AutomationServer::doHitTest(const QString& target,
 // menu/dialog the click raises runs on a normal stack, mirroring the invoke()
 // re-entrancy fix.
 QJsonObject AutomationServer::doClickAt(const QString& target,
-                                        const QString& value)
+                                        const QString& value,
+                                        ClickKind kind)
 {
     const QStringList parts = value.split(QLatin1Char(' '), Qt::SkipEmptyParts);
     if (parts.size() < 2)
@@ -9403,7 +9454,8 @@ QJsonObject AutomationServer::doClickAt(const QString& target,
     if (transmitControl) {
         markTxBridgeInitiated();
     }
-    QTimer::singleShot(0, qApp, [wp, win, local, global]() {
+    const bool wantDouble = (kind == ClickKind::Double);
+    QTimer::singleShot(0, qApp, [wp, win, local, global, wantDouble]() {
         if (!wp)
             return;
         raiseWindowForPopup(win);  // valid active window for any popup it raises
@@ -9417,6 +9469,21 @@ QJsonObject AutomationServer::doClickAt(const QString& target,
         QMouseEvent release(QEvent::MouseButtonRelease, lf, lf, gf,
                             Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
         QCoreApplication::sendEvent(wp, &release);
+        if (!wantDouble || !wp)
+            return;
+        // The second half of a real double-click. Qt's own sequence is
+        // Press, Release, DblClick, Release — the window system sends the
+        // DblClick INSTEAD of a second Press, and a widget that overrides
+        // mouseDoubleClickEvent only ever sees that type. Sending another
+        // Press here would drive the single-click path twice instead.
+        QMouseEvent dbl(QEvent::MouseButtonDblClick, lf, lf, gf,
+                        Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(wp, &dbl);
+        if (!wp)
+            return;
+        QMouseEvent release2(QEvent::MouseButtonRelease, lf, lf, gf,
+                             Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(wp, &release2);
     });
 
     return QJsonObject{
