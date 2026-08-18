@@ -307,6 +307,30 @@ void PhoneApplet::buildUI()
         m_lowCutLabel->setAlignment(Qt::AlignCenter);
         AetherSDR::ThemeManager::instance().applyStyleSheet(m_lowCutLabel, "QLabel { font-size: 11px; color: {{color.text.primary}}; background: {{color.background.0}}; "
             "border: 1px solid {{color.background.1}}; border-radius: 3px; padding: 1px 3px; }");
+        // Direct numeric entry (#3627): double-click to type an exact Hz
+        // value instead of stepping to it 50 Hz at a time. The validator
+        // bounds the field at the model's own 0..10000 range; the commit
+        // below applies the same cross-bound rule as the step buttons.
+        //
+        // No explicit re-sync after a commit: the editor is a separate
+        // QLineEdit laid over the label, so keystrokes never touch the
+        // label's own text. Whenever the clamped value does change the
+        // model, phoneStateChanged -> syncFromModel() repaints it; when it
+        // clamps onto the value already set, the label is already right.
+        m_lowCutLabel->setEditable(0, 10000);
+        m_lowCutLabel->setEditorStyleSheetFromLabel(m_lowCutLabel->styleSheet());
+        connect(m_lowCutLabel, &ScrollableLabel::editCommitted, this, [this](int hz) {
+            if (!m_model) return;
+            // Clamp low against high HERE, exactly as the step buttons do at
+            // their own call site (lowCutUp above).
+            //
+            // This is not redundant with the model. TransmitModel::setTxFilter()
+            // resolves a crossed pair by keeping the low it was given and
+            // pushing HIGH up to low + 50 — so typing 9000 into low cut would
+            // drag the high cut from 3300 to 9050, moving a passband edge the
+            // operator never touched. Clamping low instead keeps their high.
+            m_model->setTxFilterLow(qBound(0, hz, m_model->txFilterHigh() - 50));
+        });
         connect(m_lowCutLabel, &ScrollableLabel::scrolled, this,
                 [lowCutUp, lowCutDown](int dir) {
             if (dir > 0) lowCutUp(); else lowCutDown();
@@ -358,6 +382,17 @@ void PhoneApplet::buildUI()
         m_highCutLabel->setAlignment(Qt::AlignCenter);
         AetherSDR::ThemeManager::instance().applyStyleSheet(m_highCutLabel, "QLabel { font-size: 11px; color: {{color.text.primary}}; background: {{color.background.0}}; "
             "border: 1px solid {{color.background.1}}; border-radius: 3px; padding: 1px 3px; }");
+        // Direct numeric entry (#3627) — see the low-cut comment above.
+        m_highCutLabel->setEditable(0, 10000);
+        m_highCutLabel->setEditorStyleSheetFromLabel(m_highCutLabel->styleSheet());
+        connect(m_highCutLabel, &ScrollableLabel::editCommitted, this, [this](int hz) {
+            if (!m_model) return;
+            // No call-site clamp on this side: setTxFilter() already raises a
+            // too-low high to low + 50 and caps it at 10000, which is the same
+            // answer the step buttons give. The asymmetry is real, not an
+            // oversight — see the low-cut handler for why that side needs one.
+            m_model->setTxFilterHigh(hz);
+        });
         connect(m_highCutLabel, &ScrollableLabel::scrolled, this,
                 [highCutUp, highCutDown](int dir) {
             if (dir > 0) highCutUp(); else highCutDown();

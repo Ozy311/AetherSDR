@@ -6,6 +6,9 @@
 #include <QComboBox>
 #include <QAbstractItemView>
 #include <QLabel>
+#include <QLineEdit>
+#include <QIntValidator>
+#include <QKeyEvent>
 #include <QMouseEvent>
 #include <QStyle>
 #include <QStyleOptionSlider>
@@ -173,13 +176,71 @@ public:
     }
 };
 
+// QIntValidator reports an out-of-range number as Intermediate, not Invalid
+// — so a QLineEdit happily holds "20000" but then refuses to emit
+// returnPressed/editingFinished, because those require Acceptable input.
+// Measured against Qt 6.10: validate("20000") with a 0..10000 range returns
+// Intermediate. Without a fixup() the operator types a too-large value, hits
+// Enter, and nothing whatsoever happens.
+//
+// Qt calls fixup() on Return precisely for this, so clamping there turns a
+// dead keypress into the nearest legal value.
+class ClampingIntValidator : public QIntValidator {
+public:
+    ClampingIntValidator(int minimum, int maximum, QObject* parent = nullptr)
+        : QIntValidator(minimum, maximum, parent) {}
+
+    void fixup(QString& input) const override {
+        bool ok = false;
+        const int v = input.toInt(&ok);
+        if (ok)
+            input = QString::number(qBound(bottom(), v, top()));
+        // Deliberately NOT chaining to QIntValidator::fixup(): it inserts
+        // locale group separators ("20000" -> "20,000"), and the caller
+        // parses this back with toInt(), which rejects them. Measured on
+        // Qt 6.10 — chaining silently dropped every out-of-range commit.
+    }
+};
+
 // QLabel subclass that emits scrolled(int steps) on wheel events and
 // always consumes them. Used for RIT/XIT/pitch numeric displays. (#619)
 // When controls are locked (#745), ignores wheel events.
+//
+// The label can also be typed into (#3627): call setEditable() with the
+// accepted range and a double-click swaps a QLineEdit over the label.
+// Editing is OFF by default, so every existing user — RIT/XIT, step size,
+// RTTY mark/shift — keeps its display-only behaviour unchanged.
+//
+// A committed value is only ever a REQUEST. The owner clamps it against
+// whatever relationship its own controls carry (e.g. TX low <= high - 50)
+// and then re-syncs the text from the model, so the label can never show a
+// number the model did not accept.
 class ScrollableLabel : public QLabel {
     Q_OBJECT
 public:
     using QLabel::QLabel;
+
+    // Enable double-click-to-type. min/max bound the editor's validator;
+    // the owner still applies any cross-control clamping on commit.
+    void setEditable(int minValue, int maxValue) {
+        m_editable = true;
+        m_min = minValue;
+        m_max = maxValue;
+    }
+    bool isEditable() const { return m_editable; }
+
+    // The owner passes the label's own themed stylesheet so the editor does
+    // not flash an unthemed system box over a dark panel.
+    //
+    // The selector is rewritten on the way in. Those stylesheets are written
+    // as "QLabel { ... }" and Qt matches stylesheet selectors against the
+    // widget's class, so handing one to a QLineEdit styles nothing at all.
+    void setEditorStyleSheetFromLabel(const QString& labelCss) {
+        m_editorCss = QString(labelCss).replace(QLatin1String("QLabel"),
+                                                QLatin1String("QLineEdit"));
+    }
+    QString editorStyleSheet() const { return m_editorCss; }
+
     void wheelEvent(QWheelEvent* ev) override {
         if (ControlsLock::isLocked()) {
             ev->ignore();
@@ -190,6 +251,84 @@ public:
         else if (delta < 0) emit scrolled(-1);
         ev->accept();
     }
+
+    void mouseDoubleClickEvent(QMouseEvent* ev) override {
+        // Same gate as the wheel handler: a locked panel is being scrolled,
+        // not operated. (#745)
+        if (!m_editable || ControlsLock::isLocked()) {
+            QLabel::mouseDoubleClickEvent(ev);
+            return;
+        }
+        beginEdit();
+        ev->accept();
+    }
+
+    // Exposed so a test (and any future keyboard route) can open the editor
+    // without synthesising a double-click.
+    void beginEdit() {
+        if (!m_editable || m_editor)
+            return;
+        m_editor = new QLineEdit(text(), this);
+        m_editor->setValidator(new ClampingIntValidator(m_min, m_max, m_editor));
+        m_editor->setAlignment(alignment());
+        if (!m_editorCss.isEmpty())
+            m_editor->setStyleSheet(m_editorCss);
+        m_editor->setGeometry(rect());
+        m_editor->selectAll();
+        connect(m_editor, &QLineEdit::editingFinished, this, [this]() { commitEdit(); });
+        m_editor->show();
+        m_editor->setFocus(Qt::MouseFocusReason);
+    }
+
+    bool isEditing() const { return m_editor != nullptr; }
+
 signals:
     void scrolled(int direction);
+    // A typed value the owner should clamp and push at the model.
+    void editCommitted(int value);
+
+protected:
+    void keyPressEvent(QKeyEvent* ev) override {
+        if (m_editor && ev->key() == Qt::Key_Escape) {
+            closeEditor();
+            ev->accept();
+            return;
+        }
+        QLabel::keyPressEvent(ev);
+    }
+
+private:
+    // Tear the editor down. Clears the member FIRST: destroying a focused
+    // QLineEdit emits editingFinished, and a null member is what stops that
+    // re-entering commitEdit() and committing a value twice.
+    void closeEditor() {
+        if (!m_editor)
+            return;
+        QLineEdit* ed = m_editor;
+        m_editor = nullptr;
+        // hide() before deleteLater(): the delete only lands on the next
+        // event-loop pass, and until then the editor is still a visible
+        // child sitting on top of the label.
+        ed->hide();
+        ed->deleteLater();
+    }
+
+    void commitEdit() {
+        if (!m_editor)
+            return;
+        const QString typed = m_editor->text().trimmed();
+        closeEditor();
+        bool ok = false;
+        const int value = typed.toInt(&ok);
+        // Empty or unparseable cancels: the label keeps whatever the model
+        // last put there, so a stray double-click costs nothing.
+        if (ok)
+            emit editCommitted(value);
+    }
+
+    bool       m_editable{false};
+    int        m_min{0};
+    int        m_max{0};
+    QString    m_editorCss;
+    QLineEdit* m_editor{nullptr};
 };
