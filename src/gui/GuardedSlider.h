@@ -8,6 +8,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QIntValidator>
+#include <QEvent>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QStyle>
@@ -274,6 +275,9 @@ public:
             m_editorStyler(m_editor);
         m_editor->setGeometry(rect());
         m_editor->selectAll();
+        // Escape has to be claimed on the EDITOR, via ShortcutOverride — see
+        // eventFilter() below for why a keyPressEvent override cannot work.
+        m_editor->installEventFilter(this);
         connect(m_editor, &QLineEdit::editingFinished, this, [this]() { commitEdit(); });
         m_editor->show();
         m_editor->setFocus(Qt::MouseFocusReason);
@@ -287,13 +291,34 @@ signals:
     void editCommitted(int value);
 
 protected:
-    void keyPressEvent(QKeyEvent* ev) override {
-        if (m_editor && ev->key() == Qt::Key_Escape) {
-            closeEditor();
-            ev->accept();
-            return;
+    // Cancel the edit on Esc.
+    //
+    // This MUST filter the editor and MUST answer ShortcutOverride, not just
+    // KeyPress. The main window carries `QShortcut(Qt::Key_Escape, window())`
+    // (CwxPanel, DvkPanel), and Qt dispatches a shortcut by first offering a
+    // ShortcutOverride event: if nothing accepts it, the shortcut fires and
+    // the focused widget is never sent a KeyPress at all. A keyPressEvent
+    // override on this label therefore never runs, which is exactly how this
+    // shipped broken — Esc did nothing in the app while passing a unit test
+    // that delivered the key straight to the widget with no shortcut present.
+    //
+    // Same shape as VfoWidget::eventFilter for its frequency direct-entry.
+    bool eventFilter(QObject* obj, QEvent* ev) override {
+        if (obj == m_editor
+            && (ev->type() == QEvent::ShortcutOverride
+                || ev->type() == QEvent::KeyPress)) {
+            auto* ke = static_cast<QKeyEvent*>(ev);
+            if (ke->key() == Qt::Key_Escape || ke->key() == Qt::Key_Cancel) {
+                // Accepting the ShortcutOverride claims the key so the window
+                // shortcut does not consume it; the KeyPress that follows is
+                // what actually closes the editor.
+                if (ev->type() == QEvent::KeyPress)
+                    closeEditor();
+                ev->accept();
+                return true;
+            }
         }
-        QLabel::keyPressEvent(ev);
+        return QLabel::eventFilter(obj, ev);
     }
 
 private:

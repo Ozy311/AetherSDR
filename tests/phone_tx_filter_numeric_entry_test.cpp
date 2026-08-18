@@ -43,15 +43,24 @@ ScrollableLabel* cutLabel(PhoneApplet& applet, const char* accessibleName)
     return nullptr;
 }
 
+// Open the editor and hand back the CURRENT one.
+//
+// Always drain deferred deletes first: findChild<QLineEdit*>() will otherwise
+// return an editor a previous edit already closed but that has not been
+// deleted yet, and every assertion then runs against a widget the label no
+// longer owns. A running app gets this for free from the event loop between
+// two operator actions.
+QLineEdit* openEditor(ScrollableLabel* label)
+{
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    label->beginEdit();
+    return label->findChild<QLineEdit*>();
+}
+
 // Type into an open editor and commit with Return.
 void typeAndCommit(ScrollableLabel* label, const QString& text)
 {
-    // Drain any editor left pending deleteLater() by a previous edit, so
-    // findChild() below cannot hand back the old one. A running app gets
-    // this for free from the event loop between two operator actions.
-    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
-    label->beginEdit();
-    QLineEdit* ed = label->findChild<QLineEdit*>();
+    QLineEdit* ed = openEditor(label);
     if (!ed)
         return;
     ed->setText(text);
@@ -85,8 +94,7 @@ int main(int argc, char** argv)
     // stylesheet selectors on widget class, so a QLabel rule styles nothing.
     check(low->hasEditorStyler() && high->hasEditorStyler(),
           "both readouts style their editor rather than leaving it unthemed");
-    low->beginEdit();
-    if (QLineEdit* ed = low->findChild<QLineEdit*>()) {
+    if (QLineEdit* ed = openEditor(low)) {
         check(ed->styleSheet().contains(QLatin1String("QLineEdit")),
               "the editor is themed with a QLineEdit rule");
         check(!ed->styleSheet().contains(QLatin1String("{{")),
@@ -148,14 +156,40 @@ int main(int argc, char** argv)
           "an out-of-range typed value is clamped, not silently dropped");
 
     // ── Cancel routes ─────────────────────────────────────────────────────
+    //
+    // Esc is the row that shipped broken, so it is tested the way the APP
+    // behaves, not the way a bare harness does. The main window carries
+    // QShortcut(Qt::Key_Escape, window()) (CwxPanel, DvkPanel). Qt offers a
+    // ShortcutOverride first and, if nothing accepts it, the shortcut fires
+    // and the focused widget never receives a KeyPress — which is why the
+    // original keyPressEvent handler never ran in the real app while passing
+    // a test that delivered Esc straight to the widget.
+    //
+    // Accepting the ShortcutOverride is therefore the whole fix, and it is
+    // asserted directly: without it this row fails and Esc stays dead.
     model.setTxFilter(150, 3300);
-    low->beginEdit();
-    if (QLineEdit* ed = low->findChild<QLineEdit*>()) {
+    if (QLineEdit* ed = openEditor(low)) {
         ed->setText(QStringLiteral("2000"));
+        QKeyEvent probe(QEvent::ShortcutOverride, Qt::Key_Escape, Qt::NoModifier);
+        probe.setAccepted(false);
+        QApplication::sendEvent(ed, &probe);
+        check(probe.isAccepted(),
+              "Esc is claimed from the window shortcut (ShortcutOverride accepted)");
         QTest::keyClick(ed, Qt::Key_Escape);
     }
+    check(!low->isEditing(), "Esc closes the editor");
     check(model.txFilterLow() == 150, "Esc abandons the edit without committing");
     check(low->text() == QStringLiteral("150"), "Esc leaves the displayed value intact");
+
+    // Qt::Key_Cancel is the same gesture on platforms that send it; VfoWidget
+    // treats the two together and so do we.
+    model.setTxFilter(150, 3300);
+    if (QLineEdit* ed = openEditor(low)) {
+        ed->setText(QStringLiteral("2000"));
+        QTest::keyClick(ed, Qt::Key_Cancel);
+    }
+    check(!low->isEditing() && model.txFilterLow() == 150,
+          "Key_Cancel abandons the edit the same way Esc does");
 
     // ── Lock gate: a locked panel is being scrolled, not operated (#745) ──
     ControlsLock::setLocked(true);
@@ -164,7 +198,12 @@ int main(int argc, char** argv)
     ControlsLock::setLocked(false);
     QTest::mouseDClick(low, Qt::LeftButton);
     check(low->isEditing(), "unlocking restores double-click-to-type");
+    // Flush again before reaching for the editor: the row above opened a NEW
+    // one, but an earlier closed editor can still be pending deleteLater and
+    // findChild() returns whichever it meets first.
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
     QTest::keyClick(low->findChild<QLineEdit*>(), Qt::Key_Escape);
+    check(!low->isEditing(), "the editor closes again after the lock test");
 
     // ── Blast radius: every OTHER ScrollableLabel is untouched ────────────
     // RIT/XIT (RxApplet), step size (RxApplet) and RTTY mark/shift
