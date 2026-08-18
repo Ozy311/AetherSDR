@@ -90,6 +90,16 @@ int main(int argc, char** argv)
     check(low->isEditable(),  "low cut readout is editable (#3627)");
     check(high->isEditable(), "high cut readout is editable (#3627)");
 
+    // The accepted range comes from the MODEL, never a literal in the widget.
+    // AetherSDR is growing backends (HL2, Icom, FT-991, ColibriNANO, RTL-SDR);
+    // when a radio declares a narrower passband these accessors are the single
+    // seam that has to change, and the editor follows without being touched.
+    check(low->editMinimum() == model.txFilterMinHz()
+          && low->editMaximum() == model.txFilterMaxHz(),
+          "the editor takes its range from the model, not a hardcoded 0..10000");
+    check(model.txFilterMinWidthHz() > 0,
+          "the minimum passband width is model-owned too");
+
     // Without a styler the editor renders as a bare system line edit in the
     // middle of a dark panel. The rule must select QLineEdit — Qt matches
     // stylesheet selectors on widget class, so a QLabel rule styles nothing.

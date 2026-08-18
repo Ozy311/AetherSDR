@@ -229,6 +229,8 @@ public:
         m_max = maxValue;
     }
     bool isEditable() const { return m_editable; }
+    int  editMinimum() const { return m_min; }
+    int  editMaximum() const { return m_max; }
 
     // The owner styles the editor, so it does not flash an unthemed system box
     // over a dark panel. A callback rather than a stylesheet string for two
