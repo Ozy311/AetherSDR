@@ -80,13 +80,19 @@ int main(int argc, char** argv)
     check(low->isEditable(),  "low cut readout is editable (#3627)");
     check(high->isEditable(), "high cut readout is editable (#3627)");
 
-    // The themed stylesheet the applet handed over is written for a QLabel;
-    // unless the selector is rewritten the editor renders as a bare system
-    // line edit in the middle of a dark panel.
-    check(low->editorStyleSheet().contains(QLatin1String("QLineEdit")),
-          "the editor inherits the label's theme, not a QLabel selector");
-    check(!low->editorStyleSheet().contains(QLatin1String("QLabel")),
-          "no QLabel selector survives into the editor stylesheet");
+    // Without a styler the editor renders as a bare system line edit in the
+    // middle of a dark panel. The rule must select QLineEdit — Qt matches
+    // stylesheet selectors on widget class, so a QLabel rule styles nothing.
+    check(low->hasEditorStyler() && high->hasEditorStyler(),
+          "both readouts style their editor rather than leaving it unthemed");
+    low->beginEdit();
+    if (QLineEdit* ed = low->findChild<QLineEdit*>()) {
+        check(ed->styleSheet().contains(QLatin1String("QLineEdit")),
+              "the editor is themed with a QLineEdit rule");
+        check(!ed->styleSheet().contains(QLatin1String("{{")),
+              "theme tokens are resolved, not passed through raw");
+        QTest::keyClick(ed, Qt::Key_Escape);
+    }
 
     // ── The feature: an exact value, in one action ────────────────────────
     model.setTxFilter(50, 3300);

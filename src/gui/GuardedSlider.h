@@ -229,17 +229,16 @@ public:
     }
     bool isEditable() const { return m_editable; }
 
-    // The owner passes the label's own themed stylesheet so the editor does
-    // not flash an unthemed system box over a dark panel.
-    //
-    // The selector is rewritten on the way in. Those stylesheets are written
-    // as "QLabel { ... }" and Qt matches stylesheet selectors against the
-    // widget's class, so handing one to a QLineEdit styles nothing at all.
-    void setEditorStyleSheetFromLabel(const QString& labelCss) {
-        m_editorCss = QString(labelCss).replace(QLatin1String("QLabel"),
-                                                QLatin1String("QLineEdit"));
+    // The owner styles the editor, so it does not flash an unthemed system box
+    // over a dark panel. A callback rather than a stylesheet string for two
+    // reasons: the owner writes a QLineEdit rule directly (a QLabel rule would
+    // not match a QLineEdit at all, since Qt selects on widget class), and the
+    // stylesheet is applied by ThemeManager itself, which owns theming
+    // and is where the colour audit expects it to live.
+    void setEditorStyler(std::function<void(QWidget*)> styler) {
+        m_editorStyler = std::move(styler);
     }
-    QString editorStyleSheet() const { return m_editorCss; }
+    bool hasEditorStyler() const { return static_cast<bool>(m_editorStyler); }
 
     void wheelEvent(QWheelEvent* ev) override {
         if (ControlsLock::isLocked()) {
@@ -271,8 +270,8 @@ public:
         m_editor = new QLineEdit(text(), this);
         m_editor->setValidator(new ClampingIntValidator(m_min, m_max, m_editor));
         m_editor->setAlignment(alignment());
-        if (!m_editorCss.isEmpty())
-            m_editor->setStyleSheet(m_editorCss);
+        if (m_editorStyler)
+            m_editorStyler(m_editor);
         m_editor->setGeometry(rect());
         m_editor->selectAll();
         connect(m_editor, &QLineEdit::editingFinished, this, [this]() { commitEdit(); });
@@ -329,6 +328,6 @@ private:
     bool       m_editable{false};
     int        m_min{0};
     int        m_max{0};
-    QString    m_editorCss;
+    std::function<void(QWidget*)> m_editorStyler;
     QLineEdit* m_editor{nullptr};
 };

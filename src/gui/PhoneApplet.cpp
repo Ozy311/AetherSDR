@@ -318,7 +318,11 @@ void PhoneApplet::buildUI()
         // model, phoneStateChanged -> syncFromModel() repaints it; when it
         // clamps onto the value already set, the label is already right.
         m_lowCutLabel->setEditable(0, 10000);
-        m_lowCutLabel->setEditorStyleSheetFromLabel(m_lowCutLabel->styleSheet());
+        m_lowCutLabel->setEditorStyler([](QWidget* editor) {
+            AetherSDR::ThemeManager::instance().applyStyleSheet(editor,
+                "QLineEdit { font-size: 11px; color: {{color.text.primary}}; background: {{color.background.0}}; "
+                "border: 1px solid {{color.background.1}}; border-radius: 3px; padding: 1px 3px; }");
+        });
         connect(m_lowCutLabel, &ScrollableLabel::editCommitted, this, [this](int hz) {
             if (!m_model) return;
             // Clamp low against high HERE, exactly as the step buttons do at
@@ -384,7 +388,11 @@ void PhoneApplet::buildUI()
             "border: 1px solid {{color.background.1}}; border-radius: 3px; padding: 1px 3px; }");
         // Direct numeric entry (#3627) — see the low-cut comment above.
         m_highCutLabel->setEditable(0, 10000);
-        m_highCutLabel->setEditorStyleSheetFromLabel(m_highCutLabel->styleSheet());
+        m_highCutLabel->setEditorStyler([](QWidget* editor) {
+            AetherSDR::ThemeManager::instance().applyStyleSheet(editor,
+                "QLineEdit { font-size: 11px; color: {{color.text.primary}}; background: {{color.background.0}}; "
+                "border: 1px solid {{color.background.1}}; border-radius: 3px; padding: 1px 3px; }");
+        });
         connect(m_highCutLabel, &ScrollableLabel::editCommitted, this, [this](int hz) {
             if (!m_model) return;
             // No call-site clamp on this side: setTxFilter() already raises a
