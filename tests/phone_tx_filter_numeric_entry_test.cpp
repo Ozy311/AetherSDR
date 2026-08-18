@@ -15,6 +15,7 @@
 
 #include <QApplication>
 #include <QLineEdit>
+#include <QFocusEvent>
 #include <QSignalSpy>
 #include <QCoreApplication>
 #include <QTest>
@@ -214,6 +215,42 @@ int main(int argc, char** argv)
     QTest::mouseDClick(&plain, Qt::LeftButton);
     check(!plain.isEditing(),
           "double-clicking a default ScrollableLabel does nothing");
+
+    // ── A leftover editor is what actually ate the wheel ──────────────────
+    //
+    // Reported live 2026-08-18: rolling over the numerals did nothing. The
+    // editor covers the label exactly, so any editor still on screen is a lid
+    // over the control. Two routes used to leave one there.
+
+    // Route 1: focus-out with input QIntValidator calls Intermediate.
+    // QLineEdit emits editingFinished on focus-out only when the input is
+    // ACCEPTABLE, so this emitted nothing and the editor stayed open forever.
+    // An EMPTY field is the case fixup() cannot rescue: 20000 clamps to 10000
+    // and becomes Acceptable, so Qt emits editingFinished for it anyway. Only
+    // an unparseable field actually strands the editor.
+    model.setTxFilter(200, 3300);
+    if (QLineEdit* ed = openEditor(low)) {
+        ed->clear();
+        check(!ed->hasAcceptableInput(), "an empty field is not Acceptable (the precondition)");
+        QApplication::sendEvent(ed, new QFocusEvent(QEvent::FocusOut));
+    }
+    check(!low->isEditing(),
+          "focus-out always closes the editor, even on unacceptable input");
+
+    // Route 2: with an editor open, the wheel must still step the value —
+    // the label underneath can never receive the event itself.
+    model.setTxFilter(200, 3300);
+    if (QLineEdit* ed = openEditor(low)) {
+        QWheelEvent up(QPointF(5, 5), QPointF(5, 5), QPoint(), QPoint(0, 120),
+                       Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(ed, &up);
+        check(model.txFilterLow() == 250,
+              "the wheel still steps while the editor is open");
+        check(ed->text() == QStringLiteral("250"),
+              "the open field follows the model rather than showing a stale number");
+    }
+    if (low->isEditing())
+        QTest::keyClick(low->findChild<QLineEdit*>(), Qt::Key_Escape);
 
     // ── The existing affordance still works ───────────────────────────────
     model.setTxFilter(200, 3300);

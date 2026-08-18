@@ -304,16 +304,45 @@ protected:
     //
     // Same shape as VfoWidget::eventFilter for its frequency direct-entry.
     bool eventFilter(QObject* obj, QEvent* ev) override {
-        if (obj == m_editor
-            && (ev->type() == QEvent::ShortcutOverride
-                || ev->type() == QEvent::KeyPress)) {
-            auto* ke = static_cast<QKeyEvent*>(ev);
-            if (ke->key() == Qt::Key_Escape || ke->key() == Qt::Key_Cancel) {
-                // Accepting the ShortcutOverride claims the key so the window
-                // shortcut does not consume it; the KeyPress that follows is
-                // what actually closes the editor.
-                if (ev->type() == QEvent::KeyPress)
-                    closeEditor();
+        if (obj == m_editor) {
+            if (ev->type() == QEvent::ShortcutOverride
+                || ev->type() == QEvent::KeyPress) {
+                auto* ke = static_cast<QKeyEvent*>(ev);
+                if (ke->key() == Qt::Key_Escape || ke->key() == Qt::Key_Cancel) {
+                    // Accepting the ShortcutOverride claims the key so the
+                    // window shortcut does not consume it; the KeyPress that
+                    // follows is what actually closes the editor.
+                    if (ev->type() == QEvent::KeyPress)
+                        closeEditor();
+                    ev->accept();
+                    return true;
+                }
+            }
+
+            // Focus-out must ALWAYS end the edit.  QLineEdit emits
+            // editingFinished on focus-out only when the input is Acceptable,
+            // so a half-typed or out-of-range value emitted nothing and left
+            // the editor sitting open on top of the label — where it silently
+            // ate every wheel event aimed at the numerals underneath.
+            if (ev->type() == QEvent::FocusOut) {
+                commitEdit();               // commits if parseable, else cancels
+                return false;               // let Qt finish its own focus work
+            }
+
+            // The editor covers the label exactly, so while it is open the
+            // label can never see a wheel event of its own.  Forward it, so
+            // rolling steps the value whether or not a field is open, and
+            // re-seed the text from whatever the model accepted.
+            if (ev->type() == QEvent::Wheel) {
+                if (ControlsLock::isLocked())
+                    return false;
+                auto* we = static_cast<QWheelEvent*>(ev);
+                const int delta = we->angleDelta().y();
+                if (delta != 0) {
+                    emit scrolled(delta > 0 ? 1 : -1);
+                    if (m_editor)
+                        m_editor->setText(text());   // text() is model truth
+                }
                 ev->accept();
                 return true;
             }
