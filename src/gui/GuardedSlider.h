@@ -8,7 +8,10 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QIntValidator>
+#include <QAccessible>
+#include <QAccessibleWidget>
 #include <QEvent>
+#include <QLocale>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QStyle>
@@ -177,31 +180,38 @@ public:
     }
 };
 
-// QIntValidator reports an out-of-range number as Intermediate, not Invalid
-// — so a QLineEdit happily holds "20000" but then refuses to emit
-// returnPressed/editingFinished, because those require Acceptable input.
-// Measured against Qt 6.10: validate("20000") with a 0..10000 range returns
-// Intermediate. Without a fixup() the operator types a too-large value, hits
-// Enter, and nothing whatsoever happens.
+// The editor's validator, pinned to the C locale.
 //
-// Qt calls fixup() on Return precisely for this, so clamping there turns a
-// dead keypress into the nearest legal value.
-class ClampingIntValidator : public QIntValidator {
-public:
-    ClampingIntValidator(int minimum, int maximum, QObject* parent = nullptr)
-        : QIntValidator(minimum, maximum, parent) {}
+// QIntValidator validates in ITS locale while QString::toInt() always parses
+// in the C locale, so by default the two disagree: the validator accepts
+// locale digits and correctly-placed group separators ("3,000" under en_US,
+// Arabic-Indic digits under ar_*) that toInt() then refuses, and the edit
+// closes without ever reaching the model — an accepted keystroke that does
+// nothing (#5064 review). Pinning the validator to C, with the group
+// separator explicitly rejected rather than merely omitted, makes the two
+// halves agree on exactly one grammar: optional sign, ASCII digits.
+//
+// There is deliberately no clamping fixup() here. QIntValidator calls an
+// out-of-range number Intermediate, and QLineEdit will not emit
+// returnPressed/editingFinished on Intermediate input — the earlier version
+// of this class clamped in fixup() to keep Enter from being a dead keypress.
+// Return is now handled explicitly on the editor (see eventFilter below), so
+// an out-of-range entry closes the editor and RESTORES the previous value,
+// which is what issue #3627 asks for.
+inline QIntValidator* makeCLocaleIntValidator(int minimum, int maximum, QObject* parent)
+{
+    auto* validator = new QIntValidator(minimum, maximum, parent);
+    QLocale cLocale = QLocale::c();
+    cLocale.setNumberOptions(QLocale::RejectGroupSeparator
+                             | QLocale::OmitGroupSeparator);
+    validator->setLocale(cLocale);
+    return validator;
+}
 
-    void fixup(QString& input) const override {
-        bool ok = false;
-        const int v = input.toInt(&ok);
-        if (ok)
-            input = QString::number(qBound(bottom(), v, top()));
-        // Deliberately NOT chaining to QIntValidator::fixup(): it inserts
-        // locale group separators ("20000" -> "20,000"), and the caller
-        // parses this back with toInt(), which rejects them. Measured on
-        // Qt 6.10 — chaining silently dropped every out-of-range commit.
-    }
-};
+class ScrollableLabel;
+// Installed lazily by setEditable() — see the class comment below.
+inline QAccessibleInterface* scrollableLabelAccessibleFactory(const QString& key,
+                                                              QObject* object);
 
 // QLabel subclass that emits scrolled(int steps) on wheel events and
 // always consumes them. Used for RIT/XIT/pitch numeric displays. (#619)
@@ -227,6 +237,29 @@ public:
         m_editable = true;
         m_min = minValue;
         m_max = maxValue;
+
+        // docs/a11y.md, "Interactive QLabel anti-pattern": a QLabel that opens
+        // an editor is an interactive control, so it needs Tab focus, a
+        // keyboard activation path (keyPressEvent below) and a role that is
+        // not StaticText. Without these the feature was reachable only by
+        // mouse double-click — which is the opposite of the accessibility
+        // motivation in issue #3627 (#5064 review).
+        //
+        // StrongFocus rather than TabFocus: the label already takes a click,
+        // and a control that focuses on Tab but not on click reads as broken.
+        setFocusPolicy(Qt::StrongFocus);
+        if (accessibleDescription().isEmpty()) {
+            setAccessibleDescription(
+                tr("Editable. Press Enter or Space to type an exact value in Hz "
+                   "between %1 and %2, or use the arrow buttons.")
+                    .arg(minValue).arg(maxValue));
+        }
+
+        static bool s_accessibilityFactoryInstalled = false;
+        if (!s_accessibilityFactoryInstalled) {
+            s_accessibilityFactoryInstalled = true;
+            QAccessible::installFactory(scrollableLabelAccessibleFactory);
+        }
     }
     bool isEditable() const { return m_editable; }
     int  editMinimum() const { return m_min; }
@@ -254,6 +287,21 @@ public:
         ev->accept();
     }
 
+    // Keyboard route into the editor. Same gates as the double-click: editing
+    // must be enabled and the panel unlocked. Anything else falls through to
+    // QLabel so Tab/Shift-Tab keep working.
+    void keyPressEvent(QKeyEvent* ev) override {
+        const bool activates = ev->key() == Qt::Key_Return
+                               || ev->key() == Qt::Key_Enter
+                               || ev->key() == Qt::Key_Space;
+        if (activates && m_editable && !m_editor && !ControlsLock::isLocked()) {
+            beginEdit(Qt::TabFocusReason);
+            ev->accept();
+            return;
+        }
+        QLabel::keyPressEvent(ev);
+    }
+
     void mouseDoubleClickEvent(QMouseEvent* ev) override {
         // Same gate as the wheel handler: a locked panel is being scrolled,
         // not operated. (#745)
@@ -267,11 +315,18 @@ public:
 
     // Exposed so a test (and any future keyboard route) can open the editor
     // without synthesising a double-click.
-    void beginEdit() {
+    void beginEdit(Qt::FocusReason reason = Qt::MouseFocusReason) {
         if (!m_editable || m_editor)
             return;
         m_editor = new QLineEdit(text(), this);
-        m_editor->setValidator(new ClampingIntValidator(m_min, m_max, m_editor));
+        m_editor->setValidator(makeCLocaleIntValidator(m_min, m_max, m_editor));
+        // The editor is a fresh widget every time, so it inherits none of the
+        // label's accessible metadata — to a screen reader it was an unnamed
+        // edit box appearing from nowhere (#5064 review).
+        m_editor->setAccessibleName(accessibleName());
+        m_editor->setAccessibleDescription(
+            tr("Type a value in Hz between %1 and %2, then press Enter. "
+               "Escape cancels.").arg(m_min).arg(m_max));
         m_editor->setAlignment(alignment());
         if (m_editorStyler)
             m_editorStyler(m_editor);
@@ -282,10 +337,15 @@ public:
         m_editor->installEventFilter(this);
         connect(m_editor, &QLineEdit::editingFinished, this, [this]() { commitEdit(); });
         m_editor->show();
-        m_editor->setFocus(Qt::MouseFocusReason);
+        m_editor->setFocus(reason);
     }
 
     bool isEditing() const { return m_editor != nullptr; }
+
+    // Whether closing the editor should hand focus back to the label. Yes for
+    // deliberate keyboard exits (Enter, Escape); No for focus-out, where the
+    // user is already on their way to another control.
+    enum class RestoreFocus { No, Yes };
 
 signals:
     void scrolled(int direction);
@@ -315,7 +375,27 @@ protected:
                     // window shortcut does not consume it; the KeyPress that
                     // follows is what actually closes the editor.
                     if (ev->type() == QEvent::KeyPress)
-                        closeEditor();
+                        closeEditor(RestoreFocus::Yes);
+                    ev->accept();
+                    return true;
+                }
+
+                // Return/Enter must be handled HERE rather than left to
+                // QLineEdit's own signal (#5064 review). QLineEdit emits
+                // returnPressed/editingFinished on Return only once the
+                // validator reports Acceptable — an EMPTY field is
+                // Intermediate and nothing repairs it, so Enter emitted
+                // nothing at all and left the editor sitting open on top of
+                // the label, eating every wheel event aimed at the numerals
+                // underneath. The same held for any out-of-range entry once
+                // the clamping fixup() was removed.
+                //
+                // Committing explicitly makes Enter terminal for EVERY input:
+                // a legal value commits, anything else cancels and the
+                // previous value stands.
+                if (ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter) {
+                    if (ev->type() == QEvent::KeyPress)
+                        commitEdit(RestoreFocus::Yes);
                     ev->accept();
                     return true;
                 }
@@ -327,7 +407,10 @@ protected:
             // the editor sitting open on top of the label — where it silently
             // ate every wheel event aimed at the numerals underneath.
             if (ev->type() == QEvent::FocusOut) {
-                commitEdit();               // commits if parseable, else cancels
+                // RestoreFocus::No — the user is on their way somewhere else
+                // (a Tab, a click on another control); pulling focus back to
+                // the label here would fight them for it.
+                commitEdit(RestoreFocus::No);
                 return false;               // let Qt finish its own focus work
             }
 
@@ -356,7 +439,7 @@ private:
     // Tear the editor down. Clears the member FIRST: destroying a focused
     // QLineEdit emits editingFinished, and a null member is what stops that
     // re-entering commitEdit() and committing a value twice.
-    void closeEditor() {
+    void closeEditor(RestoreFocus restore = RestoreFocus::No) {
         if (!m_editor)
             return;
         QLineEdit* ed = m_editor;
@@ -364,21 +447,48 @@ private:
         // hide() before deleteLater(): the delete only lands on the next
         // event-loop pass, and until then the editor is still a visible
         // child sitting on top of the label.
+        // window()->focusWidget(), not hasFocus(): hasFocus() is additionally
+        // false whenever the window is not ACTIVE, so a commit made while
+        // another window happens to be in front would silently skip the
+        // restore and strand the keyboard user with no focused control. The
+        // question here is only "was the editor this window's focus target".
+        QWidget* const editorWindow = ed->window();
+        const bool editorHadFocus =
+            editorWindow && editorWindow->focusWidget() == ed;
         ed->hide();
         ed->deleteLater();
+        // A keyboard user who opened the editor with Enter and closed it with
+        // Enter or Escape must land back on the label, not on whatever Qt
+        // picks when the focused child disappears.
+        if (restore == RestoreFocus::Yes && editorHadFocus
+            && focusPolicy() != Qt::NoFocus) {
+            setFocus(Qt::OtherFocusReason);
+        }
     }
 
-    void commitEdit() {
+    // Issue #3627: "Invalid values are rejected with validation and the
+    // previous value is restored." Restoring is implicit and that is the point
+    // — the editor is a separate QLineEdit laid OVER the label, so the label's
+    // own text was never touched and still holds model truth. Returning
+    // without emitting is the restore.
+    //
+    // This replaced a clamp (#5064 review). Clamping is a defensible UX, but
+    // it is not the one the issue specifies, and silently moving an operator's
+    // typed 20000 to 3250 reads as the radio having ignored them.
+    void commitEdit(RestoreFocus restore = RestoreFocus::No) {
         if (!m_editor)
             return;
         const QString typed = m_editor->text().trimmed();
-        closeEditor();
+        closeEditor(restore);
         bool ok = false;
         const int value = typed.toInt(&ok);
-        // Empty or unparseable cancels: the label keeps whatever the model
-        // last put there, so a stray double-click costs nothing.
-        if (ok)
-            emit editCommitted(value);
+        // Empty, unparseable, or outside the accepted range: reject, and the
+        // label keeps whatever the model last put there. The range test is
+        // here and not only in the validator because focus-out reaches this
+        // with Intermediate text the validator never blocked.
+        if (!ok || value < m_min || value > m_max)
+            return;
+        emit editCommitted(value);
     }
 
     bool       m_editable{false};
@@ -387,3 +497,30 @@ private:
     std::function<void(QWidget*)> m_editorStyler;
     QLineEdit* m_editor{nullptr};
 };
+
+// An editable ScrollableLabel is an interactive control, and QLabel's default
+// StaticText role tells a screen reader the opposite — the same
+// interactive-QLabel anti-pattern docs/a11y.md names. Same lazy-factory shape
+// as CrossNeedleMeterWidget's.
+//
+// EditableText rather than the doc's suggested Button: activating this does
+// not perform an action, it exposes a value for editing, and Button would have
+// an AT announce it as something to press. Display-only ScrollableLabels —
+// RIT/XIT, step size, RTTY mark/shift — return nullptr here and keep QLabel's
+// StaticText, which is correct for them.
+class ScrollableLabelAccessible : public QAccessibleWidget {
+public:
+    explicit ScrollableLabelAccessible(QWidget* widget)
+        : QAccessibleWidget(widget, QAccessible::EditableText) {}
+};
+
+inline QAccessibleInterface* scrollableLabelAccessibleFactory(const QString& key,
+                                                              QObject* object)
+{
+    if (key == QLatin1String("ScrollableLabel")) {
+        auto* label = qobject_cast<ScrollableLabel*>(object);
+        if (label && label->isEditable())
+            return new ScrollableLabelAccessible(label);
+    }
+    return nullptr;
+}

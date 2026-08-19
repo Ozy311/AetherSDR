@@ -327,16 +327,27 @@ void PhoneApplet::buildUI()
         });
         connect(m_lowCutLabel, &ScrollableLabel::editCommitted, this, [this](int hz) {
             if (!m_model) return;
-            // Clamp low against high HERE, exactly as the step buttons do at
-            // their own call site (lowCutUp above).
+            // Enforce the cross-bound HERE, because the model cannot:
+            // TransmitModel::setTxFilter() resolves a crossed pair by keeping
+            // the low it was given and pushing HIGH up to low + 50 — so
+            // typing 9000 into low cut would drag the high cut from 3300 to
+            // 9050, moving a passband edge the operator never touched.
             //
-            // This is not redundant with the model. TransmitModel::setTxFilter()
-            // resolves a crossed pair by keeping the low it was given and
-            // pushing HIGH up to low + 50 — so typing 9000 into low cut would
-            // drag the high cut from 3300 to 9050, moving a passband edge the
-            // operator never touched. Clamping low instead keeps their high.
-            m_model->setTxFilterLow(qBound(m_model->txFilterMinHz(), hz,
-                                           m_model->txFilterHigh() - m_model->txFilterMinWidthHz()));
+            // Out of range is REJECTED, not clamped (#3627: "Invalid values
+            // are rejected with validation and the previous value is
+            // restored"; #5064 review). Rejecting is simply returning: the
+            // label still shows model truth, because the editor is a separate
+            // widget laid over it and never wrote to the label's text.
+            //
+            // The STEP buttons still clamp, and that asymmetry is deliberate —
+            // a step is a request to move by one increment and stopping at the
+            // bound is the only sensible answer, while a typed number is a
+            // request for that exact value.
+            if (hz < m_model->txFilterMinHz()
+                || hz > m_model->txFilterHigh() - m_model->txFilterMinWidthHz()) {
+                return;
+            }
+            m_model->setTxFilterLow(hz);
         });
         connect(m_lowCutLabel, &ScrollableLabel::scrolled, this,
                 [lowCutUp, lowCutDown](int dir) {
@@ -399,11 +410,15 @@ void PhoneApplet::buildUI()
         });
         connect(m_highCutLabel, &ScrollableLabel::editCommitted, this, [this](int hz) {
             if (!m_model) return;
-            // No call-site clamp on this side: setTxFilter() already raises a
-            // too-low high to low + the minimum width and caps it at the
-            // model's maximum, which is the same
-            // answer the step buttons give. The asymmetry is real, not an
-            // oversight — see the low-cut handler for why that side needs one.
+            // Symmetric with the low-cut handler now that a typed value is
+            // rejected rather than clamped (#3627 / #5064 review). Relying on
+            // setTxFilter() to raise a too-low high to low + the minimum width
+            // was the CLAMPING answer; it is the wrong one for direct entry,
+            // where the operator gets their previous value back instead.
+            if (hz > m_model->txFilterMaxHz()
+                || hz < m_model->txFilterLow() + m_model->txFilterMinWidthHz()) {
+                return;
+            }
             m_model->setTxFilterHigh(hz);
         });
         connect(m_highCutLabel, &ScrollableLabel::scrolled, this,

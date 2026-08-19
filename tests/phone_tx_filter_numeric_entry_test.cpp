@@ -2,10 +2,13 @@
 //
 // The PHONE applet's low/high cut readouts are ScrollableLabels. Before this
 // they could only be stepped in 50 Hz snaps; now they can be typed into.
-// These rows pin the two things that are easy to get wrong: the cross-bound
-// clamp a typed value must obey (the same one the step buttons apply at their
-// call site), and the fact that editing is OFF for every OTHER ScrollableLabel
-// in the app — RIT/XIT, step size, RTTY mark/shift all share this class.
+// These rows pin the things that are easy to get wrong: the cross-bound a
+// typed value must obey, the fact that an out-of-range entry is REJECTED with
+// the previous value restored (issue #3627's words) rather than clamped, that
+// Enter is terminal for every input including the empty field, that the
+// feature is reachable from the keyboard, and that editing is OFF for every
+// OTHER ScrollableLabel in the app — RIT/XIT, step size, RTTY mark/shift all
+// share this class.
 
 #include "TestSettingsProfile.h"
 #include "core/AppSettings.h"
@@ -15,7 +18,9 @@
 
 #include <QApplication>
 #include <QLineEdit>
+#include <QAccessible>
 #include <QFocusEvent>
+#include <QLocale>
 #include <QSignalSpy>
 #include <QCoreApplication>
 #include <QTest>
@@ -55,6 +60,19 @@ QLineEdit* openEditor(ScrollableLabel* label)
 {
     QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
     label->beginEdit();
+    return label->findChild<QLineEdit*>();
+}
+
+// Open the editor the way an operator on a keyboard does, and hand back the
+// CURRENT one. Same deferred-delete drain as openEditor() and for the same
+// reason: without it findChild() returns an editor a previous row already
+// closed but that has not been deleted yet.
+QLineEdit* openEditorByKey(ScrollableLabel* label, Qt::Key key)
+{
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    label->setFocus(Qt::TabFocusReason);
+    QTest::keyClick(label, key);
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
     return label->findChild<QLineEdit*>();
 }
 
@@ -130,41 +148,160 @@ int main(int argc, char** argv)
     check(model.txFilterLow() == 100 && model.txFilterHigh() == 2900,
           "100-2900 Hz is reachable by typing both bounds");
 
-    // ── Cross-bound clamp: same rule the step buttons enforce ─────────────
+    // ── Cross-bound: rejected, previous value restored (#3627) ────────────
+    //
+    // Issue #3627: "Invalid values are rejected with validation and the
+    // previous value is restored." This clamped until the #5064 review — a
+    // typed 9000 silently became 3250, which reads as the radio ignoring the
+    // operator. The step buttons still clamp, deliberately: stopping at the
+    // bound is the only sensible answer to "move by one increment".
     model.setTxFilter(50, 3300);
     typeAndCommit(low, QStringLiteral("9000"));
-    check(model.txFilterLow() == 3250,
-          "a low cut above high is clamped to high - 50, never crossed");
-    // The reason that clamp lives at the call site: the model would resolve
-    // the same crossed pair by keeping low and dragging high up to 9050.
+    check(model.txFilterLow() == 50,
+          "a low cut above high is REJECTED, and the previous low stands");
+    // The reason the cross-bound test lives at the call site at all: the model
+    // would resolve the same crossed pair by keeping low and dragging high up
+    // to 9050, moving an edge the operator never touched.
     check(model.txFilterHigh() == 3300,
-          "clamping a typed low cut leaves the untouched high cut where it was");
+          "rejecting a typed low cut leaves the untouched high cut where it was");
+    check(low->text() == QStringLiteral("50"),
+          "the label is restored to the model value, not the rejected keystrokes");
 
     model.setTxFilter(500, 3300);
     typeAndCommit(high, QStringLiteral("200"));
-    check(model.txFilterHigh() == 550,
-          "a high cut below low is clamped to low + 50, never crossed");
+    check(model.txFilterHigh() == 3300,
+          "a high cut below low is REJECTED, and the previous high stands");
+
+    // Above the model's own ceiling, not just the cross-bound.
+    model.setTxFilter(50, 3300);
+    typeAndCommit(high, QStringLiteral("99999"));
+    check(model.txFilterHigh() == 3300,
+          "a high cut above the model maximum is rejected too");
 
     // ── The stale-label trap ──────────────────────────────────────────────
-    // Typing a value that clamps onto the CURRENT value changes nothing, so
-    // no model signal fires and syncFromModel() would never run on its own.
-    // Without the unconditional re-sync the label keeps showing the rejected
-    // number while the radio is on a different one.
+    // A rejected entry changes nothing, so no model signal fires and
+    // syncFromModel() never runs. The label must already be right — it is,
+    // because the editor is a separate widget laid OVER it and the label's own
+    // text was never touched. That is what makes "restore" free.
     model.setTxFilter(3250, 3300);
     typeAndCommit(low, QStringLiteral("9999"));
     check(model.txFilterLow() == 3250,
-          "clamping onto the current value leaves the model alone");
+          "a rejected entry leaves the model alone");
     check(low->text() == QStringLiteral("3250"),
-          "the label shows the model value, not the rejected keystrokes");
+          "the label still shows the model value after a rejected entry");
 
-    // Out-of-range input must not deadlock Return. QIntValidator calls
-    // 20000 Intermediate, and QLineEdit will not emit on Intermediate input,
-    // so without the clamping fixup() Enter would do nothing at all.
+    // Out-of-range input must not deadlock Return. QIntValidator calls 20000
+    // Intermediate and QLineEdit will not emit returnPressed/editingFinished
+    // on Intermediate input, so with the clamping fixup() gone, Enter is
+    // terminal only because eventFilter handles it explicitly.
     model.setTxFilter(50, 3300);
     typeAndCommit(low, QStringLiteral("20000"));
-    check(!low->isEditing(), "Enter commits an out-of-range value instead of hanging");
-    check(model.txFilterLow() == 3250 && model.txFilterHigh() == 3300,
-          "an out-of-range typed value is clamped, not silently dropped");
+    check(!low->isEditing(), "Enter closes the editor on an out-of-range value");
+    check(model.txFilterLow() == 50 && model.txFilterHigh() == 3300,
+          "an out-of-range typed value is rejected, and nothing moves");
+
+    // ── Enter is terminal for EVERY input (#5064 review) ──────────────────
+    //
+    // The stranding bug: commit hung off editingFinished, which QLineEdit
+    // emits on Return only once the validator reports Acceptable. An empty
+    // field is Intermediate and fixup() could not repair it, so Enter emitted
+    // nothing and the editor stayed open — covering the wheel target
+    // underneath. Reverting the Return branch in eventFilter fails these.
+    model.setTxFilter(200, 3300);
+    if (QLineEdit* ed = openEditor(low)) {
+        ed->clear();
+        check(!ed->hasAcceptableInput(),
+              "an empty field is Intermediate, not Acceptable (the precondition)");
+        QTest::keyClick(ed, Qt::Key_Return);
+    }
+    check(!low->isEditing(), "empty + Enter closes the editor instead of stranding it");
+    check(model.txFilterLow() == 200, "empty + Enter commits nothing");
+
+    // No "the wheel reaches the label again" row here, deliberately. Written
+    // and then deleted: it passed with the fix REVERTED, because a test can
+    // only sendEvent() to the label directly, which bypasses the very overlay
+    // the row claimed to be about. In the app the editor is a child laid over
+    // the label and the window routes the wheel to it; in a harness there is
+    // nothing to route. `!low->isEditing()` above is the real assertion — no
+    // editor, no lid.
+
+    model.setTxFilter(200, 3300);
+    typeAndCommit(low, QStringLiteral("abc"));
+    check(!low->isEditing() && model.txFilterLow() == 200,
+          "unparseable + Enter closes the editor and commits nothing");
+
+    // ── Keyboard reachability (docs/a11y.md, #5064 review) ────────────────
+    //
+    // The feature was mouse-double-click-only, which defeats the
+    // accessibility motivation in the issue itself.
+    check(low->focusPolicy() != Qt::NoFocus && high->focusPolicy() != Qt::NoFocus,
+          "an editable readout is Tab-focusable");
+    check(!low->accessibleDescription().isEmpty(),
+          "the readout describes its editability to an AT");
+
+    model.setTxFilter(200, 3300);
+    if (QLineEdit* ed = openEditorByKey(low, Qt::Key_Return)) {
+        check(low->isEditing(), "Return on the focused readout opens the editor");
+        check(!ed->accessibleName().isEmpty(),
+              "the editor carries an accessible name of its own");
+        ed->setText(QStringLiteral("450"));
+        QTest::keyClick(ed, Qt::Key_Return);
+    } else {
+        check(false, "Return on the focused readout opens the editor");
+    }
+    check(model.txFilterLow() == 450,
+          "a keyboard-only edit reaches the model (open, type, Enter)");
+    // Focus is asserted through the label's own window rather than
+    // hasFocus(): this applet is never shown, so no window is ACTIVE and
+    // hasFocus() is false for every widget in the harness regardless of where
+    // focus actually went. focusWidget() is the part the fix moves.
+    check(low->window()->focusWidget() == low,
+          "focus returns to the readout after a keyboard commit");
+
+    model.setTxFilter(200, 3300);
+    if (openEditorByKey(low, Qt::Key_Space)) {
+        check(low->isEditing(), "Space opens the editor too");
+        QTest::keyClick(low->findChild<QLineEdit*>(), Qt::Key_Escape);
+    } else {
+        check(false, "Space opens the editor too");
+    }
+    check(!low->isEditing() && low->window()->focusWidget() == low,
+          "Escape closes it and leaves focus on the readout");
+
+    // The keyboard route obeys the same lock gate as the double-click (#745).
+    ControlsLock::setLocked(true);
+    openEditorByKey(low, Qt::Key_Return);
+    check(!low->isEditing(), "a locked panel ignores the keyboard route too (#745)");
+    ControlsLock::setLocked(false);
+
+    // ── Validator and parser must agree on one locale (#5064 review) ──────
+    //
+    // QIntValidator validates in ITS locale; QString::toInt() always parses in
+    // the C locale. Under a grouping locale the validator called "3,000"
+    // Acceptable, Return fired, and toInt() then refused it — the edit closed
+    // having done nothing, which is indistinguishable from the radio ignoring
+    // the operator. The validator is now pinned to C with the group separator
+    // rejected, so the two halves accept exactly the same strings.
+    {
+        const QLocale previous = QLocale();
+        QLocale::setDefault(QLocale(QLocale::English, QLocale::UnitedStates));
+        model.setTxFilter(200, 3300);
+        if (QLineEdit* ed = openEditor(low)) {
+            ed->setText(QStringLiteral("3,000"));
+            check(!ed->hasAcceptableInput(),
+                  "a grouped number is rejected by the validator, as toInt() would");
+            QTest::keyClick(ed, Qt::Key_Return);
+        }
+        check(!low->isEditing() && model.txFilterLow() == 200,
+              "a grouped number closes the editor without a silent no-op commit");
+
+        // The same digits without the separator are the value the operator
+        // meant, and they must still work under that locale.
+        typeAndCommit(low, QStringLiteral("3000"));
+        check(model.txFilterLow() == 3000,
+              "plain ASCII digits still commit under a grouping locale");
+        QLocale::setDefault(previous);
+    }
 
     // ── Cancel routes ─────────────────────────────────────────────────────
     //
@@ -235,9 +372,9 @@ int main(int argc, char** argv)
     // Route 1: focus-out with input QIntValidator calls Intermediate.
     // QLineEdit emits editingFinished on focus-out only when the input is
     // ACCEPTABLE, so this emitted nothing and the editor stayed open forever.
-    // An EMPTY field is the case fixup() cannot rescue: 20000 clamps to 10000
-    // and becomes Acceptable, so Qt emits editingFinished for it anyway. Only
-    // an unparseable field actually strands the editor.
+    // The eventFilter's FocusOut branch is what closes it regardless — and
+    // now that the clamping fixup() is gone, EVERY non-Acceptable input takes
+    // this route, not just the empty one.
     model.setTxFilter(200, 3300);
     if (QLineEdit* ed = openEditor(low)) {
         ed->clear();
