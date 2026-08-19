@@ -3546,11 +3546,11 @@ QJsonObject AutomationServer::handleLine(const QByteArray& line, QLocalSocket* s
         // The coordinate-bearing click verbs accept numeric x/y fields
         // directly (dumpTree geometry is global), folded into `value` as "x y"
         // so both request forms share one code path. Explicit `value` still
-        // wins if supplied. Fold ONLY when both fields are present and
-        // JSON-numeric: toInt() coerces a missing field or a string-typed
-        // number to 0, which would turn a malformed request into a real click
-        // at the screen edge (or (0,0)) instead of an error — leave value empty
-        // so doClickAt rejects it.
+        // wins if supplied. Once either coordinate key is present, require both
+        // fields to be JSON-numeric: toInt() coerces a missing field or a
+        // string-typed number to 0, which would turn malformed input into a
+        // real click. This must be rejected here because doubleClick treats no
+        // coordinates as an intentional request for the widget centre.
         //
         // Resolve the CANONICAL verb through the registry rather than matching
         // the request string (#5069 review). Spelling out `clickAt || clickat`
@@ -3566,13 +3566,20 @@ QJsonObject AutomationServer::handleLine(const QByteArray& line, QLocalSocket* s
             && (coordinateSpec->name == QLatin1String("clickAt")
                 || coordinateSpec->name == QLatin1String("doubleClickAt")
                 || coordinateSpec->name == QLatin1String("doubleClick"));
-        if (coordinateVerb
-            && a.value.isEmpty()
-            && obj.value(QStringLiteral("x")).isDouble()
-            && obj.value(QStringLiteral("y")).isDouble()) {
-            a.value = QString::number(obj.value(QStringLiteral("x")).toInt())
-                      + QLatin1Char(' ')
-                      + QString::number(obj.value(QStringLiteral("y")).toInt());
+        if (coordinateVerb && a.value.isEmpty()) {
+            const bool hasX = obj.contains(QStringLiteral("x"));
+            const bool hasY = obj.contains(QStringLiteral("y"));
+            if (hasX || hasY) {
+                const QJsonValue x = obj.value(QStringLiteral("x"));
+                const QJsonValue y = obj.value(QStringLiteral("y"));
+                if (!x.isDouble() || !y.isDouble()) {
+                    return err(QStringLiteral("%1 JSON coordinates require numeric x and y")
+                                   .arg(coordinateSpec->name));
+                }
+                a.value = QString::number(x.toInt())
+                          + QLatin1Char(' ')
+                          + QString::number(y.toInt());
+            }
         }
     } else {
         // Bare line: positional tokens, parsed by the verb's registry entry

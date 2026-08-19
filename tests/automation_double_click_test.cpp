@@ -281,13 +281,15 @@ int main(int argc, char** argv)
                && target.doubleClicks == 0,
            QStringLiteral("events=%1").arg(target.events.size()));
 
-    // Explicit `value` stays authoritative over the numeric fields.
+    // Explicit `value` stays authoritative even when x/y would otherwise be
+    // malformed. Generic clients may send both representations while moving
+    // between schemas; the documented precedence must be deterministic.
     target.events.clear();
     const QJsonObject jsonValueWins = request(
         socket,
-        QByteArrayLiteral(R"({"cmd":"doubleClickAt","target":"automationDoubleClickTarget","value":"50 40","x":1,"y":2})"));
+        QByteArrayLiteral(R"({"cmd":"doubleClickAt","target":"automationDoubleClickTarget","value":"50 40","x":"ignored"})"));
     settle();
-    report("explicit value wins over JSON x/y",
+    report("explicit value wins over malformed JSON x/y",
            jsonValueWins.value(QStringLiteral("ok")).toBool()
                && isDoubleClickSequence(target.events, QPoint(50, 40)),
            QString::fromUtf8(QJsonDocument(jsonValueWins).toJson(QJsonDocument::Compact)));
@@ -302,6 +304,40 @@ int main(int argc, char** argv)
            !jsonStringCoord.value(QStringLiteral("ok")).toBool()
                && target.events.isEmpty(),
            QString::fromUtf8(QJsonDocument(jsonStringCoord).toJson(QJsonDocument::Compact)));
+
+    // doubleClick's coordinates are optional only when neither key is sent.
+    // Once a caller supplies either key, malformed or partial input must fail
+    // closed instead of collapsing to the intentional centre-click default.
+    target.events.clear();
+    const QJsonObject jsonDoubleStringCoord = request(
+        socket,
+        QByteArrayLiteral(R"({"cmd":"doubleClick","target":"automationDoubleClickTarget","x":"10","y":12})"));
+    settle();
+    report("doubleClick refuses a string-typed JSON coordinate",
+           !jsonDoubleStringCoord.value(QStringLiteral("ok")).toBool()
+               && target.events.isEmpty(),
+           QString::fromUtf8(
+               QJsonDocument(jsonDoubleStringCoord).toJson(QJsonDocument::Compact)));
+
+    target.events.clear();
+    const QJsonObject jsonDoubleXOnly = request(
+        socket,
+        QByteArrayLiteral(R"({"cmd":"doubleClick","target":"automationDoubleClickTarget","x":10})"));
+    settle();
+    report("doubleClick refuses JSON x without y",
+           !jsonDoubleXOnly.value(QStringLiteral("ok")).toBool()
+               && target.events.isEmpty(),
+           QString::fromUtf8(QJsonDocument(jsonDoubleXOnly).toJson(QJsonDocument::Compact)));
+
+    target.events.clear();
+    const QJsonObject jsonDoubleYOnly = request(
+        socket,
+        QByteArrayLiteral(R"({"cmd":"doubleClick","target":"automationDoubleClickTarget","y":12})"));
+    settle();
+    report("doubleClick refuses JSON y without x",
+           !jsonDoubleYOnly.value(QStringLiteral("ok")).toBool()
+               && target.events.isEmpty(),
+           QString::fromUtf8(QJsonDocument(jsonDoubleYOnly).toJson(QJsonDocument::Compact)));
 
     // ── refusals ─────────────────────────────────────────────────────────
     const QJsonObject noTarget = request(socket, QByteArrayLiteral("doubleClick"));
