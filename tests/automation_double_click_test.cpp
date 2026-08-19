@@ -208,6 +208,101 @@ int main(int argc, char** argv)
     report("clickAt raises no double-click", target.doubleClicks == 0,
            QStringLiteral("count=%1").arg(target.doubleClicks));
 
+    // ── JSON / MCP request form (#5069 review) ───────────────────────────
+    // MCP's `bridge_command` forwards a raw JSON object, so this — not the
+    // bare line — is the surface every MCP caller actually reaches. handleLine
+    // used to fold numeric x/y only when the request string was literally
+    // "clickAt" or "clickat", so doubleClickAt was rejected with "clickAt
+    // needs both x and y", its aliases with it, and doubleClick silently
+    // clicked the centre while reporting ok. Reverting the fold to the
+    // clickAt-only spelling fails every row below except the last two.
+    target.events.clear();
+    target.doubleClicks = 0;
+    const QJsonObject jsonAt = request(
+        socket,
+        QByteArrayLiteral(R"({"cmd":"doubleClickAt","target":"automationDoubleClickTarget","x":10,"y":12})"));
+    settle();
+    report("JSON doubleClickAt <target> x/y is accepted",
+           jsonAt.value(QStringLiteral("ok")).toBool(),
+           QString::fromUtf8(QJsonDocument(jsonAt).toJson(QJsonDocument::Compact)));
+    report("JSON doubleClickAt lands on the named point",
+           isDoubleClickSequence(target.events, QPoint(10, 12)),
+           QStringLiteral("events=%1").arg(target.events.size()));
+
+    // The alias spellings resolve through the same registry entry, so they
+    // must normalize identically — the old literal match covered neither.
+    target.events.clear();
+    target.doubleClicks = 0;
+    const QJsonObject jsonAlias = request(
+        socket,
+        QByteArrayLiteral(R"({"cmd":"dblClickAt","target":"automationDoubleClickTarget","x":20,"y":22})"));
+    settle();
+    report("JSON alias dblClickAt normalizes x/y too",
+           jsonAlias.value(QStringLiteral("ok")).toBool()
+               && isDoubleClickSequence(target.events, QPoint(20, 22)),
+           QString::fromUtf8(QJsonDocument(jsonAlias).toJson(QJsonDocument::Compact)));
+
+    target.events.clear();
+    const QJsonObject jsonLowerAlias = request(
+        socket,
+        QByteArrayLiteral(R"({"cmd":"doubleclickat","target":"automationDoubleClickTarget","x":30,"y":24})"));
+    settle();
+    report("JSON alias doubleclickat normalizes x/y too",
+           jsonLowerAlias.value(QStringLiteral("ok")).toBool()
+               && isDoubleClickSequence(target.events, QPoint(30, 24)),
+           QString::fromUtf8(QJsonDocument(jsonLowerAlias).toJson(QJsonDocument::Compact)));
+
+    // doubleClick's failure was the quiet one: ok:true at the wrong point.
+    target.events.clear();
+    target.doubleClicks = 0;
+    const QJsonObject jsonDouble = request(
+        socket,
+        QByteArrayLiteral(R"({"cmd":"doubleClick","target":"automationDoubleClickTarget","x":40,"y":30})"));
+    settle();
+    report("JSON doubleClick honours x/y instead of clicking the centre",
+           jsonDouble.value(QStringLiteral("ok")).toBool()
+               && isDoubleClickSequence(target.events, QPoint(40, 30)),
+           QStringLiteral("centre=%1,%2 events=%3")
+               .arg(target.rect().center().x())
+               .arg(target.rect().center().y())
+               .arg(target.events.size()));
+
+    // clickAt's own JSON form must be untouched by the generalization.
+    target.events.clear();
+    target.doubleClicks = 0;
+    const QJsonObject jsonClickAt = request(
+        socket,
+        QByteArrayLiteral(R"({"cmd":"clickAt","target":"automationDoubleClickTarget","x":11,"y":13})"));
+    settle();
+    report("JSON clickAt is unchanged (press+release at the point)",
+           jsonClickAt.value(QStringLiteral("ok")).toBool()
+               && target.events.size() == 2
+               && target.events.at(0).position == QPoint(11, 13)
+               && target.doubleClicks == 0,
+           QStringLiteral("events=%1").arg(target.events.size()));
+
+    // Explicit `value` stays authoritative over the numeric fields.
+    target.events.clear();
+    const QJsonObject jsonValueWins = request(
+        socket,
+        QByteArrayLiteral(R"({"cmd":"doubleClickAt","target":"automationDoubleClickTarget","value":"50 40","x":1,"y":2})"));
+    settle();
+    report("explicit value wins over JSON x/y",
+           jsonValueWins.value(QStringLiteral("ok")).toBool()
+               && isDoubleClickSequence(target.events, QPoint(50, 40)),
+           QString::fromUtf8(QJsonDocument(jsonValueWins).toJson(QJsonDocument::Compact)));
+
+    // A string-typed coordinate must NOT coerce to 0 and click the corner.
+    target.events.clear();
+    const QJsonObject jsonStringCoord = request(
+        socket,
+        QByteArrayLiteral(R"({"cmd":"doubleClickAt","target":"automationDoubleClickTarget","x":"10","y":12})"));
+    settle();
+    report("a string-typed JSON coordinate is refused, not coerced to 0",
+           !jsonStringCoord.value(QStringLiteral("ok")).toBool()
+               && target.events.isEmpty(),
+           QString::fromUtf8(QJsonDocument(jsonStringCoord).toJson(QJsonDocument::Compact)));
+
     // ── refusals ─────────────────────────────────────────────────────────
     const QJsonObject noTarget = request(socket, QByteArrayLiteral("doubleClick"));
     report("doubleClick without a target is refused",

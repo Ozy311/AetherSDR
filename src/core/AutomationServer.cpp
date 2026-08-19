@@ -3543,15 +3543,30 @@ QJsonObject AutomationServer::handleLine(const QByteArray& line, QLocalSocket* s
                 }
             }
         }
-        // clickAt accepts numeric x/y fields directly (dumpTree geometry is
-        // global), folded into `value` as "x y" so both request forms share one
-        // code path. Explicit `value` still wins if supplied. Fold ONLY when
-        // both fields are present and JSON-numeric: toInt() coerces a missing
-        // field or a string-typed number to 0, which would turn a malformed
-        // request into a real click at the screen edge (or (0,0)) instead of
-        // an error — leave value empty so doClickAt rejects it. Match both
-        // alias spellings, like the registry does.
-        if ((cmd == QLatin1String("clickAt") || cmd == QLatin1String("clickat"))
+        // The coordinate-bearing click verbs accept numeric x/y fields
+        // directly (dumpTree geometry is global), folded into `value` as "x y"
+        // so both request forms share one code path. Explicit `value` still
+        // wins if supplied. Fold ONLY when both fields are present and
+        // JSON-numeric: toInt() coerces a missing field or a string-typed
+        // number to 0, which would turn a malformed request into a real click
+        // at the screen edge (or (0,0)) instead of an error — leave value empty
+        // so doClickAt rejects it.
+        //
+        // Resolve the CANONICAL verb through the registry rather than matching
+        // the request string (#5069 review). Spelling out `clickAt || clickat`
+        // duplicated the alias table, and it silently excluded every verb added
+        // afterwards: `doubleClickAt` was rejected with "clickAt needs both x
+        // and y", its `doubleclickat` / `dblClickAt` aliases with it, and
+        // `doubleClick` ignored the fields and clicked the widget centre. MCP's
+        // `bridge_command` forwards this JSON unchanged, so for those verbs that
+        // was the entire coordinate surface.
+        const VerbSpec* coordinateSpec = findVerb(cmd);
+        const bool coordinateVerb =
+            coordinateSpec
+            && (coordinateSpec->name == QLatin1String("clickAt")
+                || coordinateSpec->name == QLatin1String("doubleClickAt")
+                || coordinateSpec->name == QLatin1String("doubleClick"));
+        if (coordinateVerb
             && a.value.isEmpty()
             && obj.value(QStringLiteral("x")).isDouble()
             && obj.value(QStringLiteral("y")).isDouble()) {
