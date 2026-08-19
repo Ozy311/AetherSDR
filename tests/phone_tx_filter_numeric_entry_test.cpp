@@ -239,6 +239,65 @@ int main(int argc, char** argv)
     check(!low->accessibleDescription().isEmpty(),
           "the readout describes its editability to an AT");
 
+    // ── The AT contract, not just the names (#5064 re-review) ─────────────
+    //
+    // The first version of this claimed role EditableText and implemented no
+    // text or editable-text interface, leaving SetFocus as the only action —
+    // so VoiceOver/NVDA/switch-control could focus the readout and never open
+    // the editor, because AT activation invokes an accessibility ACTION rather
+    // than synthesizing Return. Asserting the role alone would not have caught
+    // that; these rows assert the actionable contract behind it.
+    {
+        QAccessibleInterface* iface = QAccessible::queryAccessibleInterface(low);
+        check(iface != nullptr, "the editable readout has an accessible interface");
+        check(iface && iface->role() == QAccessible::Button,
+              "the editable readout reports Button, per docs/a11y.md");
+
+        QAccessibleActionInterface* action = iface ? iface->actionInterface() : nullptr;
+        check(action != nullptr, "it exposes an action interface");
+        const QStringList names = action ? action->actionNames() : QStringList{};
+        check(names.contains(QAccessibleActionInterface::pressAction()),
+              "press is among its actions, not just SetFocus");
+        check(names.contains(QAccessibleActionInterface::setFocusAction()),
+              "SetFocus is still offered alongside it");
+        check(action
+                  && !action->keyBindingsForAction(
+                             QAccessibleActionInterface::pressAction()).isEmpty(),
+              "the press action announces the keys that also perform it");
+
+        // The row that actually matters: driving the accessibility API the way
+        // an AT does must open the real editor.
+        model.setTxFilter(200, 3300);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        if (action)
+            action->doAction(QAccessibleActionInterface::pressAction());
+        check(low->isEditing(), "an AT press opens the editor");
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        if (QLineEdit* ed = low->findChild<QLineEdit*>()) {
+            ed->setText(QStringLiteral("610"));
+            QTest::keyClick(ed, Qt::Key_Return);
+        }
+        check(model.txFilterLow() == 610,
+              "an edit opened through the accessibility API commits normally");
+
+        // The lock gate applies to the AT route too — the keyboard and
+        // double-click routes both honour it, and a third way in that ignored
+        // it would be a hole (#745).
+        ControlsLock::setLocked(true);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        if (action)
+            action->doAction(QAccessibleActionInterface::pressAction());
+        check(!low->isEditing(), "an AT press on a locked panel is a no-op (#745)");
+        ControlsLock::setLocked(false);
+
+        // A display-only ScrollableLabel must NOT become a button.
+        ScrollableLabel readOnly(QStringLiteral("+0 Hz"));
+        QAccessibleInterface* plainIface =
+            QAccessible::queryAccessibleInterface(&readOnly);
+        check(plainIface && plainIface->role() != QAccessible::Button,
+              "a display-only ScrollableLabel is not announced as a button");
+    }
+
     model.setTxFilter(200, 3300);
     if (QLineEdit* ed = openEditorByKey(low, Qt::Key_Return)) {
         check(low->isEditing(), "Return on the focused readout opens the editor");

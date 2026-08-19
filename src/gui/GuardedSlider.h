@@ -9,6 +9,7 @@
 #include <QLineEdit>
 #include <QIntValidator>
 #include <QAccessible>
+#include <QCoreApplication>
 #include <QAccessibleWidget>
 #include <QEvent>
 #include <QLocale>
@@ -503,15 +504,74 @@ private:
 // interactive-QLabel anti-pattern docs/a11y.md names. Same lazy-factory shape
 // as CrossNeedleMeterWidget's.
 //
-// EditableText rather than the doc's suggested Button: activating this does
-// not perform an action, it exposes a value for editing, and Button would have
-// an AT announce it as something to press. Display-only ScrollableLabels —
-// RIT/XIT, step size, RTTY mark/shift — return nullptr here and keep QLabel's
-// StaticText, which is correct for them.
+// The role is Button, with a `press` action that opens the editor, exactly as
+// docs/a11y.md prescribes. An earlier version of this claimed EditableText on
+// the argument that activating it exposes a value rather than performing an
+// action — and shipped neither contract: runtime inspection found
+// textInterface() and editableTextInterface() both null and SetFocus as the
+// only action, so VoiceOver/NVDA/switch-control could focus the readout but
+// never open the editor (#5064 review). A role is a promise about which
+// interfaces exist; claiming one and implementing none is worse than the
+// StaticText it replaced, because an AT stops looking.
+//
+// Button is also the honest description of the RESTING state. This is a
+// two-stage control: the label is the thing you activate, and the QLineEdit
+// that appears carries Qt's own complete editable-text semantics. Nothing is
+// editable until the press happens.
+//
+// Keyboard users reach the same beginEdit() through keyPressEvent; AT users
+// reach it here. Both go through one entry point, and both honour the #745
+// lock — an AT press on a locked panel is the no-op the double-click is.
+//
+// Display-only ScrollableLabels — RIT/XIT, step size, RTTY mark/shift —
+// return nullptr from the factory and keep QLabel's StaticText, which is
+// correct for them.
 class ScrollableLabelAccessible : public QAccessibleWidget {
 public:
     explicit ScrollableLabelAccessible(QWidget* widget)
-        : QAccessibleWidget(widget, QAccessible::EditableText) {}
+        : QAccessibleWidget(widget, QAccessible::Button) {}
+
+    // QAccessibleWidget already implements QAccessibleActionInterface (it
+    // offers SetFocus for a focusable widget), so these are overrides rather
+    // than a new interface — actionInterface() is non-null either way. What
+    // was missing was an action that DOES anything.
+    QStringList actionNames() const override
+    {
+        QStringList names{QAccessibleActionInterface::pressAction()};
+        names += QAccessibleWidget::actionNames();   // keeps SetFocus
+        names.removeDuplicates();
+        return names;
+    }
+
+    void doAction(const QString& actionName) override
+    {
+        if (actionName == QAccessibleActionInterface::pressAction()) {
+            if (auto* label = qobject_cast<ScrollableLabel*>(object())) {
+                if (!ControlsLock::isLocked())
+                    label->beginEdit(Qt::OtherFocusReason);
+            }
+            return;
+        }
+        QAccessibleWidget::doAction(actionName);
+    }
+
+    QStringList keyBindingsForAction(const QString& actionName) const override
+    {
+        if (actionName == QAccessibleActionInterface::pressAction()) {
+            // The same keys keyPressEvent() answers, so what an AT announces
+            // and what the keyboard actually does cannot drift apart.
+            return {QStringLiteral("Return"), QStringLiteral("Space")};
+        }
+        return QAccessibleWidget::keyBindingsForAction(actionName);
+    }
+
+    QString localizedActionDescription(const QString& actionName) const override
+    {
+        if (actionName == QAccessibleActionInterface::pressAction())
+            return QCoreApplication::translate(
+                "ScrollableLabel", "Open an editor to type an exact value");
+        return QAccessibleWidget::localizedActionDescription(actionName);
+    }
 };
 
 inline QAccessibleInterface* scrollableLabelAccessibleFactory(const QString& key,
