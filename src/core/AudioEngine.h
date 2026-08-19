@@ -939,9 +939,14 @@ private:
     // Set by the watchdog, consumed by the next startTxStream(): distinguishes a
     // recovery reopen (advance the ladder) from a fresh start (reset to stage 0).
     bool               m_txSilentOpenRetryArmed{false};
-    // Index into silentOpenLadder(m_txSilentOpenInitialChannels). 0 == the
-    // initial, non-recovery open.
-    int                m_txSilentOpenStage{0};
+    // Position in AudioFormatNegotiator::txOpenLadder(m_txSilentOpenInitialChannels),
+    // the ONE ordered rate x format x channels sequence. 0 == the initial,
+    // non-recovery open. Advanced by BOTH failure shapes — a null open moves
+    // it inline, a non-null/no-data open moves it from the watchdog — so the
+    // two can no longer disagree about which rung is open (round-3 review of
+    // PR #5017). Forward-only, which is what makes a tuple already observed
+    // silent unreachable rather than merely unlikely.
+    int                m_txOpenStage{0};
     // Channel count of the stage-0 open, so the ladder stays stable across
     // reopens even though fmt.channelCount() changes underneath it.
     int                m_txSilentOpenInitialChannels{2};

@@ -117,36 +117,72 @@ ResamplerKind resamplerKindFor(int deviceRate, ResamplerPolicy policy, int inter
     return ResamplerKind::None;
 }
 
-QList<SilentOpenAttempt> silentOpenLadder(int initialChannels)
+QList<TxOpenAttempt> txOpenLadder(int initialChannels)
 {
-    // Stage 0 is the open already in flight, so it must reproduce exactly what
-    // AudioEngine opened: Float32 at whatever channel count survived the
-    // maximumChannelCount() clamp. Everything after it is recovery.
+    // Stage 0 must reproduce exactly what AudioEngine opens first: 48 kHz
+    // Float32 at whatever channel count survived the maximumChannelCount()
+    // clamp. Everything after it is recovery.
     const int initial = (initialChannels <= 1) ? 1 : 2;
 
-    QList<SilentOpenAttempt> ladder;
-    const auto add = [&](SampleFmt fmt, int channels) {
-        for (const auto& a : ladder) {
-            if (a.fmt == fmt && a.channels == channels) return;
+    QList<TxOpenAttempt> ladder;
+    const auto add = [&](int rate, SampleFmt fmt, int channels) {
+        const TxOpenAttempt candidate{rate, fmt, channels};
+        for (const auto& existing : ladder) {
+            if (existing == candidate) return;
         }
-        ladder.append(SilentOpenAttempt{fmt, channels});
+        ladder.append(candidate);
     };
 
-    // Order matters and is deliberate:
-    //   0. the initial open (Float32, clamped channels)
-    //   1. Float32 mono   — the historical #2929 recovery, unchanged. A
-    //                       mono-only mic is the common cause of a silent open,
-    //                       so this must still be the FIRST thing tried.
-    //   2. Int16 at the initial channel count
-    //   3. Int16 mono
-    // Channel count is exhausted before the format changes, so an endpoint that
-    // is merely mono-only recovers in exactly one reopen as it always did; the
-    // format dimension only costs extra reopens on devices that need it.
-    add(SampleFmt::Float32, initial);
-    add(SampleFmt::Float32, 1);
-    add(SampleFmt::Int16, initial);
-    add(SampleFmt::Int16, 1);
+    // Rate outermost, then format, then channels. Within 48 kHz that reads
+    // Float32/clamped, Float32/mono, Int16/clamped, Int16/mono — the exact
+    // order the #2929 recovery had, so a merely mono-only mic still recovers
+    // in ONE reopen and the format dimension only costs extra reopens on
+    // devices that actually need it.
+    //
+    // The lower rates are the rungs the null-open path used to own as a
+    // separate loop. They are here rather than there because a rung reached by
+    // a null open and a rung reached by a silent open are the same rung, and
+    // the bug that produced this restructure was two sequences disagreeing
+    // about which one they were on.
+    for (int rate : {48000, 44100, 24000, 16000}) {
+        for (SampleFmt fmt : {SampleFmt::Float32, SampleFmt::Int16}) {
+            add(rate, fmt, initial);
+            add(rate, fmt, 1);
+        }
+    }
     return ladder;
+}
+
+TxOpenCursor::TxOpenCursor(int initialChannels, int stage)
+    : m_ladder(txOpenLadder(initialChannels))
+{
+    // A persisted stage from a previous pass is clamped rather than trusted:
+    // the ladder's LENGTH depends on the channel clamp, so a stage carried
+    // across a device change could otherwise index past the end.
+    m_stage = qBound(0, stage, static_cast<int>(m_ladder.size()) - 1);
+}
+
+bool TxOpenCursor::advance()
+{
+    if (!hasNext())
+        return false;
+    ++m_stage;
+    return true;
+}
+
+int walkTxOpen(TxOpenCursor& cursor,
+               const std::function<TxOpenOutcome(const TxOpenAttempt&)>& probe)
+{
+    for (;;) {
+        const TxOpenOutcome outcome = probe(cursor.attempt());
+        if (outcome == TxOpenOutcome::Delivers)
+            return cursor.stage();
+        // Null and SilentNonNull take the same branch on purpose — see the
+        // enum's comment. If the ladder is exhausted the mic never opens
+        // (null) or never speaks (silent); either way there is nothing left.
+        if (!cursor.advance())
+            return -1;
+    }
 }
 
 QList<FormatCandidate> buildLadder(TargetOs os,

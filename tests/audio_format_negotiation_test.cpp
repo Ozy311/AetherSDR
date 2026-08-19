@@ -267,60 +267,191 @@ int main()
     // works or the ladder runs out" — is walkable headlessly on every runner,
     // including the Linux ones that compile none of the Windows engine code.
     {
-        const auto ladder = silentOpenLadder(2);
-        report("silent-open ladder / stereo device has 4 stages",
-               ladder.size() == 4, "size=" + std::to_string(ladder.size()));
-        report("silent-open stage 0 == the initial Float32 stereo open",
-               ladder.size() > 0 && ladder.at(0).fmt == F && ladder.at(0).channels == 2);
-        report("silent-open stage 1 == Float32 mono (#2929 behaviour preserved)",
-               ladder.size() > 1 && ladder.at(1).fmt == F && ladder.at(1).channels == 1);
-        report("silent-open stage 2 == Int16 stereo (the format dimension #5017 added)",
-               ladder.size() > 2 && ladder.at(2).fmt == I && ladder.at(2).channels == 2);
-        report("silent-open stage 3 == Int16 mono",
-               ladder.size() > 3 && ladder.at(3).fmt == I && ladder.at(3).channels == 1);
+        // ── The ONE ordered open ladder (round-3 review of PR #5017) ───────
+        //
+        // This used to be two sequences: a (format, channels) silent-open
+        // ladder at 48 kHz, and a separate rate x channels x format loop in
+        // AudioEngine entered only on a null open. They could interleave into
+        // a permanently silent mic. There is one device, so there is now one
+        // ladder, and both failure shapes advance the same cursor.
+        const auto ladder = txOpenLadder(2);
+        report("open ladder / stereo device: 4 rates x 2 formats x 2 channel counts",
+               ladder.size() == 16, "size=" + std::to_string(ladder.size()));
+
+        // The 48 kHz prefix is the historical #2929 ladder, unchanged, because
+        // a mono-only mic is the common cause of a silent open and must still
+        // recover in ONE reopen.
+        report("stage 0 == the initial 48k Float32 stereo open",
+               ladder.size() > 0 && ladder.at(0).rate == 48000
+                   && ladder.at(0).fmt == F && ladder.at(0).channels == 2);
+        report("stage 1 == 48k Float32 mono (#2929 behaviour preserved)",
+               ladder.size() > 1 && ladder.at(1).rate == 48000
+                   && ladder.at(1).fmt == F && ladder.at(1).channels == 1);
+        report("stage 2 == 48k Int16 stereo (the format dimension #5017 added)",
+               ladder.size() > 2 && ladder.at(2).rate == 48000
+                   && ladder.at(2).fmt == I && ladder.at(2).channels == 2);
+        report("stage 3 == 48k Int16 mono",
+               ladder.size() > 3 && ladder.at(3).rate == 48000
+                   && ladder.at(3).fmt == I && ladder.at(3).channels == 1);
+        // Stage 4 is the rung the OLD code could never reach from a silent
+        // stage 3 — it restarted the other loop at 48k Float stereo instead.
+        report("stage 4 == 44100 Float32 stereo, not a restart at 48k",
+               ladder.size() > 4 && ladder.at(4).rate == 44100
+                   && ladder.at(4).fmt == F && ladder.at(4).channels == 2);
+
+        bool anyDuplicate = false;
+        for (int a = 0; a < ladder.size(); ++a) {
+            for (int b = a + 1; b < ladder.size(); ++b) {
+                if (ladder.at(a) == ladder.at(b)) anyDuplicate = true;
+            }
+        }
+        report("the ladder contains no duplicate (rate, format, channels)",
+               !anyDuplicate);
     }
     {
         // A device already clamped to mono by maximumChannelCount() must not
-        // burn a stage reopening the identical (format, channels) pair.
-        const auto ladder = silentOpenLadder(1);
-        report("silent-open ladder / mono-clamped device dedups to 2 stages",
-               ladder.size() == 2, "size=" + std::to_string(ladder.size()));
-        report("silent-open mono-clamped stage 0 == Float32 mono",
-               ladder.size() > 0 && ladder.at(0).fmt == F && ladder.at(0).channels == 1);
-        report("silent-open mono-clamped stage 1 == Int16 mono",
-               ladder.size() > 1 && ladder.at(1).fmt == I && ladder.at(1).channels == 1);
+        // burn a rung reopening the identical tuple.
+        const auto ladder = txOpenLadder(1);
+        report("open ladder / mono-clamped device dedups to 8 rungs",
+               ladder.size() == 8, "size=" + std::to_string(ladder.size()));
+        report("mono-clamped stage 0 == 48k Float32 mono",
+               ladder.size() > 0 && ladder.at(0).rate == 48000
+                   && ladder.at(0).fmt == F && ladder.at(0).channels == 1);
+        report("mono-clamped stage 1 == 48k Int16 mono",
+               ladder.size() > 1 && ladder.at(1).rate == 48000
+                   && ladder.at(1).fmt == I && ladder.at(1).channels == 1);
     }
     {
-        // The state machine itself. Model a WASAPI endpoint that ACCEPTS every
-        // open (non-null QIODevice, so the null-open fallback ladder never runs)
-        // but only ever DELIVERS bytes for one (format, channels) pair. Returns
-        // the stage that finally produces audio, or -1 if the mic stays silent.
+        // ── The state machine, driven through the SHIPPED cursor ───────────
         //
-        // This is the regression: before the fix the recovery was a one-shot
-        // bool, so an Int16-only endpoint stalled at stage 1 with the watchdog
-        // already spent — permanently silent with no error anywhere.
-        const auto walk = [](SampleFmt deliversFmt, int deliversCh,
-                             int initialChannels) -> int {
-            const auto ladder = silentOpenLadder(initialChannels);
-            for (int stage = 0; stage < ladder.size(); ++stage) {
-                const auto& attempt = ladder.at(stage);
-                if (attempt.fmt == deliversFmt && attempt.channels == deliversCh)
-                    return stage;   // bytes arrived; watchdog never fires
-                // No bytes in 1.5 s. The watchdog arms iff a rung remains.
-                if (stage + 1 >= ladder.size()) return -1;
-            }
-            return -1;
+        // The previous version of this block walked a copy of the state
+        // machine written inside the test, and modelled every open as
+        // non-null — so it could not express the interaction that produced
+        // the round-3 P1 and passed against the bug. walkTxOpen() drives
+        // TxOpenCursor, the same object AudioEngine drives, and the probe
+        // returns a real per-attempt outcome: Null, SilentNonNull, Delivers.
+        using Outcome = TxOpenOutcome;
+
+        // A device that ACCEPTS every open but only ever delivers bytes for
+        // one tuple — the original #2929/#5017 shape.
+        const auto silentExcept = [](int rate, SampleFmt fmt, int ch,
+                                     int initialChannels) -> int {
+            TxOpenCursor cursor(initialChannels);
+            return walkTxOpen(cursor, [&](const TxOpenAttempt& a) {
+                return (a.rate == rate && a.fmt == fmt && a.channels == ch)
+                           ? Outcome::Delivers
+                           : Outcome::SilentNonNull;
+            });
         };
-        report("silent open / Int16-only STEREO mic is reached (the P1 fix)",
-               walk(I, 2, 2) == 2, "stage=" + std::to_string(walk(I, 2, 2)));
+        report("silent open / Int16-only STEREO mic is reached (the round-2 P1)",
+               silentExcept(48000, I, 2, 2) == 2,
+               "stage=" + std::to_string(silentExcept(48000, I, 2, 2)));
         report("silent open / Int16-only MONO mic is reached",
-               walk(I, 1, 2) == 3, "stage=" + std::to_string(walk(I, 1, 2)));
+               silentExcept(48000, I, 1, 2) == 3);
         report("silent open / mono-only Float mic still recovers in ONE reopen",
-               walk(F, 1, 2) == 1, "stage=" + std::to_string(walk(F, 1, 2)));
+               silentExcept(48000, F, 1, 2) == 1);
         report("silent open / mono-clamped Int16-only mic is reached",
-               walk(I, 1, 1) == 1, "stage=" + std::to_string(walk(I, 1, 1)));
+               silentExcept(48000, I, 1, 1) == 1);
         report("silent open / a mic that never delivers terminates instead of looping",
-               walk(F, 7, 2) == -1);
+               silentExcept(8000, F, 7, 2) == -1);
+
+        // ── rfoust's exact round-3 scenario ────────────────────────────────
+        //
+        // 48k Float stereo is observed SILENT at stage 0. The three remaining
+        // 48 kHz rungs then return null. Under the old code that null at the
+        // last 48 kHz stage dropped into the separate fallback loop, which
+        // restarted at 48k Float stereo — the known-silent tuple — accepted
+        // the non-null open, and armed no watchdog because the silent ladder
+        // was already terminal. Permanently silent, no error anywhere.
+        //
+        // With one forward-only cursor the walk simply continues to 44100.
+        {
+            QList<TxOpenAttempt> probed;
+            TxOpenCursor cursor(2);
+            const int stage = walkTxOpen(cursor, [&](const TxOpenAttempt& a) {
+                probed.append(a);
+                if (a.rate == 48000 && a.fmt == F && a.channels == 2)
+                    return Outcome::SilentNonNull;   // observed silent
+                if (a.rate == 48000)
+                    return Outcome::Null;            // the rest of 48k refuses
+                if (a.rate == 44100 && a.fmt == F && a.channels == 2)
+                    return Outcome::Delivers;
+                return Outcome::Null;
+            });
+            report("mixed null/silent walk reaches 44100 instead of stranding",
+                   stage == 4, "stage=" + std::to_string(stage));
+
+            int reprobes = 0;
+            for (int a = 0; a < probed.size(); ++a) {
+                for (int b = a + 1; b < probed.size(); ++b) {
+                    if (probed.at(a) == probed.at(b)) ++reprobes;
+                }
+            }
+            // The structural claim: a forward-only cursor CANNOT re-accept a
+            // tuple it already observed silent, because that tuple is behind
+            // it. Re-probing is the symptom the old two-loop code showed.
+            report("no tuple is attempted twice in one walk",
+                   reprobes == 0, "reprobes=" + std::to_string(reprobes));
+        }
+
+        // Null and SilentNonNull must be interchangeable — that equivalence is
+        // the fix, so it gets its own row rather than being implied.
+        {
+            const auto walkWith = [](Outcome badOutcome) {
+                TxOpenCursor cursor(2);
+                return walkTxOpen(cursor, [&](const TxOpenAttempt& a) {
+                    if (a.rate == 24000 && a.fmt == I && a.channels == 1)
+                        return Outcome::Delivers;
+                    return badOutcome;
+                });
+            };
+            report("a null open and a no-data open advance the cursor identically",
+                   walkWith(Outcome::Null) == walkWith(Outcome::SilentNonNull)
+                       && walkWith(Outcome::Null) == 11,
+                   "null=" + std::to_string(walkWith(Outcome::Null))
+                       + " silent=" + std::to_string(walkWith(Outcome::SilentNonNull)));
+        }
+
+        // Interleaved outcomes across the first rungs.
+        {
+            TxOpenCursor cursor(2);
+            const int stage = walkTxOpen(cursor, [&](const TxOpenAttempt& a) {
+                if (a.rate == 48000 && a.fmt == F && a.channels == 2)
+                    return Outcome::Null;
+                if (a.rate == 48000 && a.fmt == F && a.channels == 1)
+                    return Outcome::SilentNonNull;
+                if (a.rate == 48000 && a.fmt == I && a.channels == 2)
+                    return Outcome::Delivers;
+                return Outcome::Null;
+            });
+            report("null at stage 0, silent at stage 1, delivering at stage 2",
+                   stage == 2, "stage=" + std::to_string(stage));
+        }
+
+        // The cursor a watchdog restart rebuilds from a persisted stage must
+        // resume where it left off, not restart the ladder.
+        {
+            TxOpenCursor resumed(2, 3);
+            report("a cursor rebuilt at a persisted stage resumes there",
+                   resumed.stage() == 3 && resumed.attempt().rate == 48000
+                       && resumed.attempt().fmt == I
+                       && resumed.attempt().channels == 1);
+            TxOpenCursor clamped(1, 99);
+            report("a persisted stage past the end of a shorter ladder is clamped",
+                   clamped.stage() == clamped.size() - 1 && !clamped.hasNext());
+        }
+
+        // hasNext() is what arms the watchdog, and it must be false exactly at
+        // the terminal rung — otherwise the engine arms a retry that has
+        // nowhere to go, or fails to arm one that does.
+        {
+            TxOpenCursor cursor(2);
+            int steps = 0;
+            while (cursor.hasNext()) { cursor.advance(); ++steps; }
+            report("hasNext() is false exactly at the terminal rung",
+                   steps == cursor.size() - 1 && cursor.stage() == cursor.size() - 1,
+                   "steps=" + std::to_string(steps));
+        }
     }
 
     // ── resamplerKindFor unit checks (the two stereo strategies stay distinct).
