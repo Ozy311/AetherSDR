@@ -1,21 +1,23 @@
-// FM repeater verbs: slice squelch / squelchlevel / tone / offset, and
-// transmit rfpower / tunepower (#5102).
+// FM repeater verbs: slice tone / slice offset, transmit rfpower / tunepower,
+// and the single shared slice-action list (#5102).
 //
-// The bridge could not operate an FM repeater at all: it could not hear one
-// (no squelch control), open one (no CTCSS), transmit to one (no offset), or
-// set its drive. Every setter already existed on SliceModel/TransmitModel —
-// only the bridge could not reach them.
+// #5102 was filed reporting squelch as unreachable from the bridge. It was not:
+// `slice dsp squelch <on|off> [level]` had implemented it all along. The report
+// happened because two hand-maintained copies of the slice-action list had
+// drifted, and the one a caller actually hits — `unknown slice action:` — omitted
+// filter, agc and dsp. So the list is now derived from one function, and the row
+// below that pins both messages to it is the regression guard that matters most
+// here: it is the defect that manufactured a false bug report.
 //
-// What this file pins is the BOUNDARY behaviour, which is what a radio-less
-// CI run can actually assert: a malformed request must be refused by the verb
-// itself, BEFORE any slice is resolved (Principle VII). The distinction is
-// visible precisely because this fixture has a RadioModel with no slices —
-// a well-formed request gets "no slice available", a malformed one gets its
-// own validation error. If validation ever drifts back behind slice
-// resolution, the two collapse into the same message and these rows fail.
+// What this file pins is BOUNDARY behaviour, which is what a radio-less CI run
+// can assert. Validation must happen before any slice is resolved (Principle
+// VII), and the fixture makes that observable by carrying a RadioModel with NO
+// slices: a well-formed request reports "no slice available", a malformed one
+// reports its own error. If validation drifts back behind slice resolution the
+// two collapse into one message and these rows fail.
 //
-// The apply paths are proven against a live FLEX-6500 and a real repeater;
-// see the PR. They are deliberately not faked here.
+// Apply paths are proven against a live FLEX-6500 and a real repeater; see the
+// PR. They are deliberately not faked here.
 
 #include "core/AudioEngine.h"
 #include "core/QsoRecorder.h"
@@ -42,7 +44,7 @@ int g_failed = 0;
 
 void report(const char* name, bool ok, const QString& detail = QString())
 {
-    std::printf("%s %-56s %s\n", ok ? "[ OK ]" : "[FAIL]", name, qPrintable(detail));
+    std::printf("%s %-58s %s\n", ok ? "[ OK ]" : "[FAIL]", name, qPrintable(detail));
     if (!ok)
         ++g_failed;
 }
@@ -77,15 +79,16 @@ QString errorOf(const QJsonObject& o)
 }
 
 // A rejection that came from the VERB, not from the radio layer behind it.
-void reportRejectedAtBoundary(QLocalSocket& socket, const char* name,
-                              const QByteArray& line, const QString& expectFragment)
+void rejectedAtBoundary(QLocalSocket& socket, const char* name,
+                        const QByteArray& line, const QString& expectFragment)
 {
     const QJsonObject r = request(socket, line);
     const QString e = errorOf(r);
-    const bool refused = (r.value(QStringLiteral("ok")).toBool() == false);
-    const bool ownError = e.contains(expectFragment, Qt::CaseInsensitive);
-    const bool notRadioError = !e.contains(QStringLiteral("no slice available"));
-    report(name, refused && ownError && notRadioError, e.isEmpty() ? QStringLiteral("(no error field)") : e);
+    report(name,
+           r.value(QStringLiteral("ok")).toBool() == false
+               && e.contains(expectFragment, Qt::CaseInsensitive)
+               && !e.contains(QStringLiteral("no slice available")),
+           e.isEmpty() ? QStringLiteral("(no error field)") : e);
 }
 
 } // namespace
@@ -103,12 +106,15 @@ int main(int argc, char** argv)
     qputenv("TMPDIR", root);
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM"))
         qputenv("QT_QPA_PLATFORM", "offscreen");
-    // Left deliberately unset: the transmit rows below assert the TX gate.
+    // Unset: the gate rows below assert TX is refused by default.
     qunsetenv("AETHER_AUTOMATION_ALLOW_TX");
+    // start() reads the ceiling unconditionally, so it is in force the moment
+    // TX is later permitted at runtime.
+    qputenv("AETHER_AUTOMATION_TX_MAX_POWER", "30");
 
     QGuiApplication app(argc, argv);
 
-    RadioModel radio;   // no slices — see the header comment
+    RadioModel radio;   // deliberately no slices — see the header comment
     AutomationServer server;
     server.setRadioModel(&radio);
 
@@ -129,7 +135,73 @@ int main(int argc, char** argv)
     }
     QCoreApplication::processEvents();
 
-    // ── the verbs exist at all ───────────────────────────────────────────
+    // ── the one shared action list ───────────────────────────────────────
+    // THE row this file exists for. Two hand-maintained copies drifted and the
+    // divergence caused a false bug report; both messages must now name the
+    // same set.
+    {
+        const QString empty = errorOf(request(socket, QByteArrayLiteral("slice")));
+        const QString unknown =
+            errorOf(request(socket, QByteArrayLiteral("slice bogusaction")));
+        bool sameSet = true;
+        for (const char* a : {"add", "remove", "select", "tx", "mode", "filter", "agc",
+                              "dsp", "tone", "offset", "diversity", "centerlock",
+                              "link", "txant", "rxant", "rxsource", "fixture",
+                              "clearfixture"}) {
+            const QString act = QString::fromLatin1(a);
+            if (empty.contains(act) != unknown.contains(act))
+                sameSet = false;
+        }
+        report("both slice error messages name the same action set", sameSet);
+        report("the previously-omitted actions are advertised",
+               unknown.contains(QStringLiteral("filter"))
+                   && unknown.contains(QStringLiteral("agc"))
+                   && unknown.contains(QStringLiteral("dsp")),
+               unknown);
+        report("the new actions are advertised",
+               unknown.contains(QStringLiteral("tone"))
+                   && unknown.contains(QStringLiteral("offset")),
+               unknown);
+    }
+
+    // ── the pre-existing squelch route still works ───────────────────────
+    // #5102 reported squelch as missing; `slice dsp squelch` already did it.
+    // Nothing here may break that path — reaching the radio layer is the proof
+    // the action is still routed.
+    {
+        const QJsonObject r = request(socket, QByteArrayLiteral("slice dsp squelch off"));
+        report("slice dsp squelch still routes (the pre-existing path)",
+               errorOf(r).contains(QStringLiteral("no slice available")), errorOf(r));
+    }
+
+    // ── control row: a WELL-FORMED request reaches the radio layer ───────
+    // Everything below is only meaningful against this.
+    {
+        const QJsonObject r = request(socket, QByteArrayLiteral("slice tone ctcss_tx 100.0"));
+        report("well-formed tone reaches the radio layer",
+               errorOf(r).contains(QStringLiteral("no slice available")), errorOf(r));
+    }
+
+    // ── tone ─────────────────────────────────────────────────────────────
+    rejectedAtBoundary(socket, "tone with no argument is refused",
+                       QByteArrayLiteral("slice tone"), QStringLiteral("requires"));
+    rejectedAtBoundary(socket, "tone mode 'dcs' is refused",
+                       QByteArrayLiteral("slice tone dcs"), QStringLiteral("off/ctcss_tx"));
+    rejectedAtBoundary(socket, "tone freq 9999 is refused",
+                       QByteArrayLiteral("slice tone ctcss_tx 9999"), QStringLiteral("CTCSS"));
+    rejectedAtBoundary(socket, "tone freq 0 is refused",
+                       QByteArrayLiteral("slice tone ctcss_tx 0"), QStringLiteral("CTCSS"));
+
+    // ── offset ───────────────────────────────────────────────────────────
+    rejectedAtBoundary(socket, "offset with no argument is refused",
+                       QByteArrayLiteral("slice offset"), QStringLiteral("requires"));
+    rejectedAtBoundary(socket, "offset direction 'sideways' is refused",
+                       QByteArrayLiteral("slice offset sideways"),
+                       QStringLiteral("simplex/up/down"));
+    rejectedAtBoundary(socket, "offset magnitude 'far' is refused",
+                       QByteArrayLiteral("slice offset up far"), QStringLiteral("MHz"));
+
+    // ── transmit: gated, then clamped ────────────────────────────────────
     {
         const QJsonObject verbs = request(socket, QByteArrayLiteral("verbs"));
         bool hasTransmit = false;
@@ -139,51 +211,6 @@ int main(int argc, char** argv)
                 hasTransmit = true;
         report("transmit verb is registered", hasTransmit);
     }
-
-    // ── the control row: a WELL-FORMED request reaches the radio layer ───
-    // Everything below is only meaningful against this. If this row ever
-    // reports a validation error instead, the fixture has changed and the
-    // boundary rows below are no longer proving what they claim.
-    {
-        const QJsonObject r = request(socket, QByteArrayLiteral("slice squelch on 30"));
-        report("well-formed squelch reaches the radio layer",
-               errorOf(r).contains(QStringLiteral("no slice available")), errorOf(r));
-    }
-
-    // ── squelch: refused at the boundary ─────────────────────────────────
-    reportRejectedAtBoundary(socket, "squelch with no argument is refused",
-                             QByteArrayLiteral("slice squelch"), QStringLiteral("requires"));
-    reportRejectedAtBoundary(socket, "squelch state 'maybe' is refused",
-                             QByteArrayLiteral("slice squelch maybe"), QStringLiteral("on|off"));
-    reportRejectedAtBoundary(socket, "squelch level 101 is refused",
-                             QByteArrayLiteral("slice squelch on 101"), QStringLiteral("0..100"));
-    reportRejectedAtBoundary(socket, "squelch level -1 is refused",
-                             QByteArrayLiteral("slice squelch on -1"), QStringLiteral("0..100"));
-    reportRejectedAtBoundary(socket, "squelchlevel with no argument is refused",
-                             QByteArrayLiteral("slice squelchlevel"), QStringLiteral("requires"));
-    reportRejectedAtBoundary(socket, "squelchlevel 'loud' is refused",
-                             QByteArrayLiteral("slice squelchlevel loud"), QStringLiteral("0..100"));
-
-    // ── tone ─────────────────────────────────────────────────────────────
-    reportRejectedAtBoundary(socket, "tone with no argument is refused",
-                             QByteArrayLiteral("slice tone"), QStringLiteral("requires"));
-    reportRejectedAtBoundary(socket, "tone mode 'dcs' is refused",
-                             QByteArrayLiteral("slice tone dcs"), QStringLiteral("off/ctcss_tx"));
-    reportRejectedAtBoundary(socket, "tone freq 9999 is refused",
-                             QByteArrayLiteral("slice tone ctcss_tx 9999"), QStringLiteral("CTCSS"));
-    reportRejectedAtBoundary(socket, "tone freq 0 is refused",
-                             QByteArrayLiteral("slice tone ctcss_tx 0"), QStringLiteral("CTCSS"));
-
-    // ── offset ───────────────────────────────────────────────────────────
-    reportRejectedAtBoundary(socket, "offset with no argument is refused",
-                             QByteArrayLiteral("slice offset"), QStringLiteral("requires"));
-    reportRejectedAtBoundary(socket, "offset direction 'sideways' is refused",
-                             QByteArrayLiteral("slice offset sideways"),
-                             QStringLiteral("simplex/up/down"));
-    reportRejectedAtBoundary(socket, "offset magnitude 'far' is refused",
-                             QByteArrayLiteral("slice offset up far"), QStringLiteral("MHz"));
-
-    // ── transmit: TX-gated, and gated BEFORE the value is even parsed ────
     {
         const QJsonObject r = request(socket, QByteArrayLiteral("transmit rfpower 40"));
         report("transmit rfpower is blocked without ALLOW_TX",
@@ -192,33 +219,50 @@ int main(int argc, char** argv)
                errorOf(r));
     }
     {
-        // Principle VI: the gate must not be bypassable by sending nonsense —
-        // an out-of-range value on a TX-gated verb still reports the gate.
+        // Principle VI: the gate must not be probeable with nonsense.
         const QJsonObject r = request(socket, QByteArrayLiteral("transmit rfpower 9999"));
         report("gate reports before value validation on a TX verb",
                errorOf(r).contains(QStringLiteral("ALLOW_TX")), errorOf(r));
     }
-    reportRejectedAtBoundary(socket, "unknown transmit action is refused",
-                             QByteArrayLiteral("transmit wattage 5"),
-                             QStringLiteral("rfpower|tunepower"));
-    reportRejectedAtBoundary(socket, "transmit with no action is refused",
-                             QByteArrayLiteral("transmit"), QStringLiteral("requires an action"));
+    rejectedAtBoundary(socket, "unknown transmit action is refused",
+                       QByteArrayLiteral("transmit wattage 5"),
+                       QStringLiteral("rfpower|tunepower"));
+    rejectedAtBoundary(socket, "transmit with no action is refused",
+                       QByteArrayLiteral("transmit"), QStringLiteral("requires an action"));
 
-    // ── the action list a caller is told about must be true ──────────────
+    // Now permit TX and prove the ceiling still binds. The invoke() power rail
+    // is widget-scoped (it keys off accessibleName in the setValue path), so a
+    // verb reaching the model directly does NOT inherit it — this row is the
+    // reason the clamp is written out explicitly in doTransmit().
+    server.setTxAllowed(true);
+    QCoreApplication::processEvents();
     {
-        const QJsonObject r = request(socket, QByteArrayLiteral("slice bogusaction"));
-        const QString e = errorOf(r);
-        report("slice error lists the new actions",
-               e.contains(QStringLiteral("squelch")) && e.contains(QStringLiteral("tone"))
-                   && e.contains(QStringLiteral("offset")),
-               e);
-        // These three worked long before this change and were missing from the
-        // list, which is how a caller concludes a working action does not exist.
-        report("slice error lists the previously-omitted actions",
-               e.contains(QStringLiteral("filter")) && e.contains(QStringLiteral("agc"))
-                   && e.contains(QStringLiteral("dsp")),
-               e);
+        const QJsonObject r = request(socket, QByteArrayLiteral("transmit rfpower 90"));
+        report("transmit rfpower is accepted once TX is allowed",
+               r.value(QStringLiteral("ok")).toBool(), errorOf(r));
+        report("transmit rfpower is clamped to AETHER_AUTOMATION_TX_MAX_POWER",
+               r.value(QStringLiteral("clampedTo")).toInt() == 30
+                   && r.value(QStringLiteral("requested")).toInt() == 90,
+               QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact)));
+        report("the clamp is reported, not silent",
+               r.contains(QStringLiteral("requested"))
+                   && r.contains(QStringLiteral("clampedTo")));
     }
+    {
+        const QJsonObject r = request(socket, QByteArrayLiteral("transmit tunepower 90"));
+        report("tunepower is clamped by the same ceiling",
+               r.value(QStringLiteral("clampedTo")).toInt() == 30,
+               QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact)));
+    }
+    {
+        const QJsonObject r = request(socket, QByteArrayLiteral("transmit rfpower 10"));
+        report("a request under the ceiling is not annotated",
+               r.value(QStringLiteral("ok")).toBool()
+                   && !r.contains(QStringLiteral("clampedTo")),
+               QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact)));
+    }
+    rejectedAtBoundary(socket, "rfpower 101 is refused even with TX allowed",
+                       QByteArrayLiteral("transmit rfpower 101"), QStringLiteral("0..100"));
 
     socket.disconnectFromServer();
     server.stop();

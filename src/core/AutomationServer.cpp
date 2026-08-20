@@ -1179,6 +1179,18 @@ QImage grabWidget(QWidget* w)
     return w->grab().toImage();
 }
 
+// The single list of slice actions. It previously existed twice, by hand, and
+// the two copies drifted: the `unknown slice action:` message omitted filter,
+// agc and dsp — all of which work. That omission is not cosmetic; it is how a
+// caller concludes a working action does not exist (#5102 was filed reporting
+// squelch as absent when `slice dsp squelch` had implemented it all along).
+QString sliceActionList()
+{
+    return QStringLiteral(
+        "add|remove|select|tx|mode|filter|agc|dsp|tone|offset|diversity|"
+        "centerlock|link|txant|rxant|rxsource|fixture|clearfixture");
+}
+
 QJsonObject err(const QString& msg)
 {
     return QJsonObject{{QStringLiteral("ok"), false},
@@ -3018,9 +3030,8 @@ const std::vector<AutomationServer::VerbSpec>& AutomationServer::verbRegistry()
             [](AutomationServer& s, A& a, QLocalSocket*) -> QJsonObject {
                 if (a.action.isEmpty())
                     return err(QStringLiteral(
-                        "slice requires an action (add|remove|select|tx|mode|filter|"
-                        "agc|dsp|diversity|centerlock|link|txant|rxant|rxsource|fixture|"
-                        "clearfixture)"));
+                        "slice requires an action (")
+                        + sliceActionList() + QStringLiteral(")"));
                 return s.doSlice(a.action, a.value);
             });
 
@@ -7108,73 +7119,6 @@ QJsonObject AutomationServer::doSlice(const QString& action, const QString& arg)
                            {QStringLiteral("id"), id},
                            {QStringLiteral("sliceCount"), radio->slices().size()}};
     }
-    if (action == QLatin1String("squelch")
-        || action == QLatin1String("squelchlevel")) {
-        // "slice squelch <on|off> [level 0..100]" / "slice squelchlevel <0..100>"
-        // Selecting FM auto-enables squelch, which gates the audio an automated
-        // capture is trying to measure — so this is the difference between an FM
-        // capture workflow that runs unattended and one that needs a human.
-        const QStringList parts =
-            arg.trimmed().split(QRegularExpression(QStringLiteral("[\\s,]+")),
-                                Qt::SkipEmptyParts);
-        const bool levelOnly = (action == QLatin1String("squelchlevel"));
-        if (parts.isEmpty())
-            return err(levelOnly
-                           ? QStringLiteral("slice squelchlevel requires '<0..100>'")
-                           : QStringLiteral("slice squelch requires '<on|off> [level]'"));
-
-        // Validate everything the caller sent BEFORE resolving a slice, so a
-        // malformed request is refused at the boundary rather than after the
-        // radio has been reached for (Principle VII) — and so the rejection
-        // paths are assertable without a radio attached.
-        const int levelIdx = levelOnly ? 0 : 1;
-        bool requestedOn = false;
-        bool haveOn = false;
-        if (!levelOnly) {
-            const QString state = parts[0].toLower();
-            if (state == QLatin1String("on") || state == QLatin1String("1"))
-                requestedOn = true;
-            else if (state == QLatin1String("off") || state == QLatin1String("0"))
-                requestedOn = false;
-            else
-                return err(QStringLiteral("squelch state must be on|off"));
-            haveOn = true;
-        }
-        int requestedLevel = -1;
-        if (parts.size() > levelIdx) {
-            bool okL = false;
-            const int value = parts[levelIdx].toInt(&okL);
-            if (!okL || value < 0 || value > 100)
-                return err(QStringLiteral("squelch level must be an integer 0..100"));
-            requestedLevel = value;
-        }
-        if (levelOnly && requestedLevel < 0)
-            return err(QStringLiteral("slice squelchlevel requires '<0..100>'"));
-
-        SliceModel* s = nullptr;
-        for (SliceModel* candidate : radio->slices()) {
-            if (candidate->isActive()) { s = candidate; break; }
-        }
-        if (!s && !radio->slices().isEmpty())
-            s = radio->slices().first();
-        if (!s)
-            return err(QStringLiteral("no slice available to set squelch on"));
-
-        // Unspecified halves keep their current value, so `squelchlevel` never
-        // silently toggles the gate and `squelch on` never resets the level.
-        const bool on = haveOn ? requestedOn : s->squelchOn();
-        const int level = (requestedLevel >= 0) ? requestedLevel : s->squelchLevel();
-
-        // One setter carries both halves, so state and level always reach the
-        // backend as a coherent pair (same reasoning as the AGC arm above).
-        s->setSquelch(on, level);
-        return QJsonObject{{QStringLiteral("ok"), true},
-                           {QStringLiteral("slice"), action},
-                           {QStringLiteral("id"), s->sliceId()},
-                           {QStringLiteral("squelch"), s->squelchOn()},
-                           {QStringLiteral("squelchLevel"), s->squelchLevel()}};
-    }
-
     if (action == QLatin1String("tone")) {
         // "slice tone <off|ctcss_tx> [freq]" — a FlexRadio slice carries a single
         // TX CTCSS tone, so the mode pair is off/ctcss_tx (see MemoryCsvCompat,
@@ -7269,9 +7213,7 @@ QJsonObject AutomationServer::doSlice(const QString& action, const QString& arg)
     }
 
     return err(QStringLiteral("unknown slice action: ") + action
-               + QStringLiteral(" (add|remove|select|tx|mode|filter|agc|dsp|squelch|"
-                                "squelchlevel|tone|offset|diversity|centerlock|"
-                                "link|txant|rxant|rxsource|fixture|clearfixture)"));
+               + QStringLiteral(" (") + sliceActionList() + QStringLiteral(")"));
 }
 
 QJsonObject AutomationServer::doGps(const QString& action, const QString& format)
@@ -8046,17 +7988,37 @@ QJsonObject AutomationServer::doTransmit(const QString& action, const QString& a
             return err(QStringLiteral("transmit ") + a
                        + QStringLiteral(" must be an integer 0..100"));
 
+        // The power-ceiling rail is WIDGET-scoped: it lives in invoke()'s
+        // setValue path and keys off accessibleName, so a verb that reaches the
+        // model directly does not inherit it. `radiocert` already had to pass
+        // m_txMaxPower down its own path for the same reason. Clamp explicitly —
+        // otherwise AETHER_AUTOMATION_TX_MAX_POWER silently stops bounding the
+        // one surface most likely to be driving a transverter or an amplifier.
+        int applied = pct;
+        if (m_txMaxPower >= 0 && applied > m_txMaxPower) {
+            qCWarning(lcAutomation).noquote()
+                << "power ceiling: clamped transmit" << a << pct << "->" << m_txMaxPower;
+            applied = m_txMaxPower;
+        }
+
         if (a == QLatin1String("rfpower"))
-            tx.setRfPower(pct);
+            tx.setRfPower(applied);
         else
-            tx.setTunePower(pct);
+            tx.setTunePower(applied);
 
         qCInfo(lcAutomation).noquote()
-            << "transmit" << a << pct << "(ALLOW_TX)";
-        return QJsonObject{{QStringLiteral("ok"), true},
-                           {QStringLiteral("transmit"), a},
-                           {QStringLiteral("rfPower"), tx.rfPower()},
-                           {QStringLiteral("tunePower"), tx.tunePower()}};
+            << "transmit" << a << applied << "(ALLOW_TX)";
+        QJsonObject reply{{QStringLiteral("ok"), true},
+                          {QStringLiteral("transmit"), a},
+                          {QStringLiteral("rfPower"), tx.rfPower()},
+                          {QStringLiteral("tunePower"), tx.tunePower()}};
+        if (applied != pct) {
+            // Say so rather than silently honouring a different number than the
+            // caller asked for.
+            reply.insert(QStringLiteral("requested"), pct);
+            reply.insert(QStringLiteral("clampedTo"), applied);
+        }
+        return reply;
     }
 
     return err(QStringLiteral("transmit requires an action (rfpower|tunepower)"));
@@ -11365,6 +11327,10 @@ QJsonObject AutomationServer::doAudioCapture(const QString& action,
         snapshot[QStringLiteral("chunksOmitted")] =
             snapshot.value(QStringLiteral("chunkCount"));
         snapshot.remove(QStringLiteral("chunks"));
+        // Without this, chunksOmitted == chunkCount reads as "the capture was
+        // lost" when the audio is intact and simply needs somewhere to go.
+        snapshot[QStringLiteral("hint")] = QStringLiteral(
+            "audio retained; pass path=<file> to audioCapture read to write it out");
         return snapshot;
     };
 
