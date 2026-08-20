@@ -1,4 +1,5 @@
 #include "AutomationServer.h"
+#include "core/CtcssTones.h"
 #include "core/RadioCertification.h"
 #include "LogManager.h"
 #include "AppSettings.h"          // StationName (restore the user's real station name)
@@ -1659,6 +1660,10 @@ QJsonObject sliceSnapshot(const SliceModel* s, int linkedTo)
         {QStringLiteral("fmToneValue"), s->fmToneValue()},
         {QStringLiteral("repeaterOffsetDir"), s->repeaterOffsetDir()},
         {QStringLiteral("fmRepeaterOffsetFreq"), s->fmRepeaterOffsetFreq()},
+        // The signed one — the number that decides where the radio transmits.
+        // An FM session can assert the duplex it just applied, not just that
+        // the request was accepted.
+        {QStringLiteral("txOffsetFreq"), s->txOffsetFreq()},
         {QStringLiteral("receiveAgcMode"), s->receiveAgcMode()},
         {QStringLiteral("receiveAgcThreshold"), s->receiveAgcThreshold()},
         {QStringLiteral("receiveAgcOffLevel"), s->receiveAgcOffLevel()},
@@ -7139,9 +7144,14 @@ QJsonObject AutomationServer::doSlice(const QString& action, const QString& arg)
         if (parts.size() >= 2) {
             bool okF = false;
             const double hz = parts[1].toDouble(&okF);
-            if (!okF || hz <= 0.0 || hz > 300.0)
+            // Against the SAME table the operator's dropdown is built from
+            // (core/CtcssTones.h), not a range: a bare 0 < f <= 300 bound
+            // accepted 123.4 Hz, which is not a CTCSS tone and which no
+            // operator could dial in from the applet.
+            if (!okF || !isCtcssFrequency(hz))
                 return err(QStringLiteral(
-                    "tone freq must be a CTCSS frequency in Hz (0 < f <= 300)"));
+                    "tone freq must be a standard CTCSS tone in Hz "
+                    "(67.0 .. 254.1, e.g. 100.0)"));
             toneValue = QString::number(hz, 'f', 1);
         }
 
@@ -7188,6 +7198,12 @@ QJsonObject AutomationServer::doSlice(const QString& action, const QString& arg)
             offsetMhz = std::abs(parts[1].toDouble(&okM));
             if (!okM)
                 return err(QStringLiteral("offset must be a frequency in MHz"));
+            // The same bound both GUI spinboxes carry (RxApplet.cpp,
+            // VfoWidget.cpp: setRange(0.0, 100.0)), so the bridge cannot
+            // request duplex no operator could dial in.
+            if (offsetMhz > 100.0)
+                return err(QStringLiteral(
+                    "offset magnitude must be 0..100 MHz"));
         }
 
         SliceModel* s = nullptr;
@@ -7204,12 +7220,23 @@ QJsonObject AutomationServer::doSlice(const QString& action, const QString& arg)
         if (offsetMhz >= 0.0)
             s->setFmRepeaterOffsetFreq(offsetMhz);
         s->setRepeaterOffsetDir(dir);
+        // ...and then the field that actually moves the transmitter. Direction
+        // and magnitude each send only their own key; tx_offset_freq is a
+        // separate one the radio carries in its own right (FlexBackend
+        // decodes it as its own value), so without this a slice records
+        // "down, 5 MHz" and still transmits on the receive frequency. Last,
+        // so the split is only armed once both operands are in place — and
+        // unconditional, because a direction unchanged from its current value
+        // still has to recompute against a magnitude that just moved.
+        s->setTxOffsetFreq(SliceModel::txOffsetForDirection(
+            dir, s->fmRepeaterOffsetFreq()));
         return QJsonObject{{QStringLiteral("ok"), true},
                            {QStringLiteral("slice"), QStringLiteral("offset")},
                            {QStringLiteral("id"), s->sliceId()},
                            {QStringLiteral("repeaterOffsetDir"), s->repeaterOffsetDir()},
                            {QStringLiteral("fmRepeaterOffsetFreq"),
-                            s->fmRepeaterOffsetFreq()}};
+                            s->fmRepeaterOffsetFreq()},
+                           {QStringLiteral("txOffsetFreq"), s->txOffsetFreq()}};
     }
 
     return err(QStringLiteral("unknown slice action: ") + action

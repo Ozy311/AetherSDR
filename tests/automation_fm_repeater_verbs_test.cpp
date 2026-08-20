@@ -16,8 +16,12 @@
 // reports its own error. If validation drifts back behind slice resolution the
 // two collapse into one message and these rows fail.
 //
-// Apply paths are proven against a live FLEX-6500 and a real repeater; see the
-// PR. They are deliberately not faked here.
+// The APPLY path is asserted too, at the end, through the repo's own
+// `slice fixture` action — a disconnected-only synthetic slice. That is what
+// catches a verb that accepts a request, answers ok, and writes only two of
+// the three fields a duplex split needs. A live FLEX-6500 exercised the same
+// path against a real repeater; the fixture rows are what keep it honest in
+// CI, where there is no radio.
 
 #include "core/AudioEngine.h"
 #include "core/QsoRecorder.h"
@@ -162,6 +166,31 @@ int main(int argc, char** argv)
                unknown.contains(QStringLiteral("tone"))
                    && unknown.contains(QStringLiteral("offset")),
                unknown);
+
+        // ...and every advertised action actually DISPATCHES. The rows above
+        // pin the two messages to each other, which can only catch someone
+        // re-hardcoding one of them. The defect class in #5102 was
+        // list ≠ dispatch: an action can be advertised and still fall through
+        // to "unknown slice action". So drive each one and assert it does not.
+        // Each is sent bare, so most are refused for their own reasons (a
+        // missing argument, no slice, no radio) — any of those proves the
+        // action was routed. Only falling through to the unknown-action arm
+        // fails this row.
+        QStringList notDispatched;
+        const QStringList advertised =
+            unknown.section(QLatin1Char('('), 1).section(QLatin1Char(')'), 0, 0)
+                .split(QLatin1Char('|'), Qt::SkipEmptyParts);
+        for (const QString& act : advertised) {
+            const QString e = errorOf(
+                request(socket, ("slice " + act).toUtf8()));
+            if (e.contains(QStringLiteral("unknown slice action")))
+                notDispatched << act;
+        }
+        report("every advertised slice action dispatches",
+               !advertised.isEmpty() && notDispatched.isEmpty(),
+               notDispatched.isEmpty()
+                   ? QStringLiteral("%1 actions driven").arg(advertised.size())
+                   : QStringLiteral("no handler: ") + notDispatched.join(QLatin1Char(' ')));
     }
 
     // ── the pre-existing squelch route still works ───────────────────────
@@ -191,6 +220,16 @@ int main(int argc, char** argv)
                        QByteArrayLiteral("slice tone ctcss_tx 9999"), QStringLiteral("CTCSS"));
     rejectedAtBoundary(socket, "tone freq 0 is refused",
                        QByteArrayLiteral("slice tone ctcss_tx 0"), QStringLiteral("CTCSS"));
+    // 123.4 sits inside the old 0 < f <= 300 bound and is NOT a CTCSS tone.
+    // The verb now validates against core/CtcssTones.h — the same table the
+    // operator's dropdown is built from — so the bridge cannot ask the radio
+    // for a tone nobody could dial in.
+    rejectedAtBoundary(socket, "a non-CTCSS tone inside the old range is refused",
+                       QByteArrayLiteral("slice tone ctcss_tx 123.4"),
+                       QStringLiteral("CTCSS"));
+    rejectedAtBoundary(socket, "67.1 Hz — one tick off a real tone — is refused",
+                       QByteArrayLiteral("slice tone ctcss_tx 67.1"),
+                       QStringLiteral("CTCSS"));
 
     // ── offset ───────────────────────────────────────────────────────────
     rejectedAtBoundary(socket, "offset with no argument is refused",
@@ -200,6 +239,9 @@ int main(int argc, char** argv)
                        QStringLiteral("simplex/up/down"));
     rejectedAtBoundary(socket, "offset magnitude 'far' is refused",
                        QByteArrayLiteral("slice offset up far"), QStringLiteral("MHz"));
+    rejectedAtBoundary(socket, "offset magnitude 101 MHz is refused",
+                       QByteArrayLiteral("slice offset up 101"),
+                       QStringLiteral("0..100"));
 
     // ── transmit: gated, then clamped ────────────────────────────────────
     {
@@ -263,6 +305,98 @@ int main(int argc, char** argv)
     }
     rejectedAtBoundary(socket, "rfpower 101 is refused even with TX allowed",
                        QByteArrayLiteral("transmit rfpower 101"), QStringLiteral("0..100"));
+
+    // ── the applied duplex, through the repo's own disconnected fixture ──
+    //
+    // `slice fixture` synthesizes an owned slice through the normal
+    // slice-status path with no radio attached, which is what lets these rows
+    // assert the APPLY path and not merely the boundary.
+    //
+    // The bug these exist for: the verb set repeater_offset_dir and
+    // fm_repeater_offset_freq and stopped there. tx_offset_freq is a field the
+    // radio carries in its own right — FlexBackend decodes it as its own value,
+    // and every other writer of duplex in the tree (RxApplet::applyOffsetDir,
+    // VfoWidget's spin + applyDir, MemoryRecallPolicy's slice fixup) sends all
+    // three. Sending two of three records "down, 5 MHz" on a slice that still
+    // transmits on the receive frequency, and no reply field said so.
+    {
+        const QJsonObject fx = request(socket, QByteArrayLiteral("slice fixture 0"));
+        report("disconnected slice fixture is available",
+               fx.value(QStringLiteral("ok")).toBool(), errorOf(fx));
+    }
+    QCoreApplication::processEvents();
+
+    auto offsetApplies = [&socket](const char* name, const QByteArray& line,
+                                   double wantTx, const QString& wantDir,
+                                   double wantMagnitude) {
+        const QJsonObject r = request(socket, line);
+        const double tx = r.value(QStringLiteral("txOffsetFreq")).toDouble();
+        const QString dir = r.value(QStringLiteral("repeaterOffsetDir")).toString();
+        const double mag =
+            r.value(QStringLiteral("fmRepeaterOffsetFreq")).toDouble();
+        report(name,
+               r.value(QStringLiteral("ok")).toBool()
+                   && qFuzzyCompare(tx + 1.0, wantTx + 1.0)
+                   && dir == wantDir
+                   && qFuzzyCompare(mag + 1.0, wantMagnitude + 1.0),
+               QString::fromUtf8(
+                   QJsonDocument(r).toJson(QJsonDocument::Compact)));
+    };
+
+    offsetApplies("down 5 MHz applies tx_offset_freq -5 (the TX split)",
+                  QByteArrayLiteral("slice offset down 5"), -5.0,
+                  QStringLiteral("down"), 5.0);
+    offsetApplies("up 5 MHz applies +5 — the direction carries the sign",
+                  QByteArrayLiteral("slice offset up 5"), 5.0,
+                  QStringLiteral("up"), 5.0);
+    offsetApplies("simplex zeroes the TX offset",
+                  QByteArrayLiteral("slice offset simplex"), 0.0,
+                  QStringLiteral("simplex"), 5.0);
+    // A magnitude change with the direction UNCHANGED. setRepeaterOffsetDir()
+    // early-returns when the value has not moved, so a recompute conditioned on
+    // the direction changing would leave the old split in place here.
+    offsetApplies("down 5 MHz, from simplex",
+                  QByteArrayLiteral("slice offset down 5"), -5.0,
+                  QStringLiteral("down"), 5.0);
+    offsetApplies("a magnitude-only change recomputes the split",
+                  QByteArrayLiteral("slice offset down 0.6"), -0.6,
+                  QStringLiteral("down"), 0.6);
+
+    {
+        // ...and the number is readable, so a session can assert the duplex it
+        // applied rather than assume the request took.
+        const QJsonObject r = request(socket, QByteArrayLiteral("get slice active"));
+        const QJsonObject snap =
+            r.value(QStringLiteral("slice")).isObject()
+                ? r.value(QStringLiteral("slice")).toObject()
+                : r;
+        report("the slice snapshot carries txOffsetFreq",
+               snap.contains(QStringLiteral("txOffsetFreq"))
+                   && qFuzzyCompare(
+                       snap.value(QStringLiteral("txOffsetFreq")).toDouble() + 1.0,
+                       -0.6 + 1.0),
+               QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact)));
+    }
+
+    {
+        // A legal tone applies, to the same fixture slice, and 123.0 is a real
+        // table entry while the neighbouring 123.4 above is not.
+        const QJsonObject r =
+            request(socket, QByteArrayLiteral("slice tone ctcss_tx 123.0"));
+        report("a standard CTCSS tone applies",
+               r.value(QStringLiteral("ok")).toBool()
+                   && r.value(QStringLiteral("fmToneMode")).toString()
+                          == QLatin1String("ctcss_tx")
+                   && r.value(QStringLiteral("fmToneValue")).toString()
+                          == QLatin1String("123.0"),
+               QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact)));
+    }
+
+    {
+        const QJsonObject r = request(socket, QByteArrayLiteral("slice clearfixture 0"));
+        report("slice fixture is removed again",
+               r.value(QStringLiteral("ok")).toBool(), errorOf(r));
+    }
 
     socket.disconnectFromServer();
     server.stop();

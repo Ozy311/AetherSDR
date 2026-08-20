@@ -116,6 +116,56 @@ def generated_block(verbs):
             f"{END}")
 
 
+# The slice ACTION set is its own drift surface. #5102 was filed against a
+# working feature because two hand-maintained copies of this list disagreed;
+# the in-code copies were then collapsed into sliceActionList(). The docs held
+# a third and a fourth copy, and the `slice` action table is the one a reader
+# actually consults — so pin it to the code the same way the verb table is.
+_SLICE_LIST_RE = re.compile(
+    r'QString\s+sliceActionList\(\)\s*\{\s*return\s+QStringLiteral\('
+    r'(?P<body>(?:\s*"(?:[^"\\]|\\.)*")+)\s*\)\s*;',
+    re.DOTALL)
+
+
+def extract_slice_actions(cpp_path):
+    """The action names sliceActionList() advertises, in code order."""
+    with open(cpp_path, encoding="utf-8") as f:
+        src = f.read()
+    m = _SLICE_LIST_RE.search(src)
+    if not m:
+        raise SystemExit(
+            "error: could not parse sliceActionList() from "
+            f"{cpp_path} — the docs-vs-code slice-action lint cannot run, and "
+            "silently skipping it is how the list drifted in the first place.")
+    joined = _join_literals(m.group("body"))
+    return [a for a in joined.split("|") if a]
+
+
+def documented_slice_actions(md_text):
+    """Action names named in the first column of the `slice` section's table."""
+    lines = md_text.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        if ln.strip() == "### `slice`":
+            start = i
+            break
+    if start is None:
+        raise SystemExit(
+            "error: no '### `slice`' section in the docs — the slice-action "
+            "lint cannot run.")
+    found = set()
+    for ln in lines[start + 1:]:
+        # Stop at the next section of the same level; #### subsections belong
+        # to `slice` and may legitimately carry rows.
+        if ln.startswith("### ") and ln.strip() != "### `slice`":
+            break
+        if not ln.startswith("|"):
+            continue
+        first_cell = ln.split("|")[1]
+        found.update(re.findall(r'`([a-z]+)`', first_cell))
+    return found
+
+
 def find_duplicate_headings(md_text):
     # Track fenced code blocks so a ``` … ### foo … ``` example isn't mistaken
     # for a real heading — otherwise this lint could block CI on doc content
@@ -175,6 +225,10 @@ def main():
     # honest regardless of what the generator would produce.
     dups = find_duplicate_headings(md)
 
+    slice_actions = extract_slice_actions(CPP)
+    undocumented = [a for a in slice_actions
+                    if a not in documented_slice_actions(md)]
+
     if args.check:
         problems = []
         if want != md:
@@ -184,17 +238,28 @@ def main():
         if dups:
             problems.append("duplicate detail-section heading(s): "
                             + ", ".join(sorted(set(dups))))
+        if undocumented:
+            problems.append(
+                "slice action(s) advertised by sliceActionList() but absent "
+                "from the `slice` action table in the docs: "
+                + ", ".join(undocumented)
+                + " — document them (this table cannot be generated; the "
+                  "per-action prose is hand-written on purpose)")
         if problems:
             for p in problems:
                 print("FAIL:", p, file=sys.stderr)
             return 1
         print(f"ok: docs verb table matches the registry ({len(verbs)} verbs), "
-              "no duplicate headings")
+              f"no duplicate headings, all {len(slice_actions)} slice actions "
+              "documented")
         return 0
 
     if dups:
         print("warning: duplicate detail-section heading(s): "
               + ", ".join(sorted(set(dups))), file=sys.stderr)
+    if undocumented:
+        print("warning: slice action(s) missing from the docs table: "
+              + ", ".join(undocumented), file=sys.stderr)
     if want != md:
         with open(DOCS, "w", encoding="utf-8") as f:
             f.write(want)

@@ -2369,10 +2369,8 @@ void VfoWidget::buildTabContent()
                 if (m_fmOffsetSpin->signalsBlocked()) return;
                 if (!m_slice) return;
                 m_slice->setFmRepeaterOffsetFreq(val);
-                const QString& dir = m_slice->repeaterOffsetDir();
-                if (dir == "up") m_slice->setTxOffsetFreq(val);
-                else if (dir == "down") m_slice->setTxOffsetFreq(-val);
-                else m_slice->setTxOffsetFreq(0);
+                m_slice->setTxOffsetFreq(SliceModel::txOffsetForDirection(
+                    m_slice->repeaterOffsetDir(), val));
             });
 
             // Direction: − | Simplex | + | REV
@@ -2382,10 +2380,8 @@ void VfoWidget::buildTabContent()
             auto applyDir = [this](const QString& dir) {
                 if (!m_slice) return;
                 m_slice->setRepeaterOffsetDir(dir);
-                double offset = m_slice->fmRepeaterOffsetFreq();
-                if (dir == "up") m_slice->setTxOffsetFreq(offset);
-                else if (dir == "down") m_slice->setTxOffsetFreq(-offset);
-                else m_slice->setTxOffsetFreq(0);
+                m_slice->setTxOffsetFreq(SliceModel::txOffsetForDirection(
+                    dir, m_slice->fmRepeaterOffsetFreq()));
                 m_fmOffsetDown->setChecked(dir == "down");
                 m_fmSimplexBtn->setChecked(dir == "simplex");
                 m_fmOffsetUp->setChecked(dir == "up");
