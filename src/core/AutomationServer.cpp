@@ -1641,6 +1641,12 @@ QJsonObject sliceSnapshot(const SliceModel* s, int linkedTo)
         {QStringLiteral("flexSquelchLevel"), s->flexSquelchLevel()},
         {QStringLiteral("agcMode"),    s->agcMode()},
         {QStringLiteral("agcThreshold"), s->agcThreshold()},
+        // FM / repeater duplex — readable so an automated FM session can assert
+        // the repeater setup it just applied, not just fire and hope.
+        {QStringLiteral("fmToneMode"),  s->fmToneMode()},
+        {QStringLiteral("fmToneValue"), s->fmToneValue()},
+        {QStringLiteral("repeaterOffsetDir"), s->repeaterOffsetDir()},
+        {QStringLiteral("fmRepeaterOffsetFreq"), s->fmRepeaterOffsetFreq()},
         {QStringLiteral("receiveAgcMode"), s->receiveAgcMode()},
         {QStringLiteral("receiveAgcThreshold"), s->receiveAgcThreshold()},
         {QStringLiteral("receiveAgcOffLevel"), s->receiveAgcOffLevel()},
@@ -3354,6 +3360,15 @@ const std::vector<AutomationServer::VerbSpec>& AutomationServer::verbRegistry()
                 return s.doRadioCert(a.action, a.value);
             });
 
+        add("transmit", {},
+            "transmit <rfpower|tunepower> <0..100> — transmit drive (TX-gated)",
+            parseActionValue,
+            [](AutomationServer& s, A& a, QLocalSocket*) -> QJsonObject {
+                if (a.action.isEmpty())
+                    return err(QStringLiteral(
+                        "transmit requires an action (rfpower|tunepower)"));
+                return s.doTransmit(a.action, a.value);
+            });
         add("key", {}, "key <ptt on|off | mox> — semantic keying (TX-gated)",
             parseActionValue,
             [](AutomationServer& s, A& a, QLocalSocket*) -> QJsonObject {
@@ -7093,8 +7108,169 @@ QJsonObject AutomationServer::doSlice(const QString& action, const QString& arg)
                            {QStringLiteral("id"), id},
                            {QStringLiteral("sliceCount"), radio->slices().size()}};
     }
+    if (action == QLatin1String("squelch")
+        || action == QLatin1String("squelchlevel")) {
+        // "slice squelch <on|off> [level 0..100]" / "slice squelchlevel <0..100>"
+        // Selecting FM auto-enables squelch, which gates the audio an automated
+        // capture is trying to measure — so this is the difference between an FM
+        // capture workflow that runs unattended and one that needs a human.
+        const QStringList parts =
+            arg.trimmed().split(QRegularExpression(QStringLiteral("[\\s,]+")),
+                                Qt::SkipEmptyParts);
+        const bool levelOnly = (action == QLatin1String("squelchlevel"));
+        if (parts.isEmpty())
+            return err(levelOnly
+                           ? QStringLiteral("slice squelchlevel requires '<0..100>'")
+                           : QStringLiteral("slice squelch requires '<on|off> [level]'"));
+
+        // Validate everything the caller sent BEFORE resolving a slice, so a
+        // malformed request is refused at the boundary rather than after the
+        // radio has been reached for (Principle VII) — and so the rejection
+        // paths are assertable without a radio attached.
+        const int levelIdx = levelOnly ? 0 : 1;
+        bool requestedOn = false;
+        bool haveOn = false;
+        if (!levelOnly) {
+            const QString state = parts[0].toLower();
+            if (state == QLatin1String("on") || state == QLatin1String("1"))
+                requestedOn = true;
+            else if (state == QLatin1String("off") || state == QLatin1String("0"))
+                requestedOn = false;
+            else
+                return err(QStringLiteral("squelch state must be on|off"));
+            haveOn = true;
+        }
+        int requestedLevel = -1;
+        if (parts.size() > levelIdx) {
+            bool okL = false;
+            const int value = parts[levelIdx].toInt(&okL);
+            if (!okL || value < 0 || value > 100)
+                return err(QStringLiteral("squelch level must be an integer 0..100"));
+            requestedLevel = value;
+        }
+        if (levelOnly && requestedLevel < 0)
+            return err(QStringLiteral("slice squelchlevel requires '<0..100>'"));
+
+        SliceModel* s = nullptr;
+        for (SliceModel* candidate : radio->slices()) {
+            if (candidate->isActive()) { s = candidate; break; }
+        }
+        if (!s && !radio->slices().isEmpty())
+            s = radio->slices().first();
+        if (!s)
+            return err(QStringLiteral("no slice available to set squelch on"));
+
+        // Unspecified halves keep their current value, so `squelchlevel` never
+        // silently toggles the gate and `squelch on` never resets the level.
+        const bool on = haveOn ? requestedOn : s->squelchOn();
+        const int level = (requestedLevel >= 0) ? requestedLevel : s->squelchLevel();
+
+        // One setter carries both halves, so state and level always reach the
+        // backend as a coherent pair (same reasoning as the AGC arm above).
+        s->setSquelch(on, level);
+        return QJsonObject{{QStringLiteral("ok"), true},
+                           {QStringLiteral("slice"), action},
+                           {QStringLiteral("id"), s->sliceId()},
+                           {QStringLiteral("squelch"), s->squelchOn()},
+                           {QStringLiteral("squelchLevel"), s->squelchLevel()}};
+    }
+
+    if (action == QLatin1String("tone")) {
+        // "slice tone <off|ctcss_tx> [freq]" — a FlexRadio slice carries a single
+        // TX CTCSS tone, so the mode pair is off/ctcss_tx (see MemoryCsvCompat,
+        // which degrades CHIRP's richer taxonomy onto exactly these two).
+        const QStringList parts =
+            arg.trimmed().split(QRegularExpression(QStringLiteral("[\\s,]+")),
+                                Qt::SkipEmptyParts);
+        if (parts.isEmpty())
+            return err(QStringLiteral(
+                "slice tone requires '<off|ctcss_tx> [freq]'"));
+        const QString mode = parts[0].toLower();
+        static const QStringList kToneModes{QStringLiteral("off"),
+                                            QStringLiteral("ctcss_tx")};
+        if (!kToneModes.contains(mode))
+            return err(QStringLiteral("tone mode must be one of: ")
+                       + kToneModes.join(QLatin1Char('/')));
+        QString toneValue;
+        if (parts.size() >= 2) {
+            bool okF = false;
+            const double hz = parts[1].toDouble(&okF);
+            if (!okF || hz <= 0.0 || hz > 300.0)
+                return err(QStringLiteral(
+                    "tone freq must be a CTCSS frequency in Hz (0 < f <= 300)"));
+            toneValue = QString::number(hz, 'f', 1);
+        }
+
+        SliceModel* s = nullptr;
+        for (SliceModel* candidate : radio->slices()) {
+            if (candidate->isActive()) { s = candidate; break; }
+        }
+        if (!s && !radio->slices().isEmpty())
+            s = radio->slices().first();
+        if (!s)
+            return err(QStringLiteral("no slice available to set tone on"));
+
+        // Value before mode: enabling ctcss_tx while the old tone is still set
+        // would key the repeater on the wrong tone for one round trip.
+        if (!toneValue.isEmpty())
+            s->setFmToneValue(toneValue);
+        s->setFmToneMode(mode);
+        return QJsonObject{{QStringLiteral("ok"), true},
+                           {QStringLiteral("slice"), QStringLiteral("tone")},
+                           {QStringLiteral("id"), s->sliceId()},
+                           {QStringLiteral("fmToneMode"), s->fmToneMode()},
+                           {QStringLiteral("fmToneValue"), s->fmToneValue()}};
+    }
+
+    if (action == QLatin1String("offset")) {
+        // "slice offset <simplex|up|down> [mhz]" — repeater duplex. The offset
+        // magnitude is unsigned; the direction carries the sign.
+        const QStringList parts =
+            arg.trimmed().split(QRegularExpression(QStringLiteral("[\\s,]+")),
+                                Qt::SkipEmptyParts);
+        if (parts.isEmpty())
+            return err(QStringLiteral(
+                "slice offset requires '<simplex|up|down> [mhz]'"));
+        const QString dir = parts[0].toLower();
+        static const QStringList kDirs{QStringLiteral("simplex"),
+                                       QStringLiteral("up"),
+                                       QStringLiteral("down")};
+        if (!kDirs.contains(dir))
+            return err(QStringLiteral("offset direction must be one of: ")
+                       + kDirs.join(QLatin1Char('/')));
+        double offsetMhz = -1.0;
+        if (parts.size() >= 2) {
+            bool okM = false;
+            offsetMhz = std::abs(parts[1].toDouble(&okM));
+            if (!okM)
+                return err(QStringLiteral("offset must be a frequency in MHz"));
+        }
+
+        SliceModel* s = nullptr;
+        for (SliceModel* candidate : radio->slices()) {
+            if (candidate->isActive()) { s = candidate; break; }
+        }
+        if (!s && !radio->slices().isEmpty())
+            s = radio->slices().first();
+        if (!s)
+            return err(QStringLiteral("no slice available to set offset on"));
+
+        // Magnitude before direction, so a single request never leaves the radio
+        // briefly duplexing by a stale offset.
+        if (offsetMhz >= 0.0)
+            s->setFmRepeaterOffsetFreq(offsetMhz);
+        s->setRepeaterOffsetDir(dir);
+        return QJsonObject{{QStringLiteral("ok"), true},
+                           {QStringLiteral("slice"), QStringLiteral("offset")},
+                           {QStringLiteral("id"), s->sliceId()},
+                           {QStringLiteral("repeaterOffsetDir"), s->repeaterOffsetDir()},
+                           {QStringLiteral("fmRepeaterOffsetFreq"),
+                            s->fmRepeaterOffsetFreq()}};
+    }
+
     return err(QStringLiteral("unknown slice action: ") + action
-               + QStringLiteral(" (add|remove|select|tx|mode|diversity|centerlock|"
+               + QStringLiteral(" (add|remove|select|tx|mode|filter|agc|dsp|squelch|"
+                                "squelchlevel|tone|offset|diversity|centerlock|"
                                 "link|txant|rxant|rxsource|fixture|clearfixture)"));
 }
 
@@ -7843,6 +8019,48 @@ QJsonObject AutomationServer::doRadioCert(const QString& phaseArg, const QString
 // deterministic and focus-independent. KEYING is gated by the same
 // AETHER_AUTOMATION_ALLOW_TX rail as txtest/atu and arms the force-unkey
 // watchdog; UNKEY is always allowed (it only reduces TX risk).
+
+QJsonObject AutomationServer::doTransmit(const QString& action, const QString& arg)
+{
+    if (!m_radioModel)
+        return err(QStringLiteral("no radio model available"));
+    auto& tx = m_radioModel->transmitModel();
+    const QString a = action.trimmed().toLower();
+
+    if (a == QLatin1String("rfpower") || a == QLatin1String("tunepower")) {
+        // TX-gated for the same reason `key` is: these set how hard the radio
+        // will drive whatever is downstream of it — a transverter or an
+        // amplifier — so a session that may not transmit may not change them
+        // either. Reading them stays ungated via `get transmit`.
+        if (!m_txAllowed)
+            return err(QStringLiteral("blocked: transmit ") + a
+                       + QStringLiteral(" sets transmit drive — set "
+                                        "AETHER_AUTOMATION_ALLOW_TX=1 to allow"));
+        const QString v = arg.trimmed();
+        if (v.isEmpty())
+            return err(QStringLiteral("transmit ") + a
+                       + QStringLiteral(" requires a percentage 0..100"));
+        bool okP = false;
+        const int pct = v.toInt(&okP);
+        if (!okP || pct < 0 || pct > 100)
+            return err(QStringLiteral("transmit ") + a
+                       + QStringLiteral(" must be an integer 0..100"));
+
+        if (a == QLatin1String("rfpower"))
+            tx.setRfPower(pct);
+        else
+            tx.setTunePower(pct);
+
+        qCInfo(lcAutomation).noquote()
+            << "transmit" << a << pct << "(ALLOW_TX)";
+        return QJsonObject{{QStringLiteral("ok"), true},
+                           {QStringLiteral("transmit"), a},
+                           {QStringLiteral("rfPower"), tx.rfPower()},
+                           {QStringLiteral("tunePower"), tx.tunePower()}};
+    }
+
+    return err(QStringLiteral("transmit requires an action (rfpower|tunepower)"));
+}
 
 QJsonObject AutomationServer::doKey(const QString& name, const QString& arg)
 {
