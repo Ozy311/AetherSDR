@@ -7919,8 +7919,21 @@ void AudioEngine::onTxAudioReady()
                 TxCaptureBuffer::readLatestBounded(m_micDevice.data(),
                                                    m_txInputChannels,
                                                    txInputBytesPerSample());
-            if (!drained.block.isEmpty() || drained.discardedBytes > 0) {
+            if (drained.deliveredBytes()) {
                 m_txCaptureHealth.recordMicRead(txCaptureNowMs());
+                // These bytes are thrown away, and they are still proof the
+                // endpoint works -- which is the only question the WASAPI
+                // silent-open watchdog asks (#2929). Without this, a mic that
+                // is delivering normally reads as silent for as long as TCI
+                // owns TX audio: the watchdog walks the recovery ladder off a
+                // rung that was never broken, reopening a valid device up to
+                // 15 times and leaving local capture at the terminal
+                // 16 kHz/Int16/mono rung once TCI stops. On that terminal rung
+                // it also logs "capture is silent, no retry left", which would
+                // be just as wrong. Before this PR the same oversight could
+                // only trigger the single mono retry; the full ladder makes it
+                // materially worse (round-4 review of PR #5017).
+                m_txReceivedAnyBytes = true;
             }
             if (drained.discardedBytes > 0) {
                 noteTxCaptureBacklogDiscard(drained.discardedBytes);
@@ -7970,9 +7983,16 @@ void AudioEngine::onTxAudioReady()
     if (micRead.discardedBytes > 0) {
         noteTxCaptureBacklogDiscard(micRead.discardedBytes);
     }
+    // One evidence rule, asked at every place this device is read: the
+    // suppressed drain above uses the same call. A read that only DISCARDED
+    // still proves the endpoint delivers, and returning early on an empty
+    // block before recording that would leave the same blind spot the
+    // suppressed branch had.
+    if (micRead.deliveredBytes()) {
+        m_txReceivedAnyBytes = true;  // disarms the WASAPI silent-open watchdog (#2929)
+    }
     QByteArray data = micRead.block;
     if (data.isEmpty()) return;
-    m_txReceivedAnyBytes = true;  // disarms the WASAPI silent-open watchdog (#2929)
 #endif
 
     m_txCaptureHealth.recordMicRead(txCaptureNowMs());

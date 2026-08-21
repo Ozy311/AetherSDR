@@ -10,6 +10,7 @@
 // Run: ./build/audio_format_negotiation_test
 
 #include "core/AudioFormatNegotiator.h"
+#include "core/TxCaptureBuffer.h"
 
 #include <cstdio>
 #include <string>
@@ -454,7 +455,61 @@ int main()
         }
     }
 
-    // ── resamplerKindFor unit checks (the two stereo strategies stay distinct).
+    // -- The TCI-suppressed drain vs the silent-open watchdog (round 4 of #5017).
+    //
+    // While a TCI client owns TX audio, AudioEngine::onTxAudioReady() drains
+    // the local mic and throws the bytes away. Those discarded bytes are the
+    // only evidence the silent-open watchdog can have that the endpoint works,
+    // because nothing else on that path touches the capture device. If they do
+    // not count, a working mic reads as silent for the whole TCI session and
+    // the watchdog walks the recovery ladder off a rung that was never broken.
+    //
+    // The evidence rule below is the SHIPPED one -- BoundedRead::deliveredBytes(),
+    // the same call the suppressed branch makes -- and the cursor is the shipped
+    // one. What the test supplies is the watchdog's expiry condition: advance
+    // iff the endpoint has not been proven to deliver. (The engine's own
+    // `if (m_txReceivedAnyBytes) return;` sits in a Qt timer lambda inside
+    // Q_OS_WIN and is not reachable from a headless binary; this pins the two
+    // rules it composes, not the lambda itself.)
+    {
+        using AetherSDR::TxCaptureBuffer::BoundedRead;
+
+        const auto drain = [](int blockBytes, qint64 discarded) {
+            BoundedRead r;
+            r.block = QByteArray(blockBytes, '\0');
+            r.discardedBytes = discarded;
+            return r;
+        };
+
+        // Every shape a suppressed drain can take, against the shipped rule.
+        report("suppressed drain carrying bytes proves the endpoint delivers",
+               drain(4096, 0).deliveredBytes());
+        report("suppressed drain that only DISCARDED proves the endpoint delivers",
+               drain(0, 262144).deliveredBytes());
+        report("suppressed drain that read nothing proves nothing",
+               !drain(0, 0).deliveredBytes());
+
+        // A TCI session's worth of suppressed callbacks, then the watchdog fires.
+        const auto stageAfterWatchdog = [](const QList<BoundedRead>& session) {
+            bool delivered = false;
+            for (const BoundedRead& d : session)
+                if (d.deliveredBytes()) delivered = true;  // engine: m_txReceivedAnyBytes = true
+            TxOpenCursor cursor(2);
+            if (!delivered && cursor.hasNext()) cursor.advance();  // engine: watchdog retry
+            return cursor.stage();
+        };
+
+        report("a mic delivering under TCI suppression does NOT advance the ladder",
+               stageAfterWatchdog({drain(4096, 0), drain(4096, 0)}) == 0);
+        report("a discard-only session under TCI suppression does NOT advance the ladder",
+               stageAfterWatchdog({drain(0, 262144)}) == 0);
+        report("a mic that is genuinely silent under TCI suppression still advances",
+               stageAfterWatchdog({drain(0, 0), drain(0, 0)}) == 1);
+        report("no capture callbacks at all under TCI suppression still advances",
+               stageAfterWatchdog({}) == 1);
+    }
+
+    // -- resamplerKindFor unit checks (the two stereo strategies stay distinct).
     report("resamplerKindFor 24k Pan == None",
            resamplerKindFor(24000, Pan) == ResamplerKind::None);
     report("resamplerKindFor 48k Pan == PreservePan",

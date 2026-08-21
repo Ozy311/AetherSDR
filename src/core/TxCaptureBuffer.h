@@ -29,6 +29,14 @@ struct BoundedRead {
     // Stale bytes skipped to catch up; zero on the normal path. Non-zero means
     // the backend outran the consumer and audio was dropped deliberately.
     qint64 discardedBytes{0};
+
+    // Did this read prove the ENDPOINT is producing audio? Bytes handed back
+    // and bytes deliberately skipped to catch up both mean the device spoke;
+    // whether the caller went on to USE them is a separate question. The
+    // TCI-suppressed drain discards everything it reads and still answers yes,
+    // which is what keeps the WASAPI silent-open watchdog off a working mic
+    // (#2929, round-4 review of PR #5017).
+    bool deliveredBytes() const { return !block.isEmpty() || discardedBytes > 0; }
 };
 
 // Reads at most kMaxReadBytes from a pull-mode capture device, first skipping
