@@ -2703,6 +2703,25 @@ const std::vector<AutomationServer::VerbSpec>& AutomationServer::verbRegistry()
             a.value = vtok(p, 2);
             return {};
         };
+        // Like parseActionValue, but REFUSES a trailing operand instead of
+        // dropping it. parseActionValue keeps p[2] and discards everything
+        // after, so `transmit rfpower 30 90` set the drive to 30 and answered
+        // ok — the tail vanished before any handler could object to it, which
+        // is why this has to be enforced in the parser and not downstream.
+        auto parseActionValueExact = [](const QList<QByteArray>& p,
+                                        A& a) -> QJsonObject {
+            if (p.size() > 3) {
+                return err(QString::fromUtf8(p.value(0))
+                           + QStringLiteral(" takes exactly one value; got ")
+                           + QString::number(p.size() - 2)
+                           + QStringLiteral(" ('")
+                           + QString::fromUtf8(p.value(3))
+                           + QStringLiteral("' is unexpected)"));
+            }
+            a.action = vtok(p, 1);
+            a.value = vtok(p, 2);
+            return {};
+        };
         auto parseActionRest = [](const QList<QByteArray>& p, A& a) -> QJsonObject {
             a.action = vtok(p, 1);
             a.value = vjoin(p, 2);
@@ -3378,7 +3397,7 @@ const std::vector<AutomationServer::VerbSpec>& AutomationServer::verbRegistry()
 
         add("transmit", {},
             "transmit <rfpower|tunepower> <0..100> — transmit drive (TX-gated)",
-            parseActionValue,
+            parseActionValueExact,
             [](AutomationServer& s, A& a, QLocalSocket*) -> QJsonObject {
                 if (a.action.isEmpty())
                     return err(QStringLiteral(
@@ -7134,6 +7153,10 @@ QJsonObject AutomationServer::doSlice(const QString& action, const QString& arg)
         if (parts.isEmpty())
             return err(QStringLiteral(
                 "slice tone requires '<off|ctcss_tx> [freq]'"));
+        if (parts.size() > 2)
+            return err(QStringLiteral(
+                "slice tone takes '<off|ctcss_tx> [freq]' and nothing more ('")
+                + parts[2] + QStringLiteral("' is unexpected)"));
         const QString mode = parts[0].toLower();
         static const QStringList kToneModes{QStringLiteral("off"),
                                             QStringLiteral("ctcss_tx")};
@@ -7185,6 +7208,10 @@ QJsonObject AutomationServer::doSlice(const QString& action, const QString& arg)
         if (parts.isEmpty())
             return err(QStringLiteral(
                 "slice offset requires '<simplex|up|down> [mhz]'"));
+        if (parts.size() > 2)
+            return err(QStringLiteral(
+                "slice offset takes '<simplex|up|down> [mhz]' and nothing more "
+                "('") + parts[2] + QStringLiteral("' is unexpected)"));
         const QString dir = parts[0].toLower();
         static const QStringList kDirs{QStringLiteral("simplex"),
                                        QStringLiteral("up"),

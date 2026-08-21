@@ -141,8 +141,21 @@ def extract_slice_actions(cpp_path):
     return [a for a in joined.split("|") if a]
 
 
+# Deliberately documented, deliberately NOT in sliceActionList(): `source` is
+# an accepted alias of `rxsource` (AutomationServer.cpp, the `rxsource`/`source`
+# branch) that the advertised list omits on purpose. Naming it here is the
+# difference between a lint that encodes one known exception and a lint someone
+# turns off.
+DOCUMENTED_SLICE_ALIASES = {"source"}
+
+
 def documented_slice_actions(md_text):
-    """Action names named in the first column of the `slice` section's table."""
+    """Action names in the first column of the `slice` section's table body.
+
+    Header rows are skipped structurally — a markdown table's header is the row
+    before its `|---|` separator — rather than by filtering the word "action",
+    which would also hide a real action called `action`.
+    """
     lines = md_text.splitlines()
     start = None
     for i, ln in enumerate(lines):
@@ -154,12 +167,21 @@ def documented_slice_actions(md_text):
             "error: no '### `slice`' section in the docs — the slice-action "
             "lint cannot run.")
     found = set()
+    pending_header = None
+    body = False
     for ln in lines[start + 1:]:
         # Stop at the next section of the same level; #### subsections belong
         # to `slice` and may legitimately carry rows.
         if ln.startswith("### ") and ln.strip() != "### `slice`":
             break
         if not ln.startswith("|"):
+            pending_header, body = None, False
+            continue
+        if re.fullmatch(r'\|[\s|:-]+', ln.strip()):
+            pending_header, body = None, True   # separator: header was above
+            continue
+        if not body:
+            pending_header = ln                 # candidate header, not counted
             continue
         first_cell = ln.split("|")[1]
         found.update(re.findall(r'`([a-z]+)`', first_cell))
@@ -226,8 +248,12 @@ def main():
     dups = find_duplicate_headings(md)
 
     slice_actions = extract_slice_actions(CPP)
-    undocumented = [a for a in slice_actions
-                    if a not in documented_slice_actions(md)]
+    documented = documented_slice_actions(md)
+    undocumented = [a for a in slice_actions if a not in documented]
+    # ...and the other direction: an action the docs still describe after the
+    # code stopped advertising it. A reader cannot tell a removed action from a
+    # working one, and the drift that produced #5102 ran this way round too.
+    stale_docs = sorted(documented - set(slice_actions) - DOCUMENTED_SLICE_ALIASES)
 
     if args.check:
         problems = []
@@ -245,6 +271,12 @@ def main():
                 + ", ".join(undocumented)
                 + " — document them (this table cannot be generated; the "
                   "per-action prose is hand-written on purpose)")
+        if stale_docs:
+            problems.append(
+                "slice action(s) documented in the `slice` action table but "
+                "NOT advertised by sliceActionList(): " + ", ".join(stale_docs)
+                + " — remove the row, or add the action back to the code "
+                  "(known aliases live in DOCUMENTED_SLICE_ALIASES)")
         if problems:
             for p in problems:
                 print("FAIL:", p, file=sys.stderr)
@@ -260,6 +292,9 @@ def main():
     if undocumented:
         print("warning: slice action(s) missing from the docs table: "
               + ", ".join(undocumented), file=sys.stderr)
+    if stale_docs:
+        print("warning: slice action(s) documented but not advertised: "
+              + ", ".join(stale_docs), file=sys.stderr)
     if want != md:
         with open(DOCS, "w", encoding="utf-8") as f:
             f.write(want)

@@ -378,6 +378,109 @@ int main(int argc, char** argv)
                QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact)));
     }
 
+    // ── trailing operands are refused, and change nothing ────────────────
+    //
+    // The verbs took "<a> <b>" and read parts[0]/parts[1], so a third token was
+    // silently dropped: `slice offset down 5 typo` answered ok and moved the
+    // radio. Principle VII wants malformed input refused at the boundary, and
+    // "refused" has to mean the model did not move — an error message alone
+    // would not have caught this, because the error was never the problem.
+    //
+    // These rows carry the state assertion for that reason: each sends a
+    // malformed command and asserts the slice (and the transmitter) reads
+    // exactly as it did before.
+    {
+        auto sliceState = [&socket]() -> QString {
+            const QJsonObject r =
+                request(socket, QByteArrayLiteral("get slice active"));
+            const QJsonObject sl = r.value(QStringLiteral("slice")).toObject();
+            return QStringLiteral("%1/%2/%3/%4/%5")
+                .arg(sl.value(QStringLiteral("fmToneMode")).toString(),
+                     sl.value(QStringLiteral("fmToneValue")).toString(),
+                     sl.value(QStringLiteral("repeaterOffsetDir")).toString())
+                .arg(sl.value(QStringLiteral("fmRepeaterOffsetFreq")).toDouble())
+                .arg(sl.value(QStringLiteral("txOffsetFreq")).toDouble());
+        };
+        auto txState = [&socket]() -> QString {
+            const QJsonObject r = request(socket, QByteArrayLiteral("get transmit"));
+            const QJsonObject t = r.value(QStringLiteral("transmit")).toObject();
+            return QStringLiteral("%1/%2")
+                .arg(t.value(QStringLiteral("rfPower")).toInt())
+                .arg(t.value(QStringLiteral("tunePower")).toInt());
+        };
+
+        auto refusedAndUnchanged = [&](const char* name, const QByteArray& line,
+                                       bool transmitVerb) {
+            const QString before = transmitVerb ? txState() : sliceState();
+            const QJsonObject r = request(socket, line);
+            const QString after = transmitVerb ? txState() : sliceState();
+            const QString e = errorOf(r);
+            report(name,
+                   r.value(QStringLiteral("ok")).toBool() == false
+                       && !e.isEmpty() && after == before,
+                   after == before
+                       ? (e.isEmpty() ? QStringLiteral("(accepted)") : e)
+                       : QStringLiteral("MUTATED %1 -> %2 (%3)")
+                             .arg(before, after, e.isEmpty()
+                                                     ? QStringLiteral("ok")
+                                                     : e));
+        };
+
+        refusedAndUnchanged("offset with a trailing operand changes nothing",
+                            QByteArrayLiteral("slice offset down 5 typo"), false);
+        refusedAndUnchanged("tone with a trailing operand changes nothing",
+                            QByteArrayLiteral("slice tone ctcss_tx 100.0 typo"),
+                            false);
+        // `transmit` drops the tail in its REGISTRY PARSER, before the handler
+        // sees it — so this one cannot be caught downstream of parsing.
+        refusedAndUnchanged("transmit with a trailing operand changes nothing",
+                            QByteArrayLiteral("transmit rfpower 30 90"), true);
+        // Both request forms, because they reach the arity check differently:
+        // the JSON `args` string is folded into a bare request and re-parsed by
+        // the registry parser, while explicit `action`/`value` fields skip the
+        // parser entirely and are caught downstream. A fix in only one place
+        // leaves the other form able to move the transmitter.
+        refusedAndUnchanged("json args form refuses the trailing operand too",
+                            QByteArrayLiteral(
+                                "{\"cmd\":\"transmit\",\"args\":\"rfpower 30 90\"}"),
+                            true);
+        refusedAndUnchanged("json action/value form refuses it as well",
+                            QByteArrayLiteral(
+                                "{\"cmd\":\"transmit\",\"action\":\"rfpower\","
+                                "\"value\":\"30 90\"}"),
+                            true);
+
+        // The well-formed shapes must keep working — an arity check that is
+        // just "too many tokens" is easy to write one token too tight.
+        {
+            const QJsonObject r =
+                request(socket, QByteArrayLiteral("slice offset down 5"));
+            report("the well-formed offset still applies",
+                   r.value(QStringLiteral("ok")).toBool()
+                       && qFuzzyCompare(
+                           r.value(QStringLiteral("txOffsetFreq")).toDouble() + 1.0,
+                           -5.0 + 1.0),
+                   QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact)));
+        }
+        {
+            const QJsonObject r =
+                request(socket, QByteArrayLiteral("slice offset simplex"));
+            report("a one-token offset still applies",
+                   r.value(QStringLiteral("ok")).toBool()
+                       && r.value(QStringLiteral("repeaterOffsetDir")).toString()
+                              == QLatin1String("simplex"),
+                   QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact)));
+        }
+        {
+            const QJsonObject r =
+                request(socket, QByteArrayLiteral("transmit rfpower 25"));
+            report("the well-formed transmit still applies",
+                   r.value(QStringLiteral("ok")).toBool()
+                       && r.value(QStringLiteral("rfPower")).toInt() == 25,
+                   QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact)));
+        }
+    }
+
     {
         // A legal tone applies, to the same fixture slice, and 123.0 is a real
         // table entry while the neighbouring 123.4 above is not.
