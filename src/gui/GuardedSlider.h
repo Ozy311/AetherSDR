@@ -251,7 +251,7 @@ public:
         setFocusPolicy(Qt::StrongFocus);
         if (accessibleDescription().isEmpty()) {
             setAccessibleDescription(
-                tr("Editable. Press Enter or Space to type an exact value in Hz "
+                tr("Editable. Press Enter to type an exact value in Hz "
                    "between %1 and %2, or use the arrow buttons.")
                     .arg(minValue).arg(maxValue));
         }
@@ -293,8 +293,7 @@ public:
     // QLabel so Tab/Shift-Tab keep working.
     void keyPressEvent(QKeyEvent* ev) override {
         const bool activates = ev->key() == Qt::Key_Return
-                               || ev->key() == Qt::Key_Enter
-                               || ev->key() == Qt::Key_Space;
+                               || ev->key() == Qt::Key_Enter;
         if (activates && m_editable && !m_editor && !ControlsLock::isLocked()) {
             beginEdit(Qt::TabFocusReason);
             ev->accept();
@@ -560,7 +559,10 @@ public:
         if (actionName == QAccessibleActionInterface::pressAction()) {
             // The same keys keyPressEvent() answers, so what an AT announces
             // and what the keyboard actually does cannot drift apart.
-            return {QStringLiteral("Return"), QStringLiteral("Space")};
+            // Space is deliberately absent: MainWindow owns it as the default
+            // application-level PTT-hold key and intercepts it before this
+            // widget while a radio is connected (Principle VI).
+            return {QStringLiteral("Return")};
         }
         return QAccessibleWidget::keyBindingsForAction(actionName);
     }

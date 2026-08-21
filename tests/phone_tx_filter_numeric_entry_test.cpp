@@ -238,6 +238,8 @@ int main(int argc, char** argv)
           "an editable readout is Tab-focusable");
     check(!low->accessibleDescription().isEmpty(),
           "the readout describes its editability to an AT");
+    check(!low->accessibleDescription().contains(QLatin1String("Space")),
+          "the readout does not advertise Space, which the app reserves for PTT");
 
     // ── The AT contract, not just the names (#5064 re-review) ─────────────
     //
@@ -260,10 +262,13 @@ int main(int argc, char** argv)
               "press is among its actions, not just SetFocus");
         check(names.contains(QAccessibleActionInterface::setFocusAction()),
               "SetFocus is still offered alongside it");
-        check(action
-                  && !action->keyBindingsForAction(
-                             QAccessibleActionInterface::pressAction()).isEmpty(),
-              "the press action announces the keys that also perform it");
+        const QStringList pressKeys = action
+            ? action->keyBindingsForAction(QAccessibleActionInterface::pressAction())
+            : QStringList{};
+        check(pressKeys.contains(QLatin1String("Return")),
+              "the press action announces Return as its activation key");
+        check(!pressKeys.contains(QLatin1String("Space")),
+              "the press action does not announce Space, which the app reserves for PTT");
 
         // The row that actually matters: driving the accessibility API the way
         // an AT does must open the real editor.
@@ -318,14 +323,9 @@ int main(int argc, char** argv)
           "focus returns to the readout after a keyboard commit");
 
     model.setTxFilter(200, 3300);
-    if (openEditorByKey(low, Qt::Key_Space)) {
-        check(low->isEditing(), "Space opens the editor too");
-        QTest::keyClick(low->findChild<QLineEdit*>(), Qt::Key_Escape);
-    } else {
-        check(false, "Space opens the editor too");
-    }
-    check(!low->isEditing() && low->window()->focusWidget() == low,
-          "Escape closes it and leaves focus on the readout");
+    openEditorByKey(low, Qt::Key_Space);
+    check(!low->isEditing(),
+          "Space does not open the editor because the app reserves it for PTT");
 
     // The keyboard route obeys the same lock gate as the double-click (#745).
     ControlsLock::setLocked(true);
