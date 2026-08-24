@@ -7222,13 +7222,13 @@ QJsonObject AutomationServer::doSlice(const QString& action, const QString& arg)
         double offsetMhz = -1.0;
         if (parts.size() >= 2) {
             bool okM = false;
-            offsetMhz = std::abs(parts[1].toDouble(&okM));
-            if (!okM)
+            offsetMhz = parts[1].toDouble(&okM);
+            if (!okM || !std::isfinite(offsetMhz))
                 return err(QStringLiteral("offset must be a frequency in MHz"));
             // The same bound both GUI spinboxes carry (RxApplet.cpp,
             // VfoWidget.cpp: setRange(0.0, 100.0)), so the bridge cannot
             // request duplex no operator could dial in.
-            if (offsetMhz > 100.0)
+            if (offsetMhz < 0.0 || offsetMhz > 100.0)
                 return err(QStringLiteral(
                     "offset magnitude must be 0..100 MHz"));
         }

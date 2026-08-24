@@ -242,6 +242,15 @@ int main(int argc, char** argv)
     rejectedAtBoundary(socket, "offset magnitude 101 MHz is refused",
                        QByteArrayLiteral("slice offset up 101"),
                        QStringLiteral("0..100"));
+    rejectedAtBoundary(socket, "a negative offset magnitude is refused",
+                       QByteArrayLiteral("slice offset down -5"),
+                       QStringLiteral("0..100"));
+    rejectedAtBoundary(socket, "a NaN offset magnitude is refused",
+                       QByteArrayLiteral("slice offset up nan"),
+                       QStringLiteral("frequency"));
+    rejectedAtBoundary(socket, "an infinite offset magnitude is refused",
+                       QByteArrayLiteral("slice offset up inf"),
+                       QStringLiteral("frequency"));
 
     // ── transmit: gated, then clamped ────────────────────────────────────
     {
