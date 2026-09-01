@@ -3873,6 +3873,30 @@ if(UNIX)
 endif()
 add_test(NAME transmit_model_test COMMAND transmit_model_test)
 
+# CW controls hold their value on a backend that never echoes them (#5256).
+# The Radio Setup CW group commits through TransmitModel setters, and the
+# setters optimistic local update is the ONLY thing that makes a CW setting
+# stick on a Hermes-Lite 2: `iambic` and `iambic_mode` are parsed in exactly
+# one place in the tree (FlexBackend::decodeTransmitState), so without it the
+# model never moves, the dialog reseeds stale, and syncLocalKeyerToRadio never
+# fires. Each row also asserts the wire command is STILL sent, so a FLEX keeps
+# its firmware echo and stays authoritative (Principle II).
+# Socket-free: TransmitModel is constructed directly, no radio, no connection.
+add_executable(cw_control_local_state_test
+    tests/cw_control_local_state_test.cpp
+    src/models/TransmitModel.cpp
+    src/core/ClientQuindarTone.cpp
+    ${AETHER_SETTINGS_SOURCES}
+    src/core/AsyncLogWriter.cpp
+    src/core/LogManager.cpp
+)
+target_include_directories(cw_control_local_state_test PRIVATE src)
+target_link_libraries(cw_control_local_state_test PRIVATE Qt6::Core)
+if(UNIX)
+    target_link_libraries(cw_control_local_state_test PRIVATE pthread)
+endif()
+add_test(NAME cw_control_local_state_test COMMAND cw_control_local_state_test)
+
 add_executable(transmit_inhibit_policy_test
     tests/transmit_inhibit_policy_test.cpp
     src/core/CommandParser.cpp
@@ -4240,6 +4264,7 @@ set(AETHER_SETTINGS_CONSUMERS
     flex_control_dialog_size_test
     pan_layout_dialog_size_test
     transmit_model_test
+    cw_control_local_state_test
     container_widget_test
     hl2_pc_audio_lock_test
     titlebar_headphone_mute_test
