@@ -2607,8 +2607,8 @@ QWidget* RadioSetupDialog::buildPhoneCwTab()
         auto* grid = new QGridLayout(group);
         grid->setSpacing(6);
 
-        // Every control in this group commits through its TransmitModel
-        // setter, never raw wire text.  The setter updates local state and
+        // The four keyer controls below commit through their TransmitModel
+        // setters, never raw wire text.  Each setter updates local state and
         // emits phoneStateChanged BEFORE sending the same command, and that
         // local update is the only thing that makes the value stick on a
         // backend which never echoes the setting back: `iambic` and
