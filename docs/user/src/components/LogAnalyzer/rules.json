@@ -932,7 +932,7 @@
         },
         {
           "file": "src/core/backends/icom/IcomSession.cpp",
-          "line": 258,
+          "line": 262,
           "text": "the radio rejected the username or password"
         }
       ]
