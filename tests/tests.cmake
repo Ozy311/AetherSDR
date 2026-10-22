@@ -8001,6 +8001,25 @@ add_test(NAME aethercontrol_window_test COMMAND aethercontrol_window_test)
 set_tests_properties(aethercontrol_window_test PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+# Socket-free admission: injected backend, uninitialized TCP transport, and
+# picker signals without a connection receiver. No peer, bind, or device access.
+add_executable(automation_demo_only_test
+    tests/automation_demo_only_test.cpp
+    src/gui/ConnectionPanel.cpp
+    src/gui/CanonWindow.cpp
+    src/gui/PersistentDialog.cpp
+    src/gui/FramelessResizer.cpp
+    src/gui/FramelessWindowTitleBar.cpp
+)
+target_include_directories(automation_demo_only_test PRIVATE src tests)
+target_link_libraries(automation_demo_only_test PRIVATE
+    aethercore Qt6::Core Qt6::Network Qt6::Widgets Qt6::Test)
+set_target_properties(automation_demo_only_test PROPERTIES AUTOMOC ON)
+add_test(NAME automation_demo_only_test COMMAND automation_demo_only_test restricted)
+add_test(NAME automation_demo_only_normal_test COMMAND automation_demo_only_test normal)
+set_tests_properties(automation_demo_only_test automation_demo_only_normal_test PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+
 add_executable(connection_panel_size_test
     tests/connection_panel_size_test.cpp
     src/gui/ConnectionPanel.cpp
@@ -9522,6 +9541,7 @@ if(NOT WIN32)
 endif()
 
 set(AETHER_SETTINGS_CONSUMERS
+    automation_demo_only_test
     flex_readonly_metadata_test
     dsp_parameter_reset_test
     cw_rx_model_test

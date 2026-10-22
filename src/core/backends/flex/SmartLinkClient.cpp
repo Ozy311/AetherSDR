@@ -1,3 +1,4 @@
+#include "core/AutomationIsolationPolicy.h"
 #include "SmartLinkClient.h"
 #include "core/AppSettings.h"
 #include "core/LogManager.h"
@@ -308,6 +309,11 @@ void SmartLinkClient::reconnect()
 
 void SmartLinkClient::requestConnect(const QString& serial, quint16 holePunchPort)
 {
+    if (AutomationIsolationPolicy::demoOnly()) {
+        qCWarning(lcSmartLink) << AutomationIsolationPolicy::refusal();
+        return;
+    }
+
     if (!m_serverConnected) return;
     QString cmd = QString("application connect serial=%1 hole_punch_port=%2\n")
                       .arg(serial).arg(holePunchPort);
@@ -318,6 +324,11 @@ void SmartLinkClient::requestConnect(const QString& serial, quint16 holePunchPor
 
 void SmartLinkClient::disconnectRadioClients(const QString& serial, const QList<quint32>& handles)
 {
+    if (AutomationIsolationPolicy::demoOnly()) {
+        qCWarning(lcSmartLink) << AutomationIsolationPolicy::refusal();
+        return;
+    }
+
     if (!m_serverConnected || serial.isEmpty())
         return;
 
