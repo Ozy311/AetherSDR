@@ -1,0 +1,273 @@
+[
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 12,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 300
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 12,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 450
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 12,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 900
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 14,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 300
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 14,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 450
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 14,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 900
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 16,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 300
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 16,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 450
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 16,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 900
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 20,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 300
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 20,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 450
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 20,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 900
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 24,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 300
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 24,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 450
+    },
+    {
+        "fits": false,
+        "fixed": false,
+        "fontPixels": 24,
+        "height": 30,
+        "requiredHeight": 45,
+        "width": 113,
+        "windowWidth": 900
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 12,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 300
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 12,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 450
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 12,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 900
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 14,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 300
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 14,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 450
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 14,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 900
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 16,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 300
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 16,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 450
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 16,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 900
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 20,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 300
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 20,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 450
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 20,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 900
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 24,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 300
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 24,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 450
+    },
+    {
+        "fits": true,
+        "fixed": true,
+        "fontPixels": 24,
+        "height": 30,
+        "requiredHeight": 30,
+        "width": 203,
+        "windowWidth": 900
+    }
+]
+
