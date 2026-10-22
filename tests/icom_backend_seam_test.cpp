@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 using namespace AetherSDR;
@@ -114,6 +115,20 @@ struct IcomCivBackendTestAccess {
     {
         const std::vector<std::uint8_t> frame = cmdReadFrequency(0xA4);
         b.queueRead(frame, b.semanticKey(frame), IcomCivScheduler::Priority::Maintenance);
+    }
+    static void queueMeterRead(IcomCivBackend& b)
+    {
+        const auto frame = cmdReadMeter(b.m_session->civAddress(), meter::kSMeter);
+        b.queueRead(frame, b.semanticKey(frame), IcomCivScheduler::Priority::ActiveMeter);
+    }
+    static void pumpNextSlot(IcomCivBackend& b)
+    {
+        b.pumpCiv(std::max<qint64>(b.nowMs(), b.m_civScheduler.stats().lastDispatchMs)
+                  + IcomCivScheduler::kSlotMs);
+    }
+    static std::string inFlightKey(const IcomCivBackend& b)
+    {
+        return b.m_civScheduler.stats().inFlightKey;
     }
     static void cancelScheduler(IcomCivBackend& b)
     {
@@ -315,6 +330,49 @@ void testIc705PreampFrequencyRanges()
     const auto unknown = writes(Access::issued(backend), cmd::kFunction, func::kPreamp);
     check(unknown.size() == 1 && unknown.front().data == std::vector<std::uint8_t>{1},
           "unknown frequency cannot authorize P.AMP2 at the backend entry");
+}
+
+void testRangePreampReadPrecedesQueuedMeters()
+{
+    IcomCivBackend backend;
+    Access::prepare(backend, "IC-705");
+    Access::queuePendingRead(backend);
+    Access::pumpNextSlot(backend);
+    Access::queueMeterRead(backend);
+    // The unsolicited band change arrives while a frequency poll is in flight.
+    Access::deliver(backend, frame(cmd::kSetFreqTrx, {}, encodeFreq(144'300'000)));
+    Access::deliver(backend, frame(cmd::kReadFreq, {}, encodeFreq(144'300'000)));
+    Access::pumpNextSlot(backend);
+    check(Access::inFlightKey(backend) == "civ.22.2",
+          "range-change preamp confirmation precedes a queued active meter read");
+    Access::deliver(backend, frame(cmd::kFunction, func::kPreamp, {1}));
+    Access::pumpNextSlot(backend);
+    check(Access::inFlightKey(backend) == "civ.21.2",
+          "active meter polling resumes after the range-change confirmation");
+}
+
+void testReconnectSMeterWaitsForFrequency()
+{
+    IcomCivBackend backend;
+    Access::prepare(backend, "IC-705");
+    Access::sessionConnected(backend);
+    QSignalSpy meterSpy(&backend, &IRadioBackend::meterUpdate);
+    const CivFrame s9 = frame(cmd::kMeter, meter::kSMeter, {0x01, 0x20});
+    Access::deliver(backend, s9);
+    check(meterSpy.isEmpty(), "unknown receive frequency cannot publish an assumed HF S-meter value");
+    meterSpy.clear();
+    Access::deliver(backend, frame(cmd::kMeter, meter::kVd, {0x01, 0x20}));
+    check(meterSpy.size() == 1 && meterSpy.last().at(0).toString() == "RAD:+13.8A",
+          "frequency-independent meter telemetry remains available during reconnect");
+    meterSpy.clear();
+    Access::deliver(backend, frame(cmd::kReadFreq, {}, encodeFreq(144'300'000)));
+    Access::deliver(backend, s9);
+    check(meterSpy.size() == 1 && std::abs(meterSpy.last().at(1).toDouble() + 93.0) < 0.01,
+          "the first S9 sample after VHF frequency readback uses -93 dBm");
+    Access::deliver(backend, frame(cmd::kSetFreqTrx, {}, encodeFreq(14'100'000)));
+    Access::deliver(backend, s9);
+    check(meterSpy.size() == 2 && std::abs(meterSpy.last().at(1).toDouble() + 73.0) < 0.01,
+          "confirmed HF frequency restores the -73 dBm S9 reference");
 }
 
 // IC-9700 preamp wire state 02 is mirrored; operator intent stays bounded.
@@ -993,6 +1051,8 @@ int main(int argc, char** argv)
     testStaleGenerationDropped();
     testSwrMinimumHold();
     testIc705PreampFrequencyRanges();
+    testRangePreampReadPrecedesQueuedMeters();
+    testReconnectSMeterWaitsForFrequency();
     testIc9700PreampWireState();
     testWaiterLifetime(app);
     testCapabilityFlags();

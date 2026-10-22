@@ -1920,7 +1920,7 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame,
                 // Read back the current stage after publishing its new ladder.
                 if (m_session) {
                     const auto read = cmdReadFunction(m_session->civAddress(), func::kPreamp);
-                    queueRead(read, semanticKey(read), IcomCivScheduler::Priority::Control);
+                    queueRead(read, semanticKey(read), IcomCivScheduler::Priority::Operator);
                     pumpCiv(frameAtMs);
                 }
             }
@@ -2861,6 +2861,11 @@ void IcomCivBackend::onCivFrame(const CivFrame& frame,
 
         const qint64 answeredAtMs = nowMs();
         m_meters.markAnswered(spec->id, answeredAtMs);
+        // S-meter dBm needs the radio's band-dependent S9 reference. A new
+        // session has no receive frequency until the radio reports it.
+        if (spec->id == MeterId::SMeter && m_frequencyHz == 0) {
+            return;
+        }
         const MeterCalibrationProfile meterProfile = m_model
             ? profileFor(*m_model).meters : MeterCalibrationProfile{};
         const std::span<const CurvePoint> powerCurve = m_model
