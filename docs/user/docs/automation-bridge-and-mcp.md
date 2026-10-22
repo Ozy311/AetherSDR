@@ -78,6 +78,10 @@ automation TX off. Physical radio connections are refused through both the
 bridge and the app's connection window. Operator settings are not copied into
 this profile; it is removed after the owned process exits.
 
+SmartLink sign-in, token refresh, and server reconnect are disabled in this
+process. It does not read, save, or delete your stored SmartLink credentials;
+signing out in a proof instance does not sign out your normal app.
+
 The tool checks isolation support before opening the app and verifies the
 running process reports `demoOnly:true`. A build without that support is refused.
 After a proof launch attempt, later MCP commands stay bound to the owned proof

@@ -84,6 +84,11 @@ scratch settings directory only after the process exits. The MCP `app_instance`
 tool manages this lifecycle automatically and is the preferred cross-platform
 proof launcher.
 
+Demo-only processes also refuse SmartLink automatic/manual login, token refresh,
+and server reconnect before credential or network access. SmartLink keychain
+reads, writes, and deletes are suppressed, including credential removal through
+logout. A fresh settings directory alone does not isolate the OS keychain.
+
 Parallel worktrees should give each bridge a stable automation identity and a
 human-readable agent name:
 

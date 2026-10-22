@@ -8001,6 +8001,14 @@ add_test(NAME aethercontrol_window_test COMMAND aethercontrol_window_test)
 set_tests_properties(aethercontrol_window_test PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+# SmartLink effect injection keeps both policy modes and guard mutations offline.
+add_executable(smartlink_demo_isolation_test tests/smartlink_demo_isolation_test.cpp)
+target_include_directories(smartlink_demo_isolation_test PRIVATE src tests)
+target_link_libraries(smartlink_demo_isolation_test PRIVATE aethercore Qt6::Core Qt6::Network Qt6::Test)
+add_test(NAME smartlink_demo_isolation_test COMMAND smartlink_demo_isolation_test restricted)
+add_test(NAME smartlink_demo_isolation_normal_test COMMAND smartlink_demo_isolation_test normal)
+set_tests_properties(smartlink_demo_isolation_test smartlink_demo_isolation_normal_test PROPERTIES TIMEOUT 30)
+
 # Socket-free admission: injected backend, uninitialized TCP transport, and
 # picker signals without a connection receiver. No peer, bind, or device access.
 add_executable(automation_demo_only_test
@@ -9542,6 +9550,7 @@ endif()
 
 set(AETHER_SETTINGS_CONSUMERS
     automation_demo_only_test
+    smartlink_demo_isolation_test
     flex_readonly_metadata_test
     dsp_parameter_reset_test
     cw_rx_model_test

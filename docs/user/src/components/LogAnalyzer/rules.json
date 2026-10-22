@@ -288,17 +288,17 @@
       "source": [
         {
           "file": "src/core/backends/flex/SmartLinkClient.cpp",
-          "line": 101,
+          "line": 111,
           "text": "SmartLinkClient: Auth0 login failed:"
         },
         {
           "file": "src/core/backends/flex/SmartLinkClient.cpp",
-          "line": 155,
+          "line": 174,
           "text": "SmartLinkClient: Auth0 refresh failed:"
         },
         {
           "file": "src/core/backends/flex/SmartLinkClient.cpp",
-          "line": 445,
+          "line": 541,
           "text": "SmartLinkClient: registration invalid"
         }
       ]
@@ -337,7 +337,7 @@
         },
         {
           "file": "src/core/backends/flex/SmartLinkClient.cpp",
-          "line": 382,
+          "line": 472,
           "text": "SmartLinkClient: SSL error:"
         }
       ]
