@@ -44,7 +44,7 @@ struct IcomCivBackendTestAccess {
     static void deliver(IcomCivBackend& b, CivFrame frame, std::uint64_t generation = 1)
     {
         frame.to = kControllerAddress;
-        frame.from = b.m_model->civAddress;
+        frame.from = b.m_session->civAddress();
         b.onCivFrame(frame, generation);
     }
     static void expectPttConfirmation(IcomCivBackend& b, bool keyed)
@@ -105,6 +105,9 @@ struct IcomCivBackendTestAccess {
         b.m_mode = mode;
         b.m_dataMode = data;
     }
+    static void forgetIdentity(IcomCivBackend& b) { b.m_civReported = 0; b.m_civModelId = 0; }
+    static void publishControls(IcomCivBackend& b) { b.publishModelControls(); }
+    static std::uint64_t frequency(const IcomCivBackend& b) { return b.m_frequencyHz; }
     static int preampStep(const IcomCivBackend& b) { return b.m_preampStep; }
     static void reassertPreamp(IcomCivBackend& b) { b.reassertPanPreampWireStep(b.m_preampStep); }
     static void queuePendingRead(IcomCivBackend& b)
@@ -248,6 +251,70 @@ void testSwrMinimumHold()
     swr.data = {0x00, 0x82};
     Access::deliver(backend, swr);
     check(meterSpy.count() == 2, "the next real SWR reading publishes");
+}
+
+// Both polled and unsolicited frequency replies drive the effective ladder.
+void testIc705PreampFrequencyRanges()
+{
+    IcomCivBackend backend;
+    Access::prepare(backend, "IC-705");
+    QSignalSpy info(&backend, &IRadioBackend::panPreampInfoChanged);
+    QSignalSpy value(&backend, &IRadioBackend::panPreampChanged);
+    Access::publishControls(backend);
+    check(info.size() == 1 && info.last().at(1).toStringList().size() == 3,
+          "initial IC-705 controls use the authoritative HF frequency");
+    backend.setSliceFrequency(0, 144'300'000);
+    check(info.size() == 1 && Access::frequency(backend) == 14'100'000,
+          "tune intent alone cannot change the radio-authoritative ladder");
+    Access::deliver(backend, frame(cmd::kReadFreq, {}, encodeFreq(74'799'999)));
+    check(info.size() == 1, "same-ladder frequency read does not republish controls");
+    Access::forget(backend);
+    Access::deliver(backend, frame(cmd::kSetFreqTrx, {}, encodeFreq(74'800'000)));
+    check(info.size() == 2 && info.last().at(1).toStringList() == QStringList({"OFF", "P.AMP1"}),
+          "transceive frequency at the boundary publishes two preamp positions");
+    const auto crossed = Access::issued(backend);
+    check(any(crossed, [](const CivFrame& f) {
+        return f.cmd == cmd::kFunction && f.hasSub && f.sub == func::kPreamp && f.data.empty();
+    }), "ladder transition requests authoritative preamp readback");
+    check(writes(crossed, cmd::kFunction, func::kPreamp).empty() && value.isEmpty(),
+          "frequency crossing never writes or invents a preamp setting");
+    Access::deliver(backend, frame(cmd::kFunction, func::kPreamp, {1}));
+    check(value.size() == 1 && value.last().at(1).toInt() == 1,
+          "preamp confirmation adopts the radio's stage");
+    Access::forget(backend);
+    backend.setPanPreamp(QStringLiteral("0"), 2);
+    const auto bounded = writes(Access::issued(backend), cmd::kFunction, func::kPreamp);
+    check(bounded.size() == 1 && bounded.front().data == std::vector<std::uint8_t>{1},
+          "stale out-of-range intent cannot send P.AMP2 at the boundary");
+    Access::forget(backend);
+    backend.setPanPreamp(QStringLiteral("0"), 0);
+    const auto off = writes(Access::issued(backend), cmd::kFunction, func::kPreamp);
+    check(off.size() == 1 && off.front().data == std::vector<std::uint8_t>{0},
+          "OFF remains writable from P.AMP1 on the restricted ladder");
+    Access::deliver(backend, frame(cmd::kReadFreq, {}, encodeFreq(442'000'000)));
+    check(info.size() == 2, "VHF to UHF preserves the same two-position ladder");
+    Access::forget(backend);
+    Access::deliver(backend, frame(cmd::kReadFreq, {}, encodeFreq(50'000'000)));
+    check(info.size() == 3 && info.last().at(1).toStringList().size() == 3,
+          "polled frequency returning to 6 m restores P.AMP2");
+    check(writes(Access::issued(backend), cmd::kFunction, func::kPreamp).empty(),
+          "return to HF also leaves the setting to the radio");
+    Access::forget(backend);
+    backend.setPanPreamp(QStringLiteral("0"), 2);
+    const auto full = writes(Access::issued(backend), cmd::kFunction, func::kPreamp);
+    check(full.size() == 1 && full.front().data == std::vector<std::uint8_t>{2},
+          "P.AMP2 remains writable in the lower receive range");
+    Access::forgetIdentity(backend);
+    Access::sessionConnected(backend);
+    check(Access::frequency(backend) == 0, "new session discards the previous receive frequency");
+    Access::deliver(backend, frame(cmd::kReadId, 0, {0xA4}));
+    check(info.last().at(1).toStringList() == QStringList({"OFF", "P.AMP1"}),
+          "identified IC-705 with unknown frequency publishes only shared stages");
+    Access::forget(backend);
+    backend.setPanPreamp(QStringLiteral("0"), 2);
+    const auto unknown = writes(Access::issued(backend), cmd::kFunction, func::kPreamp);
+    check(unknown.size() == 1 && unknown.front().data == std::vector<std::uint8_t>{1},
+          "unknown frequency cannot authorize P.AMP2 at the backend entry");
 }
 
 // IC-9700 preamp wire state 02 is mirrored; operator intent stays bounded.
@@ -925,6 +992,7 @@ int main(int argc, char** argv)
 
     testStaleGenerationDropped();
     testSwrMinimumHold();
+    testIc705PreampFrequencyRanges();
     testIc9700PreampWireState();
     testWaiterLifetime(app);
     testCapabilityFlags();
