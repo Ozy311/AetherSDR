@@ -1,0 +1,61 @@
+{
+  "radioModel": "IC-705",
+  "receiveFrequencyMHz": 446.15,
+  "base": "6bb29bb7c7b1988d7f3300e41fc596f62902c65b",
+  "fixedSource": "65c3658e08f02d8a7762de090c07bfad2bd919ac",
+  "scope": "Native preamp control clicks through the automation bridge; offscreen control captures, not GPU-renderer proof. Receive-only; no transmit testing.",
+  "before": [
+    {
+      "direction": "tx",
+      "payload": "16 02 02"
+    },
+    {
+      "direction": "rx",
+      "payload": "FA"
+    },
+    {
+      "direction": "tx",
+      "payload": "16 02"
+    },
+    {
+      "direction": "rx",
+      "payload": "16 02 01"
+    }
+  ],
+  "afterOff": [
+    {
+      "direction": "tx",
+      "payload": "16 02 00"
+    },
+    {
+      "direction": "rx",
+      "payload": "FB"
+    },
+    {
+      "direction": "tx",
+      "payload": "16 02"
+    },
+    {
+      "direction": "rx",
+      "payload": "16 02 00"
+    }
+  ],
+  "afterRestore": [
+    {
+      "direction": "tx",
+      "payload": "16 02 01"
+    },
+    {
+      "direction": "rx",
+      "payload": "FB"
+    },
+    {
+      "direction": "tx",
+      "payload": "16 02"
+    },
+    {
+      "direction": "rx",
+      "payload": "16 02 01"
+    }
+  ]
+}
