@@ -1,0 +1,113 @@
+{
+  "before": [
+    {
+      "requestedPort": 1,
+      "displayedText": "1",
+      "editorWidth": 1,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 9999,
+      "displayedText": "9999",
+      "editorWidth": 1,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 10000,
+      "displayedText": "10000",
+      "editorWidth": 1,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 12345,
+      "displayedText": "12345",
+      "editorWidth": 1,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 65535,
+      "displayedText": "65535",
+      "editorWidth": 1,
+      "enabled": true,
+      "visible": true
+    }
+  ],
+  "after": [
+    {
+      "requestedPort": 1,
+      "displayedText": "1",
+      "editorWidth": 52,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 9999,
+      "displayedText": "9999",
+      "editorWidth": 52,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 10000,
+      "displayedText": "10000",
+      "editorWidth": 52,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 12345,
+      "displayedText": "12345",
+      "editorWidth": 52,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 65535,
+      "displayedText": "65535",
+      "editorWidth": 52,
+      "enabled": true,
+      "visible": true
+    }
+  ],
+  "after-150": [
+    {
+      "requestedPort": 1,
+      "displayedText": "1",
+      "editorWidth": 52,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 9999,
+      "displayedText": "9999",
+      "editorWidth": 52,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 10000,
+      "displayedText": "10000",
+      "editorWidth": 52,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 12345,
+      "displayedText": "12345",
+      "editorWidth": 52,
+      "enabled": true,
+      "visible": true
+    },
+    {
+      "requestedPort": 65535,
+      "displayedText": "65535",
+      "editorWidth": 52,
+      "enabled": true,
+      "visible": true
+    }
+  ]
+}

@@ -1,0 +1,182 @@
+[
+    {
+        "accepted": true,
+        "editorWidth": 1,
+        "fits": false,
+        "fixed": false,
+        "port": "1",
+        "style": "Fusion",
+        "textWidth": 5
+    },
+    {
+        "accepted": true,
+        "editorWidth": 1,
+        "fits": false,
+        "fixed": false,
+        "port": "9999",
+        "style": "Fusion",
+        "textWidth": 27
+    },
+    {
+        "accepted": true,
+        "editorWidth": 1,
+        "fits": false,
+        "fixed": false,
+        "port": "10000",
+        "style": "Fusion",
+        "textWidth": 32
+    },
+    {
+        "accepted": true,
+        "editorWidth": 1,
+        "fits": false,
+        "fixed": false,
+        "port": "12345",
+        "style": "Fusion",
+        "textWidth": 32
+    },
+    {
+        "accepted": true,
+        "editorWidth": 1,
+        "fits": false,
+        "fixed": false,
+        "port": "65535",
+        "style": "Fusion",
+        "textWidth": 33
+    },
+    {
+        "accepted": true,
+        "editorWidth": 52,
+        "fits": true,
+        "fixed": true,
+        "port": "1",
+        "style": "Fusion",
+        "textWidth": 5
+    },
+    {
+        "accepted": true,
+        "editorWidth": 52,
+        "fits": true,
+        "fixed": true,
+        "port": "9999",
+        "style": "Fusion",
+        "textWidth": 27
+    },
+    {
+        "accepted": true,
+        "editorWidth": 52,
+        "fits": true,
+        "fixed": true,
+        "port": "10000",
+        "style": "Fusion",
+        "textWidth": 32
+    },
+    {
+        "accepted": true,
+        "editorWidth": 52,
+        "fits": true,
+        "fixed": true,
+        "port": "12345",
+        "style": "Fusion",
+        "textWidth": 32
+    },
+    {
+        "accepted": true,
+        "editorWidth": 52,
+        "fits": true,
+        "fixed": true,
+        "port": "65535",
+        "style": "Fusion",
+        "textWidth": 33
+    },
+    {
+        "accepted": true,
+        "editorWidth": 1,
+        "fits": false,
+        "fixed": false,
+        "port": "1",
+        "style": "Windows",
+        "textWidth": 5
+    },
+    {
+        "accepted": true,
+        "editorWidth": 1,
+        "fits": false,
+        "fixed": false,
+        "port": "9999",
+        "style": "Windows",
+        "textWidth": 27
+    },
+    {
+        "accepted": true,
+        "editorWidth": 1,
+        "fits": false,
+        "fixed": false,
+        "port": "10000",
+        "style": "Windows",
+        "textWidth": 32
+    },
+    {
+        "accepted": true,
+        "editorWidth": 1,
+        "fits": false,
+        "fixed": false,
+        "port": "12345",
+        "style": "Windows",
+        "textWidth": 32
+    },
+    {
+        "accepted": true,
+        "editorWidth": 1,
+        "fits": false,
+        "fixed": false,
+        "port": "65535",
+        "style": "Windows",
+        "textWidth": 33
+    },
+    {
+        "accepted": true,
+        "editorWidth": 52,
+        "fits": true,
+        "fixed": true,
+        "port": "1",
+        "style": "Windows",
+        "textWidth": 5
+    },
+    {
+        "accepted": true,
+        "editorWidth": 52,
+        "fits": true,
+        "fixed": true,
+        "port": "9999",
+        "style": "Windows",
+        "textWidth": 27
+    },
+    {
+        "accepted": true,
+        "editorWidth": 52,
+        "fits": true,
+        "fixed": true,
+        "port": "10000",
+        "style": "Windows",
+        "textWidth": 32
+    },
+    {
+        "accepted": true,
+        "editorWidth": 52,
+        "fits": true,
+        "fixed": true,
+        "port": "12345",
+        "style": "Windows",
+        "textWidth": 32
+    },
+    {
+        "accepted": true,
+        "editorWidth": 52,
+        "fits": true,
+        "fixed": true,
+        "port": "65535",
+        "style": "Windows",
+        "textWidth": 33
+    }
+]

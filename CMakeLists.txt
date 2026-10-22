@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(spinprobe LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Test)
+add_executable(spin_probe spin_probe.cpp)
+target_link_libraries(spin_probe PRIVATE Qt6::Widgets Qt6::Test)
