@@ -1,0 +1,65 @@
+{
+  "scenario": "Seeded recorded discovery fault; open Copy Assist in demo USB, click Enable twice; read status after one second each time.",
+  "before": {
+    "build": {
+      "baseline": "v26.10.3",
+      "commitsSinceTag": 30,
+      "describe": "v26.10.3-30-gb5b54092",
+      "dirty": false,
+      "sha": "b5b54092"
+    },
+    "txAllowed": false,
+    "radio": "DEMO-0001",
+    "states": [
+      {
+        "event": "initial",
+        "status": "The speech engine stopped AetherSDR while starting up last time, so local Copy Assist is off for this session. A remote server still works.",
+        "statusVisible": true,
+        "enableChecked": false
+      },
+      {
+        "event": "after first enable",
+        "status": "Disabled",
+        "statusVisible": true,
+        "enableChecked": false
+      },
+      {
+        "event": "after second enable",
+        "status": "Disabled",
+        "statusVisible": true,
+        "enableChecked": false
+      }
+    ]
+  },
+  "after": {
+    "build": {
+      "baseline": "v26.10.3",
+      "commitsSinceTag": 31,
+      "describe": "v26.10.3-31-g2eeb9c86",
+      "dirty": false,
+      "sha": "2eeb9c86"
+    },
+    "txAllowed": false,
+    "radio": "DEMO-0001",
+    "states": [
+      {
+        "event": "initial",
+        "status": "The speech engine stopped AetherSDR while starting up last time, so local Copy Assist is off for this session. A remote server still works.",
+        "statusVisible": true,
+        "enableChecked": false
+      },
+      {
+        "event": "after first enable",
+        "status": "The speech engine stopped AetherSDR while starting up last time, so local Copy Assist is off for this session. A remote server still works.",
+        "statusVisible": true,
+        "enableChecked": false
+      },
+      {
+        "event": "after second enable",
+        "status": "The speech engine stopped AetherSDR while starting up last time, so local Copy Assist is off for this session. A remote server still works.",
+        "statusVisible": true,
+        "enableChecked": false
+      }
+    ]
+  }
+}
